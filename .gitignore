@@ -1,5 +1,9 @@
 # ---- copyrighted game files (bring your own dump; never commit) ----
+# NOTE: the finished modded APK IS shared with friends here (private repo). OBBs (~13GB)
+# are too big for GitHub and must be shared separately.
 *.apk
+!Pavlov-Frame-chams.apk
+!Backups/**/Pavlov-Frame-chams.apk
 *.apk.idsig
 *.obb
 *.pak
