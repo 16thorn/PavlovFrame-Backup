@@ -56,7 +56,67 @@ printf '6yawn' | adb shell 'cat > /sdcard/Android/data/com.vankrupt.pavlov/files
 
 ---
 
-## How it works (architecture)
+## Install on Quest 3
+
+The ready-to-run build is **`Backups/2026-08-29/Pavlov-Frame-chams.apk`** (same file as
+`Pavlov-Frame-chams.apk` in the repo root). Grab it from the backup folder — pull it out with any
+APK extractor / file manager, or just `adb install` it directly.
+
+This is the Pavlov **Steam Frame** build (`com.vankrupt.pavlov`), which is an Android/arm64 VR build
+originally targeting the Steam Frame headset. It runs on **Quest 3** because the APK carries an
+**OpenXR interaction-profile shim** (an `xrGetInstanceProcAddr` interposer) that remaps the Steam
+Frame controller profile to the Quest **Touch Plus** profile — so aim/grip/trigger/stick all bind
+correctly on Quest. No native Meta/Oculus libs are involved (which is also why it never trips Meta
+device-attestation — see `docs/EOS-PORT.md`).
+
+```sh
+adb install -r Pavlov-Frame-chams.apk
+# then push the game content (OBBs) — REQUIRED, ~13 GB, shared separately (too big for GitHub):
+adb push main.<ver>.com.vankrupt.pavlov.obb \
+  /sdcard/Android/obb/com.vankrupt.pavlov/
+# set the cheat mode:
+adb shell 'echo 6 > /sdcard/Android/data/com.vankrupt.pavlov/files/chams.txt'
+```
+
+Without the OBBs the app installs but won't launch (Pavlov loads its content from `main.obb`).
+
+## Libraries & load order
+
+What's in the APK's `lib/arm64-v8a/` and how it all chains together at launch:
+
+```
+Android starts com.epicgames.unreal.GameActivity
+   └─ loads libUnreal.so            ← the whole game (stripped UE5.1 monolith, no symbols)
+        │  DT_NEEDED: "libEOSSDK.so" (the game thinks this is the EOS SDK)
+        └─ loads libEOSSDK.so       ← OUR interposer wrapper (NOT the real SDK)
+             │  __attribute__((constructor)) on_load():
+             │    ├─ dlopen("libpavchams.so", RTLD_GLOBAL)   ← loads THE MOD (this repo)
+             │    └─ dlopen("libEOSDK.so")                    ← the genuine EOS SDK
+             │  Interposes EOS_*: defines a few (EOS_Connect_Login, EOS_Platform_Create …),
+             │  forwards everything else to libEOSDK.so via dlsym. Does anonymous Device-ID
+             │  auto-login so you get an EOS ProductUserId online with no Steam/Epic/Meta account.
+             └─ (separately) the OpenXR loader shim remaps Frame→Touch Plus controller bindings
+```
+
+- **`libUnreal.so`** — the game engine + all Pavlov code, one stripped monolith. We never modify
+  it; we reflect into it at runtime. (Game IP — not in this repo.)
+- **`libEOSSDK.so`** — *our* wrapper (`eosshim.cpp`). The game links it by name as the EOS SDK, so
+  its `constructor` runs automatically at load — that's our injection point. It (a) `dlopen`s the
+  mod, (b) `dlopen`s the real SDK renamed `libEOSDK.so`, (c) interposes EOS calls for the
+  Device-ID login. **This is how the mod gets loaded without patching `libUnreal`.**
+- **`libEOSDK.so`** — the genuine Epic Online Services SDK, renamed from `libEOSSDK.so` and
+  soname-patched to `libEOSDK.so` (so our wrapper can take the original name). (Epic IP — not in repo.)
+- **`libpavchams.so`** — *the mod* (`pavchams.cpp`). Once `dlopen`'d, it spins a background thread,
+  self-resolves the engine, inline-hooks `ProcessEvent`, and runs the feature passes. See below.
+- **OpenXR shim lib** — the interaction-profile interposer that makes the Frame build's controllers
+  work on Quest (Frame profile → Touch Plus). Part of the Frame port already baked into the APK.
+- **`classes_patched.dex` / `classes2.dex`** — Java side: a one-method dex patch + an
+  `androidx.browser.customtabs` stub the Frame build's Epic-login browser path was missing.
+
+Full port/auth write-up (EOS Device-ID login, OBB version notes, how the wrapper is built and
+soname-patched): **[docs/EOS-PORT.md](docs/EOS-PORT.md)**.
+
+## How the mod works (architecture)
 
 `pavchams.cpp` is a single translation unit, loaded into the game process (see
 [Loading](#loading)). On a background thread it:
