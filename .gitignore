@@ -1,0 +1,34 @@
+# ---- copyrighted game files (bring your own dump; never commit) ----
+*.apk
+*.apk.idsig
+*.obb
+*.pak
+libEOSDK.so
+stub_libEOSDK.so
+classes*.dex
+*.aar
+AndroidManifest.xml
+UECommandLine.txt
+miniout/
+work/
+tools/
+Debuggable/
+QuestBuild/
+
+# ---- build outputs ----
+libpavchams.so
+libEOSSDK.so
+Pavlov-EOS-*.apk
+
+# ---- signing secrets (generate your own) ----
+*.jks
+*.keystore
+
+# ---- runtime dumps / large artifacts ----
+sdk_dump*.txt
+*.log
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+*.swp
