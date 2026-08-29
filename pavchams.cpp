@@ -31,6 +31,10 @@
 #include <cerrno>
 #include <cstdlib>
 
+#include "mei/mei_settings.h"   // granular feature state (menu <-> core)
+#include "mei/mei_input.h"      // controller-ray -> ImGui cursor bridge
+#include "mei/mei_xr.h"         // OpenXR/Vulkan menu injection
+
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "PAVCHAMS", __VA_ARGS__)
 
 // ---- UE5.1 struct layout (stable 4.25→5.1 arm64; reflection-by-name flags any drift) --------
@@ -625,6 +629,8 @@ static void* c_PavlovPawn = nullptr;
 static void* c_PawnBase = nullptr;
 static void* fn_IsDead = nullptr;
 static void* fn_SetMaterial = nullptr;
+static void* fn_GetMaterial = nullptr;                       // UMeshComponent::GetMaterial (for ESP restore)
+static void* g_chamMesh[256]; static void* g_chamOrig[256]; static int g_nCham = 0;   // orig material cache
 static int32_t o_Avatar = -1, o_XRay0 = -1, o_XRay1 = -1, o_bValid = -1, o_TeamId = -1, o_bDead = -1;
 static inline bool pawn_dead(void* o) { return o_bDead >= 0 && *(uint8_t*)((uint8_t*)o + o_bDead) != 0; }
 static void* c_Mesh = nullptr;
@@ -644,6 +650,10 @@ static int32_t o_AvatarSkin = -1, o_SkullSocket = -1;
 static void* g_fire[16]; static int g_nfire = 0;    // gun fire UFunctions (fire-path hook)
 static void* g_kick[8]; static int g_nkick = 0;     // kick RPCs to DROP (anti-votekick)
 static void* fn_ChangeName = nullptr;               // ServerChangeName (name spoof for custom-map admin)
+// ---- trigger-kill (ported from the PC internal: APavlovPlayerController::ServerReportBulletHit) ----
+static void* fn_ReportHit = nullptr;                // ServerReportBulletHit(FClientBulletHit)
+static void* c_KillGun = nullptr, *c_KillBullet = nullptr;   // GunClass / BulletClass for the report
+static int32_t o_HeadBone = -2;                     // PavlovPawn::HeadBoneName (FName)
 static void* fn_GMChangeName = nullptr; static int32_t o_AuthGM = -1;   // GameModeBase::ChangeName (long names)
 static char g_wantName[64] = {0};                   // desired name from name.txt (direct-write spoof)
 static void* g_knife[6]; static int g_nknife = 0;   // knife throw UFunctions (homing-knife hook)
@@ -657,6 +667,7 @@ static void* g_aim_target = nullptr;                // current silent-aim target
 static int32_t g_myteam = -1;                       // local player's team
 struct FVec { double x, y, z; };
 struct FRot { double pitch, yaw, roll; };
+static FVec g_aim_targetHead{};                     // head pos of current aim target (for trigger-kill)
 static FVec  aim_getloc(void* a) { struct { FVec r; } p{}; if (fn_GetLoc) g_ProcessEvent(a, fn_GetLoc, &p); return p.r; }
 static FRot  aim_getrot(void* a) { struct { FRot r; } p{}; if (fn_GetRot) g_ProcessEvent(a, fn_GetRot, &p); return p.r; }
 static void  aim_setrot(void* a, FRot r) { struct { FRot R; uint8_t tp, ret; } p{ r, 0, 0 }; if (fn_SetRot) g_ProcessEvent(a, fn_SetRot, &p); }
@@ -707,6 +718,7 @@ static void keep_loaded() { /* infinite ammo removed (broke cocking) */ }
 // instance whose Outer == our pawn. Cached per pawn (only re-scans on respawn/match change).
 static int32_t g_mSprint = -1, g_mAds = -1, g_mWalk = -1;
 static void* g_walkComp = nullptr; static float g_walkOrig = 0.f;
+static float g_mSprintOrig = -1.f, g_mAdsOrig = -1.f;   // originals (restore when movement disabled)
 static void* g_mcPawn = nullptr; static void* g_mc = nullptr;
 static void* g_myPS = nullptr; static int32_t g_devOff = -2;   // local PlayerState + bDev (self-view dev tag; -2=unresolved)
 static void* g_hc = nullptr; static int32_t g_hcDmg = -2, g_hcH = -2, g_hcMH = -2;   // godmode (health comp)
@@ -737,9 +749,15 @@ static void* find_movecomp(void* pawn) {
 static void apply_speed() {
     void* mc = g_mc;
     if (!mc || !addr_readable((uintptr_t)mc) || !in_lib(*(uintptr_t*)mc)) return;
-    if (g_mSprint >= 0) *(float*)((uint8_t*)mc + g_mSprint) = 2.0f;   // sprint
-    if (g_mAds    >= 0) *(float*)((uint8_t*)mc + g_mAds)    = 5.0f;   // ADS: fast while aiming
-    if (g_mWalk >= 0 && g_walkOrig > 0.f) *(float*)((uint8_t*)mc + g_mWalk) = g_walkOrig * 2.0f;  // normal (lowered)
+    if (g_mei.master_enabled && g_mei.move_enabled) {             // ON: cheat speeds
+        if (g_mSprint >= 0) *(float*)((uint8_t*)mc + g_mSprint) = g_mei.move_sprint;
+        if (g_mAds    >= 0) *(float*)((uint8_t*)mc + g_mAds)    = g_mei.move_ads;
+        if (g_mWalk >= 0 && g_walkOrig > 0.f) *(float*)((uint8_t*)mc + g_mWalk) = g_walkOrig * g_mei.move_walk;
+    } else {                                                      // OFF: restore captured originals
+        if (g_mSprint >= 0 && g_mSprintOrig >= 0.f) *(float*)((uint8_t*)mc + g_mSprint) = g_mSprintOrig;
+        if (g_mAds    >= 0 && g_mAdsOrig    >= 0.f) *(float*)((uint8_t*)mc + g_mAds)    = g_mAdsOrig;
+        if (g_mWalk   >= 0 && g_walkOrig    >  0.f) *(float*)((uint8_t*)mc + g_mWalk)   = g_walkOrig;
+    }
 }
 // resolve the "Automatic/FullAuto" value of the gun FireMode enum (UEnum Names@0x40 num@0x48). Cached.
 static int g_fireAuto = -999;
@@ -762,11 +780,17 @@ static int fire_auto_value() {
     }
     g_fireAuto = -1; return -1;
 }
+// helpers: write a float/byte at offset, and restore an original value (both guard off<0).
+static inline void wf(void* o, int32_t off, float v)  { if (off >= 0) *(float*)((uint8_t*)o + off) = v; }
+static inline void wb(void* o, int32_t off, uint8_t v){ if (off >= 0) *(uint8_t*)((uint8_t*)o + off) = v; }
 static void do_norecoil(void* pawn) {
     static void* rcls[48]; static int32_t rs[48], rt[48], rm[48], ra[48];
     static int32_t ofr[48], ofd[48], obd[48];                    // FireRate/FireDelay/BurstDelay (rapid)
     static int32_t olsm[48], orpb[48], orc[48], omrc[48], obic[48], omag[48];
     static int32_t ofm[48], odc[48], obl[48], ocl[48], olb[48], obta[48];   // auto-fire: FireMode + bolt/cock
+    // ORIGINAL values captured on first sighting (unmodified gun) -> restored when a feature is OFF.
+    static float o_rs[48], o_olsm[48], o_rt[48], o_rm[48], o_ra[48], o_orpb[48], o_ofr[48], o_ofd[48], o_obd[48], o_orc[48], o_omrc[48];
+    static uint8_t o_ofm[48];
     static int rn = 0;
     void* gun = get_item(pawn, c_Gun);
     if (!gun || !addr_readable((uintptr_t)gun)) gun = get_item(pawn, c_VRGun);
@@ -793,39 +817,67 @@ static void do_norecoil(void* pawn) {
         ocl[rn] = prop_offset(gc, "bChargingLocked");
         olb[rn] = prop_offset(gc, "bLockBolt");
         obta[rn]= prop_offset(gc, "bBoltLockedTillAmmo");
+        // snapshot originals from the (still-unmodified) instance so we can restore on disable
+        #define SNAPF(o,off) o[rn] = (off >= 0) ? *(float*)((uint8_t*)gun + off) : 0.f
+        SNAPF(o_rs,rs[rn]); SNAPF(o_olsm,olsm[rn]); SNAPF(o_rt,rt[rn]); SNAPF(o_rm,rm[rn]);
+        SNAPF(o_ra,ra[rn]); SNAPF(o_orpb,orpb[rn]); SNAPF(o_ofr,ofr[rn]); SNAPF(o_ofd,ofd[rn]);
+        SNAPF(o_obd,obd[rn]); SNAPF(o_orc,orc[rn]); SNAPF(o_omrc,omrc[rn]);
+        o_ofm[rn] = (ofm[rn] >= 0) ? *(uint8_t*)((uint8_t*)gun + ofm[rn]) : 0;
+        #undef SNAPF
         char cn[48]; obj_name(gc, cn, sizeof cn);
-        LOG("gun '%s' spread@%d rc@%d mrc@%d bic@%d mag@%d rpb@%d",
+        LOG("gun '%s' spread@%d rc@%d mrc@%d bic@%d mag@%d rpb@%d (orig captured)",
             cn, rs[rn], orc[rn], omrc[rn], obic[rn], omag[rn], orpb[rn]);
         ci = rn++; }
     if (ci >= 48) return;
-    // no-recoil + perfect accuracy (cfg>=2): zero recoil + spread floats (never the pellet-count int)
-    if (rs[ci]  >= 0) *(float*)((uint8_t*)gun + rs[ci])  = 0.f;
-    if (rt[ci]  >= 0) *(float*)((uint8_t*)gun + rt[ci])  = 0.f;
-    if (rm[ci]  >= 0) *(float*)((uint8_t*)gun + rm[ci])  = 0.f;
-    if (ra[ci]  >= 0) *(float*)((uint8_t*)gun + ra[ci])  = 0.f;
-    if (olsm[ci]>= 0) *(float*)((uint8_t*)gun + olsm[ci])= 0.f;
-    if (orpb[ci]>= 0) *(float*)((uint8_t*)gun + orpb[ci])= 0.f;
-    g_ammoGun = nullptr;   // cleared unless cfg>=4 re-publishes it below
-    if (g_cfg >= 4) {
-        // rapid fire: shrink the fire intervals ("Delay" fields are seconds -> tiny)
-        if (ofd[ci] >= 0) *(float*)((uint8_t*)gun + ofd[ci]) = 0.02f;
-        if (obd[ci] >= 0) *(float*)((uint8_t*)gun + obd[ci]) = 0.02f;
-        if (ofr[ci] >= 0) { float* fr = (float*)((uint8_t*)gun + ofr[ci]);
-            if (*fr > 0.005f && *fr < 5.f) *fr = 0.03f;   // seconds/shot -> tiny (faster)
-            else if (*fr >= 5.f) *fr = 1200.f;            // rounds/min -> high (faster)
-        }
-        // auto-fire: force FireMode to Automatic. Do NOT touch cocking/bolt-lock — that bricks the
-        // rechamber when the chamber empties (can't cock). Cocking stays normal; the 999 mag feeds it.
-        if (ofm[ci] >= 0) { int av = fire_auto_value(); if (av >= 0) *(uint8_t*)((uint8_t*)gun + ofm[ci]) = (uint8_t)av; }
+    // effective flags: master AND feature. When master (or the feature) is OFF -> restore originals.
+    const bool M = g_mei.master_enabled;
+    const bool f_acc = M && g_mei.perfect_accuracy, f_rec = M && g_mei.no_recoil;
+    const bool f_rapid = M && g_mei.rapid_fire, f_auto = M && g_mei.force_auto, f_nrl = M && g_mei.no_reload;
+    // perfect accuracy: zero the spread floats when ON, restore originals when OFF
+    if (f_acc) { wf(gun, rs[ci], 0.f); wf(gun, olsm[ci], 0.f); }
+    else       { wf(gun, rs[ci], o_rs[ci]); wf(gun, olsm[ci], o_olsm[ci]); }
+    // no recoil: zero the recoil floats when ON, restore when OFF
+    if (f_rec) { wf(gun, rt[ci],0.f); wf(gun, rm[ci],0.f); wf(gun, ra[ci],0.f); wf(gun, orpb[ci],0.f); }
+    else       { wf(gun, rt[ci],o_rt[ci]); wf(gun, rm[ci],o_rm[ci]); wf(gun, ra[ci],o_ra[ci]); wf(gun, orpb[ci],o_orpb[ci]); }
+    g_ammoGun = nullptr;   // re-published below if rapid/auto is on
+    {
+        // rapid fire: shrink the intervals when ON, restore captured originals when OFF
+        if (f_rapid) {
+            wf(gun, ofd[ci], 0.02f); wf(gun, obd[ci], 0.02f);
+            if (ofr[ci] >= 0) { float* fr = (float*)((uint8_t*)gun + ofr[ci]);
+                if (*fr > 0.005f && *fr < 5.f) *fr = 0.03f;   // seconds/shot -> tiny (faster)
+                else if (*fr >= 5.f) *fr = 1200.f;            // rounds/min -> high (faster)
+            }
+        } else { wf(gun, ofd[ci], o_ofd[ci]); wf(gun, obd[ci], o_obd[ci]); wf(gun, ofr[ci], o_ofr[ci]); }
+        // auto-fire: force FireMode to Automatic when ON, restore the original fire mode when OFF.
+        if (f_auto && ofm[ci] >= 0) {
+            int av = fire_auto_value(); if (av >= 0) *(uint8_t*)((uint8_t*)gun + ofm[ci]) = (uint8_t)av; }
+        else if (!f_auto) wb(gun, ofm[ci], o_ofm[ci]);
         (void)odc; (void)obl; (void)ocl; (void)olb; (void)obta; (void)obic;
-        // no-reload: zero the reload cooldowns (does NOT touch chamber/bolt, so cocking still works)
-        if (orc[ci]  >= 0) *(float*)((uint8_t*)gun + orc[ci])  = 0.f;
-        if (omrc[ci] >= 0) *(float*)((uint8_t*)gun + omrc[ci]) = 0.f;
-        // (infinite ammo removed — it bricked cocking/rechamber)
-        // publish for the per-PE keep_loaded() (high-freq top-up so an auto gun never runs dry)
-        g_ammoGun = gun; g_ammoMagOff = omag[ci]; g_ammoBIC = obic[ci];
-        // movement speed: find PavlovMovementComponent whose Outer == our pawn
-        void* mc = find_movecomp(pawn);
+        // no-reload: zero cooldowns when ON, restore originals when OFF
+        if (f_nrl) { wf(gun, orc[ci], 0.f); wf(gun, omrc[ci], 0.f); }
+        else       { wf(gun, orc[ci], o_orc[ci]); wf(gun, omrc[ci], o_omrc[ci]); }
+        // infinite ammo (PC reference: Magazine->Bullets = MaxBullets). Purely a top-up; no chamber/bolt.
+        if (M && g_mei.infinite_ammo && omag[ci] >= 0) {
+            void* mag = *(void**)((uint8_t*)gun + omag[ci]);
+            if (mag && addr_readable((uintptr_t)mag) && in_lib(*(uintptr_t*)mag)) {
+                if (g_magBul < 0) { void* mgc = obj_class(mag);
+                    g_magBul = prop_offset(mgc, "Bullets"); g_magMax = prop_offset(mgc, "MaxBullets");
+                    LOG("mag: Bullets@%d MaxBullets@%d", g_magBul, g_magMax); }
+                if (g_magBul >= 0 && g_magMax >= 0) {
+                    int32_t mx = *(int32_t*)((uint8_t*)mag + g_magMax);
+                    if (mx > 0 && mx < 10000) *(int32_t*)((uint8_t*)mag + g_magBul) = mx;
+                }
+            }
+        }
+        // publish for the per-PE keep_loaded() (only while rapid/auto wants a topped mag)
+        if (f_rapid || f_auto) { g_ammoGun = gun; g_ammoMagOff = omag[ci]; g_ammoBIC = obic[ci]; }
+        // movement speed. Only SCAN for the movecomp when the feature is ON (the scan is expensive and
+        // re-fires on respawn -> post-death lag). When OFF, restore via the cached component only if
+        // it's still the same live pawn; a respawn drops the cache and the game resets speeds anyway.
+        void* mc = nullptr;
+        if (g_mei.master_enabled && g_mei.move_enabled) mc = find_movecomp(pawn);
+        else if (g_mc && g_mcPawn == pawn && addr_readable((uintptr_t)g_mc) && in_lib(*(uintptr_t*)g_mc)) mc = g_mc;
         static int mdbg = 0; if (mdbg++ < 3) LOG("move dbg: mc=%p", mc);
         if (mc && addr_readable((uintptr_t)mc) && in_lib(*(uintptr_t*)mc)) {
             if (g_mSprint == -1) { void* mcc = obj_class(mc);
@@ -835,15 +887,18 @@ static void do_norecoil(void* pawn) {
                 char mcn[48]; obj_name(mcc, mcn, sizeof mcn);
                 LOG("move: class '%s' sprint@%d ads@%d walk@%d", mcn, g_mSprint, g_mAds, g_mWalk);
             }
-            if (g_mWalk >= 0) {   // capture the ORIGINAL walk speed once per component (for apply_speed)
-                float* w = (float*)((uint8_t*)mc + g_mWalk);
-                if (mc != g_walkComp) { g_walkComp = mc;
-                    if (*w > 20.f && *w < 4000.f) g_walkOrig = *w; else g_walkOrig = 0.f; }
+            if (mc != g_walkComp) {   // capture ORIGINALS once per component (for restore)
+                g_walkComp = mc;
+                if (g_mWalk >= 0)   { float w = *(float*)((uint8_t*)mc + g_mWalk);   g_walkOrig   = (w>20.f&&w<4000.f)?w:0.f; }
+                if (g_mSprint >= 0) g_mSprintOrig = *(float*)((uint8_t*)mc + g_mSprint);
+                if (g_mAds >= 0)    g_mAdsOrig    = *(float*)((uint8_t*)mc + g_mAds);
             }
-            apply_speed();   // write the speeds now too (per-PE apply in handler keeps them winning)
+            apply_speed();   // writes cheat speeds if enabled, else restores originals
         }
-        // godmode: resolve the health component + offsets, publish for per-PE keep_god()
-        static int32_t o_hcp = -2;
+        // godmode: resolve the health component + offsets. Resolve it EVEN WHEN OFF so we can restore
+        // the original DamageMultiplier (else you stay invincible after disabling).
+        static int32_t o_hcp = -2; static float g_hcDmgOrig = -1.f;
+        {
         if (o_hcp == -2) o_hcp = prop_offset(obj_class(pawn), "HealthComponent");
         if (o_hcp >= 0) { void* hc = *(void**)((uint8_t*)pawn + o_hcp);
             if (hc && addr_readable((uintptr_t)hc) && in_lib(*(uintptr_t*)hc)) {
@@ -851,10 +906,14 @@ static void do_norecoil(void* pawn) {
                     g_hcDmg = prop_offset(c, "DamageMultiplier");
                     g_hcH   = prop_offset(c, "Health");
                     g_hcMH  = prop_offset(c, "MaxHealth");
-                    LOG("god: hc=%p dm@%d h@%d mh@%d", hc, g_hcDmg, g_hcH, g_hcMH); }
-                g_hc = hc; keep_god();
+                    if (g_hcDmg >= 0) g_hcDmgOrig = *(float*)((uint8_t*)hc + g_hcDmg);   // capture original
+                    LOG("god: hc=%p dm@%d h@%d mh@%d orig=%.2f", hc, g_hcDmg, g_hcH, g_hcMH, g_hcDmgOrig); }
+                if (M && g_mei.godmode) { g_hc = hc; keep_god(); }
+                else { g_hc = nullptr;                                    // restore original damage taken
+                    if (g_hcDmg >= 0) *(float*)((uint8_t*)hc + g_hcDmg) = (g_hcDmgOrig >= 0.f ? g_hcDmgOrig : 1.f); }
             }
         } else g_hc = nullptr;
+        }   // end else (godmode enabled)
     }
 }
 // per-class verdict cache — decode each class name ONCE, then pointer-compare (kills per-frame decodes)
@@ -960,7 +1019,8 @@ static void do_aim(void* me, bool rotate, bool tp) {
                         FRot to = look_at(gunLoc, head);
                         double dp = fabs(angnorm(to.pitch - gunRot.pitch));
                         double dy = fabs(angnorm(to.yaw - gunRot.yaw));
-                        if (dp <= 25.0 && dy <= 25.0) { double sc = dp + dy;
+                        double cone = g_mei.aim_fov * 0.5; if (cone < 1.0) cone = 1.0;
+                        if (dp <= cone && dy <= cone) { double sc = dp + dy;
                             if (sc < bestScore) { bestScore = sc; best = o; bestHead = head; } }
                     }
                 }
@@ -969,6 +1029,7 @@ static void do_aim(void* me, bool rotate, bool tp) {
         g_fguard = 0;
     }
     g_aim_target = best;
+    if (best) g_aim_targetHead = bestHead;   // remember head pos for trigger-kill (ServerReportBulletHit)
     static int ac = 0; if (rotate && ac++ < 30)
         LOG("aim: nbots=%d best=%p score=%.0f", g_nbots, best, bestScore);
     if (rotate && best) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
@@ -990,6 +1051,7 @@ static void resolve_names() {
     c_Mesh = find_class("SkeletalMeshComponent");    // only skinned meshes (renderable bodies)
     fn_SetOverlay = c_Mesh ? find_func(c_Mesh, "SetOverlayMaterial") : nullptr;
     fn_SetMaterial = c_Mesh ? find_func(c_Mesh, "SetMaterial") : nullptr;
+    fn_GetMaterial = c_Mesh ? find_func(c_Mesh, "GetMaterial") : nullptr;   // for ESP restore-on-disable
     fn_CompLoc = c_Mesh ? find_func(c_Mesh, "K2_GetComponentLocation") : nullptr;
     o_SkelAsset = c_Mesh ? prop_offset(c_Mesh, "SkeletalMeshAsset") : -1;
     if (o_SkelAsset < 0 && c_Mesh) o_SkelAsset = prop_offset(c_Mesh, "SkinnedAsset");
@@ -1029,6 +1091,13 @@ static void resolve_names() {
       for (int k = 0; k < 3 && cpc; k++) { void* fn = find_func(cpc, kn[k]);
           if (fn) { g_kick[g_nkick++] = fn; LOG("kick RPC '%s' = %p", kn[k], fn); } }
       fn_ChangeName = cpc ? find_func(cpc, "ServerChangeName") : nullptr;   // name spoof (custom-map admin)
+      // trigger-kill RPC + the gun/bullet classes the PC reference uses for a guaranteed headshot
+      void* cpvc = find_class("PavlovPlayerController");
+      fn_ReportHit = cpvc ? find_func(cpvc, "ServerReportBulletHit") : nullptr;
+      c_KillGun    = find_class("Gun_AntiTank_C");     // strong default (falls back to held gun at call)
+      c_KillBullet = find_class("Bullet_50Cal_C");
+      o_HeadBone   = c_PavlovPawn ? prop_offset(c_PavlovPawn, "HeadBoneName") : -1;
+      LOG("triggerkill: ReportHit=%p KillGun=%p KillBullet=%p HeadBone@%d", fn_ReportHit, c_KillGun, c_KillBullet, o_HeadBone);
       void* cgm = find_class("GameModeBase");
       fn_GMChangeName = cgm ? find_func(cgm, "ChangeName") : nullptr;       // proper rename (any length, allocates)
       void* cw2 = find_class("World"); o_AuthGM = cw2 ? prop_offset(cw2, "AuthorityGameMode") : -1;
@@ -1304,6 +1373,28 @@ static void call_setmaterial(void* mesh, int32_t idx, void* mat) {
     struct { int32_t Index; char _pad[4]; void* Material; } p{ idx, {0}, mat };
     g_ProcessEvent(mesh, fn_SetMaterial, &p);
 }
+static void* get_material(void* mesh, int32_t idx) {         // GetMaterial(idx) -> UMaterialInterface*
+    if (!fn_GetMaterial || !mesh) return nullptr;
+    struct { int32_t Index; char _pad[4]; void* Ret; } p{ idx, {0}, nullptr };
+    g_ProcessEvent(mesh, fn_GetMaterial, &p);
+    return p.Ret;
+}
+// snapshot a mesh's ORIGINAL material[0] the first time we override it (so ESP can be turned OFF).
+static void cham_snapshot(void* mesh) {
+    for (int i = 0; i < g_nCham; i++) if (g_chamMesh[i] == mesh) return;   // already captured
+    if (g_nCham >= 256) return;
+    void* orig = get_material(mesh, 0);
+    g_chamMesh[g_nCham] = mesh; g_chamOrig[g_nCham] = orig; g_nCham++;
+}
+// restore every overridden mesh to its captured original, then clear the cache (called on disable).
+static void cham_restore_all() {
+    for (int i = 0; i < g_nCham; i++) {
+        void* mesh = g_chamMesh[i];
+        if (!mesh || !addr_readable((uintptr_t)mesh) || !in_lib(*(uintptr_t*)mesh)) continue;
+        g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) call_setmaterial(mesh, 0, g_chamOrig[i]); g_fguard = 0;
+    }
+    g_nCham = 0;
+}
 static bool is_owned_by(void* o, void* pawn) {           // walk Outer chain
     for (int d = 0; d < 8 && o && addr_readable((uintptr_t)o); d++) {
         if (o == pawn) return true;
@@ -1314,10 +1405,17 @@ static bool is_owned_by(void* o, void* pawn) {           // walk Outer chain
 
 #define CHAMS_TXT "/sdcard/Android/data/com.vankrupt.pavlov/files/chams.txt"
 static int cfg_value() {
-    static int val = 2;   // read at chams_pass rate (~10Hz) so button toggles apply promptly
+    // The mei menu (g_mei) is now the source of truth. chams.txt stays as a manual escape hatch:
+    // an explicit 8/9 still forces the one-shot whitelist/SDK dump from adb without the menu.
+    int file_v = -1;
     FILE* f = fopen(CHAMS_TXT, "r");
-    if (f) { int v = 2; fscanf(f, "%d", &v); val = v; fclose(f); }
-    return val;
+    if (f) { int v = -1; if (fscanf(f, "%d", &v) == 1) file_v = v; fclose(f); }
+    if (file_v == 7) g_mei.menu_open = true;   // bring-up override: force the panel visible via adb
+    if (file_v == 8 || file_v == 9) return file_v;
+    // menu action buttons also request the dumps
+    if (g_mei.act_dump_sdk)       { return 9; }
+    if (g_mei.act_dump_whitelist) { return 8; }
+    return mei_legacy_cfg(g_mei);   // 0 / 2 / 3 / 4 / 6 derived from the granular toggles
 }
 static void cfg_write(int v) { FILE* f = fopen(CHAMS_TXT, "w"); if (f) { fprintf(f, "%d", v); fclose(f); } }
 
@@ -1546,14 +1644,20 @@ static void scan_bots() {
 static void chams_pass() {
     if (!g_ready) return;
     g_cfg = cfg_value();
-    bool on = g_cfg >= 2, hide = g_cfg == 5;
-    // NAME SPOOF: read name.txt -> g_wantName. Applied CLIENT-SIDE via in-place write (devtag block).
-    // No ChangeName/ServerChangeName RPC (server forces name back to "null" anyway, and it corrupted/crashed).
+    bool on = g_mei.master_enabled && g_mei.chams_enabled;   // chams gate (menu-driven)
+    bool hide = false;                                       // hide-test path retired
+    // NAME SPOOF: menu (g_mei.name_text) is primary; name.txt kept as an adb fallback. Applied
+    // CLIENT-SIDE via in-place write (devtag block). No ServerChangeName RPC (server forces it back).
     {
         char want[64] = {0};
-        FILE* nf = fopen("/sdcard/Android/data/com.vankrupt.pavlov/files/name.txt", "r");
-        if (nf) { if (fgets(want, sizeof want, nf)) { int L = (int)strlen(want);
-            while (L > 0 && (want[L-1]=='\n'||want[L-1]=='\r')) want[--L] = 0; } fclose(nf); }
+        if (g_mei.name_enabled && g_mei.name_text[0]) {
+            strncpy(want, g_mei.name_text, sizeof want - 1);
+        } else {
+            FILE* nf = fopen("/sdcard/Android/data/com.vankrupt.pavlov/files/name.txt", "r");
+            if (nf) { if (fgets(want, sizeof want, nf)) { int L = (int)strlen(want);
+                while (L > 0 && (want[L-1]=='\n'||want[L-1]=='\r')) want[--L] = 0; } fclose(nf); }
+        }
+        g_wantName[0] = 0;
         if (want[0]) strncpy(g_wantName, want, sizeof g_wantName - 1);
     }
     g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) force_load_xray(); g_fguard = 0;
@@ -1568,7 +1672,7 @@ static void chams_pass() {
                     void* pc = obj_class(ps);
                     if (pc != devCls) { devCls = pc; g_devOff = prop_offset(pc, "bDev");   // re-resolve on class change only
                         LOG("devtag: PlayerState=%p class-changed bDev@%d", ps, g_devOff); }
-                    g_myPS = ps; if (g_devOff >= 0) *(uint8_t*)((uint8_t*)ps + g_devOff) = 1;
+                    g_myPS = ps; if (g_devOff >= 0) *(uint8_t*)((uint8_t*)ps + g_devOff) = (g_mei.master_enabled && g_mei.dev_tag) ? 1 : 0;
                     // NAME SPOOF: in-place write ONLY if our string fits the game's existing FString
                     // buffer (never change the Data pointer -> game still owns/frees it -> no crash).
                     static int32_t o_pn = -2; if (o_pn == -2) o_pn = prop_offset(pc, "PlayerNamePrivate");
@@ -1581,20 +1685,30 @@ static void chams_pass() {
                             d[wlen] = 0; *(int32_t*)((uint8_t*)ps + o_pn + 8) = wlen + 1;   // ArrayNum
                         }
                     }
-                    static long nlast = 0; struct timespec nts; clock_gettime(CLOCK_MONOTONIC, &nts);
-                    if (o_pn >= 0 && nts.tv_sec != nlast) { nlast = nts.tv_sec;
+                    if (o_pn >= 0) {   // log the current name only when it actually CHANGES (no per-second spam)
                         char16_t* d = *(char16_t**)((uint8_t*)ps + o_pn);
                         int32_t cnt = *(int32_t*)((uint8_t*)ps + o_pn + 8);
                         char nm[64] = ""; if (d && addr_readable((uintptr_t)d) && cnt > 0 && cnt < 63)
                             for (int i = 0; i < cnt && d[i]; i++) nm[i] = (char)d[i];
-                        LOG("NAME: '%s' (@%d cnt=%d)", nm, o_pn, cnt); }
+                        static char nlast[64] = {0};
+                        if (strcmp(nm, nlast)) { strncpy(nlast, nm, sizeof nlast - 1); LOG("NAME: '%s' (@%d cnt=%d)", nm, o_pn, cnt); }
+                    }
                 }
             }
         } g_fguard = 0;
     }
     // (in-headset both-grips toggle removed: two-handing a rifle triggered it and cycled to OFF)
-    if (on && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_norecoil(me); g_fguard = 0; }
-    if (!on) return;
+    // weapon/movement/god pass. Run while any feature is ON (apply), PLUS a one-shot pass the first
+    // time they all go OFF (restore). NEVER run it continuously with everything off — that re-triggers
+    // the movecomp object-scan on every respawn and tanks FPS after dying.
+    bool anyFeat = g_mei.master_enabled && (g_mei.no_recoil || g_mei.perfect_accuracy || g_mei.rapid_fire ||
+                   g_mei.force_auto || g_mei.no_reload || g_mei.move_enabled || g_mei.godmode);
+    static bool ranLast = false;
+    if ((anyFeat || ranLast) && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_norecoil(me); g_fguard = 0; }
+    ranLast = anyFeat;   // when all go off, we run ONE more restore pass next tick, then stop
+    // ESP restore: the moment chams turns OFF, put every overridden mesh back to its original material
+    // (else the x-ray stays until respawn). One-shot: cham_restore_all clears the cache.
+    if (!on) { if (g_nCham > 0) cham_restore_all(); return; }
     for (int i = 0; i < g_nbots; i++) {
         void* o = g_bots[i];
         if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o)) continue;
@@ -1603,14 +1717,17 @@ static void chams_pass() {
         void* avatar = (o_Avatar >= 0) ? rd_obj(o, o_Avatar) : nullptr;   // read fresh
         if (!avatar || !addr_readable((uintptr_t)avatar) || !in_lib(*(uintptr_t*)avatar)) continue;
         int32_t team = (o_TeamId >= 0) ? *(int32_t*)((uint8_t*)o + o_TeamId) : 0;
-        void* mat = (team == 0) ? g_xray1 : g_xray0;   // swapped: team colors were reversed
+        void* mat = g_mei.chams_team_color ? ((team == 0) ? g_xray1 : g_xray0)   // swapped: colors were reversed
+                                           : g_xray_mat;                          // single-color mode
         if (!is_material(mat)) mat = g_xray_mat;
-        if (o == g_aim_target) { void* hl = (team == 0) ? g_xray0 : g_xray1; if (is_material(hl)) mat = hl; }
+        if (g_mei.chams_highlight && o == g_aim_target) {
+            void* hl = (team == 0) ? g_xray0 : g_xray1; if (is_material(hl)) mat = hl; }
         if (!is_material(mat)) continue;
         g_fguard = 1;
         if (!sigsetjmp(g_fjmp, 1)) {
             if (hide && fn_SetVis) { struct { uint8_t v, p; } vp{ 0, 1 }; g_ProcessEvent(avatar, fn_SetVis, &vp); }
-            else call_setmaterial(avatar, 0, mat);        // single call; overlay is a no-op on mobile
+            else { cham_snapshot(avatar);                 // capture original ONCE before overriding
+                   call_setmaterial(avatar, 0, mat); }    // single call; overlay is a no-op on mobile
         }
         g_fguard = 0;
     }
@@ -1751,9 +1868,110 @@ static void knife_home() {
     }
     g_fguard = 0;
 }
+// ===========================================================================
+//  mei menu input feed  (reflection owns engine access; math lives in mei_input.cpp)
+// ===========================================================================
+// Head pose from APlayerController::GetPlayerViewPoint; the aim ray from the held gun's transform
+// (both already proven in this codebase). Both expressed in the SAME head-local frame downstream,
+// so the cursor stays consistent with the view-space OpenXR quad — no world<->tracking calibration.
+static void* fn_ViewPoint = nullptr;
+static void rot_basis(double pitch, double yaw, float fwd[3], float right[3], float up[3]) {
+    const double D2R = 0.017453292519943295;
+    double cy = cos(yaw*D2R), sy = sin(yaw*D2R), cp = cos(pitch*D2R), sp = sin(pitch*D2R);
+    fwd[0]=(float)(cp*cy); fwd[1]=(float)(cp*sy); fwd[2]=(float)sp;
+    right[0]=(float)(-sy);  right[1]=(float)(cy);  right[2]=0.f;                 // UE Y (roll=0)
+    // up = fwd x right  (=+Z at identity)
+    up[0]=(float)(fwd[1]*right[2]-fwd[2]*right[1]);
+    up[1]=(float)(fwd[2]*right[0]-fwd[0]*right[2]);
+    up[2]=(float)(fwd[0]*right[1]-fwd[1]*right[0]);
+}
+static void mei_feed_input() {
+    if (!g_ready) return;
+    // ProcessEvent fires ~20k times/frame — do NOT syscall every call. Cheaply skip most, then a
+    // real ~60 Hz clock gate on the survivors. (The old per-PE clock_gettime was the lag source.)
+    static unsigned tick = 0; if ((++tick & 15) != 0) return;
+    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000;
+    if (ms - last < 16) return; last = ms;                   // ~60 Hz cap on the heavy reflected calls
+
+    void* pc = local_controller();
+    if (!pc || !addr_readable((uintptr_t)pc)) return;
+    if (!fn_ViewPoint) fn_ViewPoint = find_func(obj_class(pc), "GetPlayerViewPoint");
+    if (!fn_ViewPoint) return;
+    // GetPlayerViewPoint(FVector& Location, FRotator& Rotation): Location@0 (3 doubles), Rotation@24
+    // (pitch,yaw,roll doubles). UE5.1 = double precision.
+    uint8_t p[64]; memset(p, 0, sizeof p);
+    g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; return; }
+    g_ProcessEvent(pc, fn_ViewPoint, p); g_fguard = 0;
+    double* L = (double*)(p + 0); double* R = (double*)(p + 24);
+
+    float hpos[3] = { (float)L[0], (float)L[1], (float)L[2] };
+    float hf[3], hr[3], hu[3];
+    rot_basis(R[0], R[1], hf, hr, hu);
+
+    // aim ray from the held gun (fall back to head-forward if no gun in hand)
+    void* me = local_pawn(); void* gun = nullptr;
+    if (me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
+        gun = get_item(me, c_Gun);
+        if (!gun || !addr_readable((uintptr_t)gun)) gun = get_item(me, c_VRGun);
+    } g_fguard = 0; }
+    float cpos[3], cfwd[3];
+    double gun_pitch = R[0];
+    if (gun && addr_readable((uintptr_t)gun) && in_lib(*(uintptr_t*)gun)) {
+        FVec gl{}; FRot gr{};
+        g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) { gl = aim_getloc(gun); gr = aim_getrot(gun); } g_fguard = 0;
+        cpos[0]=(float)gl.x; cpos[1]=(float)gl.y; cpos[2]=(float)gl.z;
+        float rr[3], uu[3]; rot_basis(gr.pitch, gr.yaw, cfwd, rr, uu);
+        gun_pitch = gr.pitch;
+    } else {
+        cpos[0]=hpos[0]; cpos[1]=hpos[1]; cpos[2]=hpos[2];
+        cfwd[0]=hf[0]; cfwd[1]=hf[1]; cfwd[2]=hf[2];
+    }
+
+    mei_input_feed(hpos, hr, hu, hf, cpos, cfwd, false);   // click comes from the real trigger (mei_xr)
+
+    // OPEN: primary is the LEFT STICK PRESS (L3), handled in mei_xr via our injected action set.
+    // The up-point gesture stays ONLY as a fallback until those real buttons report live — so the
+    // menu is still openable on first boot if bindings need tuning.
+    if (!mei_xr_actions_live()) {
+        static long up_since = 0; static bool armed = true;
+        bool pointing_up = gun_pitch > 55.0;
+        if (pointing_up) {
+            if (up_since == 0) up_since = ms;
+            if (armed && ms - up_since > 600) {
+                g_mei.menu_open = !g_mei.menu_open; armed = false;
+                LOG("mei: menu %s (up-gesture fallback)", g_mei.menu_open ? "OPEN" : "closed");
+            }
+        } else { up_since = 0; armed = true; }
+    }
+}
+
+// TRIGGER-KILL: report a headshot bullet-hit on `target` to the server (client-authoritative hit-reg).
+// FClientBulletHit (UE5.1 doubles, from the PC SDK): Target@0x00 Hit@0x08 bHeadshot@0x20 bPenetrated@0x21
+// BulletClass@0x28 GunClass@0x30 Origin@0x38 BoneName(FName)@0x50 Timestamp@0x58 (size 0x60).
+static void report_hit(void* target, FVec head, void* heldGun) {
+    if (!fn_ReportHit || !target || !addr_readable((uintptr_t)target)) return;
+    void* pc = local_controller();
+    if (!pc || !addr_readable((uintptr_t)pc) || !in_lib(*(uintptr_t*)pc)) return;
+    uint8_t p[0x60]; memset(p, 0, sizeof p);
+    *(void**)(p + 0x00) = target;                 // Target
+    *(FVec*)(p + 0x08)  = head;                    // Hit
+    p[0x20] = 1;                                   // bHeadshot
+    p[0x21] = 1;                                   // bPenetrated
+    void* gunCls = c_KillGun;                      // strong default; fall back to the gun that fired
+    if (!gunCls && heldGun && addr_readable((uintptr_t)heldGun)) gunCls = obj_class(heldGun);
+    if (c_KillBullet) *(void**)(p + 0x28) = c_KillBullet;   // BulletClass
+    if (gunCls)       *(void**)(p + 0x30) = gunCls;         // GunClass
+    *(FVec*)(p + 0x38)  = head;                    // Origin
+    if (o_HeadBone >= 0) *(uint64_t*)(p + 0x50) = *(uint64_t*)((uint8_t*)target + o_HeadBone);  // BoneName
+    g_ProcessEvent(pc, fn_ReportHit, p);
+}
+
 static void handler(void* obj, void* func, void* params) {
+    // mei menu input feed (throttled inside; guarded against PE re-entry)
+    if (!g_in_pass && g_ready) { g_in_pass = true; mei_feed_input(); g_in_pass = false; }
     // homing knife: mark the thrown knife on a throw call, then steer it per-PE toward nearest enemy
-    if (g_ready && g_cfg >= 3 && g_nknife) {
+    if (g_ready && g_mei.master_enabled && g_mei.homing_knife && g_nknife) {
         for (int k = 0; k < g_nknife; k++) if (g_knife[k] == func) { g_thrownKnife = obj;
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); g_throwMs = ts.tv_sec*1000 + ts.tv_nsec/1000000;
             LOG("knife thrown %p -> homing", obj); break; }
@@ -1763,15 +1981,17 @@ static void handler(void* obj, void* func, void* params) {
     // (ClientReturnToMainMenu is used for normal navigation) -> trapped the user at the menu.
     // movement: apply speeds per-PE (cheap write only). Re-finding the movecomp is done at 10Hz in
     // do_norecoil — NEVER scan the object array per-PE here (that was a 20k-object scan every frame = 1fps).
-    if (g_cfg >= 4 && g_mc && addr_readable((uintptr_t)g_mc) && in_lib(*(uintptr_t*)g_mc)) apply_speed();
+    if (g_mei.move_enabled && g_mc && addr_readable((uintptr_t)g_mc) && in_lib(*(uintptr_t*)g_mc)) apply_speed();
     // godmode: per-PE so no hit slips through (offline; server-auth online)
-    if (g_cfg >= 4 && g_hc) keep_god();
+    if (g_mei.godmode && g_hc) keep_god();
     // dev tag (self-view): keep bDev=1 per-PE so it holds against server replication
-    if (g_ready && g_myPS && g_devOff >= 0 && addr_readable((uintptr_t)g_myPS) &&
+    if (g_mei.master_enabled && g_mei.dev_tag && g_ready && g_myPS && g_devOff >= 0 && addr_readable((uintptr_t)g_myPS) &&
         in_lib(*(uintptr_t*)g_myPS)) *(uint8_t*)((uint8_t*)g_myPS + g_devOff) = 1;
     // fire-path silent aim: the instant a gun fire function is called, snap the aim so the shot
     // traces at the target's head — the motion controller can't override it at this tick.
-    if (!g_in_pass && g_ready && g_nfire && g_cfg >= 3) {
+    if (!g_in_pass && g_ready && g_nfire && g_mei.master_enabled &&
+        ((g_mei.aim_enabled && g_mei.aim_mode >= AIM_ONFIRE) || g_mei.trigger_kill)) {
+        bool aimOn = g_mei.aim_enabled && g_mei.aim_mode >= AIM_ONFIRE;
         bool fire = false; for (int k = 0; k < g_nfire; k++) if (g_fire[k] == func) { fire = true; break; }
         if (fire) {
             static bool dumped = false;
@@ -1797,14 +2017,20 @@ static void handler(void* obj, void* func, void* params) {
             }
             g_in_pass = true;
             void* me = local_pawn();
-            if (me) do_aim(me, true, true);              // fire tick: rotate + bullet TP (beats server-auth online)
+            if (me) do_aim(me, aimOn, aimOn);            // select target (+ rotate/TP only if silent-aim on)
+            // trigger-kill: report a headshot on the selected target the instant you fire
+            if (g_mei.trigger_kill && g_aim_target && addr_readable((uintptr_t)g_aim_target) &&
+                in_lib(*(uintptr_t*)g_aim_target)) {
+                g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) report_hit(g_aim_target, g_aim_targetHead, obj); g_fguard = 0;
+            }
             g_in_pass = false;
         }
     }
     // continuous aim (cfg 6): run on the LATE-frame ReceiveDrawHUD path (our PostRender equivalent) so
     // our rotation is the last write before the frame replicates — the reference works online for this
     // exact reason. Fall back to ~90Hz timer if the HUD event doesn't fire.
-    if (!g_in_pass && g_ready && g_cfg == 6) {
+    if (!g_in_pass && g_ready && g_mei.master_enabled && g_mei.aim_enabled &&
+        g_mei.aim_mode == AIM_CONTINUOUS) {
         bool isHud = false; for (int k = 0; k < g_ndrawhud; k++) if (g_drawhud[k] == func) { isHud = true; break; }
         static long last_aim = 0;
         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1840,6 +2066,7 @@ static void handler(void* obj, void* func, void* params) {
 // ===========================================================================
 static void* boot(void*) {
     install_fault();
+    mei_load();                 // pull saved feature state (mei.cfg) before anything gates on it
     scan_maps();
     if (!g_base) { LOG("libUnreal not mapped yet"); return nullptr; }
     LOG("libUnreal base=%p text=[%p,%p]", (void*)g_base, (void*)g_text_lo, (void*)g_text_hi);
@@ -1856,24 +2083,26 @@ static void* boot(void*) {
             if (g_ready) {
                 uintptr_t pe = find_processevent();
                 if (!pe) { g_ready = false; struct timespec t{0,100000000}; nanosleep(&t,nullptr); continue; }
-                LOG("PE @ lib+0x%lx — hook DISARMED. arm with: echo 2 > chams.txt", pe - g_base);
+                LOG("PE @ lib+0x%lx — hook DISARMED. arms when g_mei.master_enabled (default on).", pe - g_base);
                 for (;;) {                               // discovery done; arm the hook on demand
                     int v = 1;
                     FILE* f = fopen("/sdcard/Android/data/com.vankrupt.pavlov/files/chams.txt", "r");
                     if (f) { fscanf(f, "%d", &v); fclose(f); }
-                    if (v >= 2) {
+                    if (v >= 2 || g_mei.master_enabled) {   // menu master switch (or legacy chams.txt) arms it
                         LOG("arming: hooking PE @ lib+0x%lx", pe - g_base);
                         if (inline_hook(pe)) {
-                            LOG("=== chams live ===");
+                            LOG("=== mei live ===");
                             for (;;) {
                                 int cv = cfg_value();
-                                if (cv == 9) {                   // one-shot SDK dump mode
+                                if (cv == 9) {                   // one-shot SDK dump (menu button or chams.txt=9)
                                     static bool dumped = false;
                                     if (!dumped) { LOG("sdk dump: starting..."); dump_sdk(); dumped = true; }
+                                    g_mei.act_dump_sdk = false;  // consume the menu action
                                 } else if (cv == 8) {            // whitelist dump mode: retry until map BPs load
                                     static long wlast = 0; struct timespec wt; clock_gettime(CLOCK_MONOTONIC, &wt);
                                     if (wt.tv_sec - wlast >= 3) { wlast = wt.tv_sec;
                                         g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) dump_whitelist(); g_fguard = 0; }
+                                    g_mei.act_dump_whitelist = false;
                                 } else scan_bots();
                                 struct timespec s{0, 60 * 1000 * 1000}; nanosleep(&s, nullptr);
                             }
@@ -1890,11 +2119,25 @@ static void* boot(void*) {
     return nullptr;
 }
 
+// Dedicated OpenXR-install thread: retry FAST (every 5 ms) from load so we wrap xrGetInstanceProcAddr
+// BEFORE the app calls xrCreateInstance/xrCreateSession (otherwise it caches the real pointers and we
+// miss them). Runs independently of the chams boot/arm state.
+static void* xr_boot(void*) {
+    LOG("xr_boot: waiting for OpenXR loader...");
+    for (int i = 0; i < 4000; i++) {                     // ~20s of 5ms polls
+        if (mei_xr_install()) { LOG("xr_boot: menu hook installed after %d ms", i * 5); return nullptr; }
+        struct timespec t{0, 5 * 1000 * 1000}; nanosleep(&t, nullptr);
+    }
+    LOG("xr_boot: OpenXR loader never appeared — VR menu unavailable (check libopenxr name)");
+    return nullptr;
+}
+
 extern "C" __attribute__((visibility("default")))
 void pavchams_start() {
     static bool once = false; if (once) return; once = true;
     LOG("libpavchams start");
     pthread_t t; pthread_create(&t, nullptr, boot, nullptr); pthread_detach(t);
+    pthread_t x; pthread_create(&x, nullptr, xr_boot, nullptr); pthread_detach(x);
 }
 
 __attribute__((constructor))

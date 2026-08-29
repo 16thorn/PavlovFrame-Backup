@@ -32,7 +32,23 @@ the game thread from a hooked `ProcessEvent`.
 
 ---
 
-## Config
+## mei mei [private] — in-headset menu
+
+Primary control is now an in-VR **Dear ImGui** panel, **mei mei [private]**, rendered as an OpenXR
+quad layer and driven by your controller. No more adb for day-to-day toggling.
+
+- **Open/close:** press in the **left thumbstick (L3)**.
+- **Cursor:** aim the controller at the panel. **Click:** the **right trigger**.
+  *(If bindings need tuning on first boot, it auto-falls-back to up-point-to-open + dwell-to-click.)*
+- **Tabs:** Aimbot · Visuals · Weapon · Movement · Player · Config — every feature has its own toggle
+  and sliders (aim FOV/mode, movement multipliers, chams colors, name changer, etc.).
+- Settings persist to `.../files/mei.cfg`. Master enable is on by default so the mod arms itself.
+
+Architecture + first-pixel bring-up: **[docs/MEI-MENU.md](docs/MEI-MENU.md)** and
+**[docs/ON-DEVICE.md](docs/ON-DEVICE.md)**. The old `chams.txt` integer still works as a fallback
+(and `8`/`9` still force the one-shot dumps from adb).
+
+## Config (legacy fallback)
 
 Edit `/sdcard/Android/data/com.vankrupt.pavlov/files/chams.txt` (single integer):
 
@@ -208,6 +224,8 @@ patchelf on `libUnreal`. The EOS shim also provides anonymous Device-ID online a
 
 **In the repo (our source):**
 - `pavchams.cpp` — the mod (all features + engine self-resolution).
+- `mei/` — the **mei mei [private]** VR ImGui menu: `mei_settings` (state + `mei.cfg`), `mei_menu`
+  (tabs/UI), `mei_input` (controller-ray cursor), `mei_xr` (OpenXR quad-layer + Vulkan backend).
 - `eosshim.cpp`, `stub.c`, `minisrc/` — the EOS interposer / loader source.
 - `repack.py` — APK repacker.
 - `build.sh` — one-shot build/sign/install.
@@ -243,8 +261,10 @@ Workflow to add a feature:
 Gotchas learned the hard way (there are inline comments too):
 - Don't write in a full-object scan **per ProcessEvent** — it's ~20k objects/ call = 1 fps.
 - Don't replace an FString/GC-owned pointer with your own buffer — the engine frees it → crash.
-- Mobile forward renderer ignores `SetOverlayMaterial` and won't draw `TextRenderComponent`
-  (no in-world text UI) — control is file-based, not an in-game menu.
+- Mobile forward renderer ignores `SetOverlayMaterial` and won't draw `TextRenderComponent` (no
+  in-world text UI *through reflection*). The **mei menu** sidesteps this entirely: it draws with its
+  own Vulkan ImGui backend into an **OpenXR quad layer** (`mei/mei_xr.cpp`), never touching the
+  engine's renderer — the same reason chams (material swap) works but text didn't.
 - Re-validate cached world/pawn pointers across map changes (they go stale → silent no-ops).
 
 PRs welcome. Keep it single-file-friendly and comment the offsets/mechanisms you use.

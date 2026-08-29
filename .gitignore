@@ -23,6 +23,10 @@ QuestBuild/
 libpavchams.so
 libEOSSDK.so
 Pavlov-EOS-*.apk
+# cloned Dear ImGui + OpenXR-SDK headers (fetched by build.sh)
+third_party/
+# per-device saved menu state
+mei.cfg
 
 # ---- signing secrets (generate your own) ----
 *.jks
