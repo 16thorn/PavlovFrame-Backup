@@ -141,6 +141,11 @@ static void tab_weapon(){
     gb_end();
     gb_begin("COMBAT");
     Chk("Trigger kill",&g_mei.trigger_kill);
+    Chk("Kill aura",&g_mei.kill_aura);
+    ImGui::BeginDisabled(!g_mei.kill_aura);
+    Sl("Aura rate",&g_mei.aura_rate,40.f,500.f,"%.0f ms");
+    ImGui::EndDisabled();
+    Chk("Wallbang (shoot thru walls)",&g_mei.wallbang);
     gb_end();
 }
 static void tab_movement(){

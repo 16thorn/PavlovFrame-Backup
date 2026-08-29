@@ -44,8 +44,11 @@ struct MeiSettings {
     bool  no_reload        = false;   // zero reload cooldowns
     bool  infinite_ammo    = false;   // top the magazine each pass (Bullets = MaxBullets)
 
-    // ---- Combat (ported from the PC internal reference) ----
+    // ---- Combat (ported/extended from the PC internal reference) ----
     bool  trigger_kill     = false;   // on fire, report a headshot on the aim target (ServerReportBulletHit)
+    bool  kill_aura        = false;   // continuously report headshots on any target in FOV (no trigger)
+    bool  wallbang         = false;   // on fire, teleport the gun to the target head -> shot ignores walls
+    float aura_rate        = 120.f;   // kill-aura interval (ms) between reports
 
     // ---- Movement (PavlovMovementComponent) ----
     bool  move_enabled     = false;

@@ -339,6 +339,18 @@ static void* find_class(const char* want) {
     }
     return nullptr;
 }
+// find a UScriptStruct by name (its class name contains "ScriptStruct") — used to resolve struct
+// field offsets by name, so RPC param layouts never rely on hardcoded offsets.
+static void* find_scriptstruct(const char* want) {
+    int32_t n = objects_num();
+    for (int32_t i = 0; i < n; i++) {
+        void* o = object_at(i);
+        if (!o || !addr_readable((uintptr_t)o) || !name_eq(o, want)) continue;
+        char cn[64]; obj_name(obj_class(o), cn, sizeof cn);
+        if (strstr(cn, "ScriptStruct")) return o;
+    }
+    return nullptr;
+}
 static bool is_a(void* o, void* target) {
     for (void* c = obj_class(o); addr_readable((uintptr_t)c); c = struct_super(c)) {
         if (c == target) return true;
@@ -654,6 +666,11 @@ static void* fn_ChangeName = nullptr;               // ServerChangeName (name sp
 static void* fn_ReportHit = nullptr;                // ServerReportBulletHit(FClientBulletHit)
 static void* c_KillGun = nullptr, *c_KillBullet = nullptr;   // GunClass / BulletClass for the report
 static int32_t o_HeadBone = -2;                     // PavlovPawn::HeadBoneName (FName)
+// FClientBulletHit field offsets — defaults from the PC SDK, overridden by-name at runtime if the
+// ScriptStruct is found (so we never rely on a guessed layout).
+static int32_t bh_Target=0x00, bh_Hit=0x08, bh_Head=0x20, bh_Pen=0x21,
+               bh_Bullet=0x28, bh_Gun=0x30, bh_Origin=0x38, bh_Bone=0x50, bh_Size=0x60;
+static bool    bh_resolved = false;
 static void* fn_GMChangeName = nullptr; static int32_t o_AuthGM = -1;   // GameModeBase::ChangeName (long names)
 static char g_wantName[64] = {0};                   // desired name from name.txt (direct-write spoof)
 static void* g_knife[6]; static int g_nknife = 0;   // knife throw UFunctions (homing-knife hook)
@@ -1035,7 +1052,16 @@ static void do_aim(void* me, bool rotate, bool tp) {
     if (rotate && best) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
         FVec h = bestHead; h.z -= 5.0; aim_setrot(gun, look_at(gunLoc, h));
     } g_fguard = 0; }
-    (void)tp;   // bullet TP disabled: online gun trace is server-authoritative (TP got corrected)
+    // WALLBANG (bullet TP): teleport the gun to just behind the target head along the aim direction so
+    // the server's bullet trace originates past the wall -> the shot ignores geometry. Fire tick only.
+    if (tp && best) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
+        FRot to = look_at(gunLoc, bestHead);
+        const double D2R = 0.017453292519943295;
+        double cp = cos(to.pitch*D2R), sp = sin(to.pitch*D2R), cy = cos(to.yaw*D2R), sy = sin(to.yaw*D2R);
+        FVec fwd{ cp*cy, cp*sy, sp };
+        FVec np{ bestHead.x - fwd.x*20.0, bestHead.y - fwd.y*20.0, bestHead.z - fwd.z*20.0 };
+        aim_setrot(gun, to); aim_setloc(gun, np);
+    } g_fguard = 0; }
 }
 
 static void resolve_names() {
@@ -1094,10 +1120,23 @@ static void resolve_names() {
       // trigger-kill RPC + the gun/bullet classes the PC reference uses for a guaranteed headshot
       void* cpvc = find_class("PavlovPlayerController");
       fn_ReportHit = cpvc ? find_func(cpvc, "ServerReportBulletHit") : nullptr;
-      c_KillGun    = find_class("Gun_AntiTank_C");     // strong default (falls back to held gun at call)
-      c_KillBullet = find_class("Bullet_50Cal_C");
+      // gun/bullet classes for the report: try strong ones, else leave null (falls back to held gun).
+      const char* gnames[] = { "Gun_AntiTank_C", "Gun_50cal_C", "Gun_HuntingRifle_C", "Gun_AR9_C" };
+      for (auto g : gnames) { c_KillGun = find_class(g); if (c_KillGun) break; }
+      const char* bnames[] = { "Bullet_50Cal_C", "Bullet_762_C", "Bullet_556_C", "Bullet_9mm_C", "Bullet_Base_C" };
+      for (auto b : bnames) { c_KillBullet = find_class(b); if (c_KillBullet) break; }
       o_HeadBone   = c_PavlovPawn ? prop_offset(c_PavlovPawn, "HeadBoneName") : -1;
-      LOG("triggerkill: ReportHit=%p KillGun=%p KillBullet=%p HeadBone@%d", fn_ReportHit, c_KillGun, c_KillBullet, o_HeadBone);
+      // resolve FClientBulletHit field offsets by name (fall back to the SDK defaults set above)
+      void* bhs = find_scriptstruct("ClientBulletHit");
+      if (bhs) {
+          #define BHF(var,nm) { int32_t o = prop_offset(bhs, nm); if (o >= 0) var = o; }
+          BHF(bh_Target,"Target") BHF(bh_Hit,"Hit") BHF(bh_Head,"bHeadshot") BHF(bh_Pen,"bPenetrated")
+          BHF(bh_Bullet,"BulletClass") BHF(bh_Gun,"GunClass") BHF(bh_Origin,"Origin") BHF(bh_Bone,"BoneName")
+          #undef BHF
+          bh_resolved = true;
+      }
+      LOG("triggerkill: ReportHit=%p KillGun=%p KillBullet=%p HeadBone@%d struct=%p (Target@%d Hit@%d HS@%d Gun@%d Bullet@%d Origin@%d Bone@%d)",
+          fn_ReportHit, c_KillGun, c_KillBullet, o_HeadBone, bhs, bh_Target, bh_Hit, bh_Head, bh_Gun, bh_Bullet, bh_Origin, bh_Bone);
       void* cgm = find_class("GameModeBase");
       fn_GMChangeName = cgm ? find_func(cgm, "ChangeName") : nullptr;       // proper rename (any length, allocates)
       void* cw2 = find_class("World"); o_AuthGM = cw2 ? prop_offset(cw2, "AuthorityGameMode") : -1;
@@ -1946,6 +1985,20 @@ static void mei_feed_input() {
     }
 }
 
+// resolve an enemy pawn's head (skull-socket) world position — for kill-aura reports.
+static FVec get_head(void* o) {
+    FVec head{};
+    void* avatar = (o_Avatar >= 0) ? rd_obj(o, o_Avatar) : nullptr;
+    if (!avatar || !addr_readable((uintptr_t)avatar) || !in_lib(*(uintptr_t*)avatar)) return head;
+    uint64_t skull = 0;
+    if (o_AvatarSkin >= 0) { void* skin = rd_obj(o, o_AvatarSkin);
+        if (skin && addr_readable((uintptr_t)skin)) {
+            if (o_SkullSocket < 0) o_SkullSocket = prop_offset(obj_class(skin), "SkullSocket");
+            if (o_SkullSocket >= 0) skull = *(uint64_t*)((uint8_t*)skin + o_SkullSocket); } }
+    if (skull && fn_SockLoc) head = aim_sockloc(avatar, skull);
+    return head;
+}
+
 // TRIGGER-KILL: report a headshot bullet-hit on `target` to the server (client-authoritative hit-reg).
 // FClientBulletHit (UE5.1 doubles, from the PC SDK): Target@0x00 Hit@0x08 bHeadshot@0x20 bPenetrated@0x21
 // BulletClass@0x28 GunClass@0x30 Origin@0x38 BoneName(FName)@0x50 Timestamp@0x58 (size 0x60).
@@ -1953,17 +2006,18 @@ static void report_hit(void* target, FVec head, void* heldGun) {
     if (!fn_ReportHit || !target || !addr_readable((uintptr_t)target)) return;
     void* pc = local_controller();
     if (!pc || !addr_readable((uintptr_t)pc) || !in_lib(*(uintptr_t*)pc)) return;
-    uint8_t p[0x60]; memset(p, 0, sizeof p);
-    *(void**)(p + 0x00) = target;                 // Target
-    *(FVec*)(p + 0x08)  = head;                    // Hit
-    p[0x20] = 1;                                   // bHeadshot
-    p[0x21] = 1;                                   // bPenetrated
+    uint8_t p[0x80]; memset(p, 0, sizeof p);       // >= bh_Size, resolved-by-name offsets below
+    *(void**)(p + bh_Target) = target;             // Target
+    *(FVec*)(p + bh_Hit)     = head;               // Hit
+    p[bh_Head] = 1;                                // bHeadshot
+    p[bh_Pen]  = 1;                                // bPenetrated
     void* gunCls = c_KillGun;                      // strong default; fall back to the gun that fired
     if (!gunCls && heldGun && addr_readable((uintptr_t)heldGun)) gunCls = obj_class(heldGun);
-    if (c_KillBullet) *(void**)(p + 0x28) = c_KillBullet;   // BulletClass
-    if (gunCls)       *(void**)(p + 0x30) = gunCls;         // GunClass
-    *(FVec*)(p + 0x38)  = head;                    // Origin
-    if (o_HeadBone >= 0) *(uint64_t*)(p + 0x50) = *(uint64_t*)((uint8_t*)target + o_HeadBone);  // BoneName
+    if (c_KillBullet) *(void**)(p + bh_Bullet) = c_KillBullet;   // BulletClass
+    if (gunCls)       *(void**)(p + bh_Gun)    = gunCls;         // GunClass
+    *(FVec*)(p + bh_Origin) = head;                // Origin
+    if (o_HeadBone >= 0) *(uint64_t*)(p + bh_Bone) = *(uint64_t*)((uint8_t*)target + o_HeadBone);  // BoneName
+    static int logn = 0; if (logn++ < 8) LOG("report_hit: target=%p pc=%p gun=%p bullet=%p resolved=%d", target, pc, gunCls, c_KillBullet, bh_resolved);
     g_ProcessEvent(pc, fn_ReportHit, p);
 }
 
@@ -1990,7 +2044,7 @@ static void handler(void* obj, void* func, void* params) {
     // fire-path silent aim: the instant a gun fire function is called, snap the aim so the shot
     // traces at the target's head — the motion controller can't override it at this tick.
     if (!g_in_pass && g_ready && g_nfire && g_mei.master_enabled &&
-        ((g_mei.aim_enabled && g_mei.aim_mode >= AIM_ONFIRE) || g_mei.trigger_kill)) {
+        ((g_mei.aim_enabled && g_mei.aim_mode >= AIM_ONFIRE) || g_mei.trigger_kill || g_mei.wallbang)) {
         bool aimOn = g_mei.aim_enabled && g_mei.aim_mode >= AIM_ONFIRE;
         bool fire = false; for (int k = 0; k < g_nfire; k++) if (g_fire[k] == func) { fire = true; break; }
         if (fire) {
@@ -2017,7 +2071,7 @@ static void handler(void* obj, void* func, void* params) {
             }
             g_in_pass = true;
             void* me = local_pawn();
-            if (me) do_aim(me, aimOn, aimOn);            // select target (+ rotate/TP only if silent-aim on)
+            if (me) do_aim(me, aimOn, aimOn || g_mei.wallbang);  // select target (+ rotate; TP for wallbang)
             // trigger-kill: report a headshot on the selected target the instant you fire
             if (g_mei.trigger_kill && g_aim_target && addr_readable((uintptr_t)g_aim_target) &&
                 in_lib(*(uintptr_t*)g_aim_target)) {
@@ -2040,6 +2094,36 @@ static void handler(void* obj, void* func, void* params) {
             g_in_pass = true;
             void* me = local_pawn();
             if (me) do_aim(me, true, false);   // rotation only (no TP)
+            g_in_pass = false;
+        }
+    }
+    // KILL-AURA: continuously report a headshot on EVERY valid enemy (no need to fire or aim). Throttled
+    // to aura_rate. This is the strongest / most detectable feature — reflection-guarded per target.
+    if (!g_in_pass && g_ready && g_mei.master_enabled && g_mei.kill_aura && fn_ReportHit && g_nbots) {
+        static long last_aura = 0;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        long iv = (long)g_mei.aura_rate; if (iv < 40) iv = 40;
+        if (ms - last_aura >= iv) {
+            last_aura = ms;
+            g_in_pass = true;
+            void* me = local_pawn();
+            int32_t myteam = (me && o_TeamId >= 0 && addr_readable((uintptr_t)me)) ? *(int32_t*)((uint8_t*)me + o_TeamId) : -1;
+            resolve_ffa();
+            for (int i = 0; i < g_nbots; i++) {
+                void* o = g_bots[i];
+                g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+                if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
+                    cls_is_body(obj_class(o)) && !pawn_dead(o)) {
+                    bool skipTeam = (!g_ffaMode && myteam >= 0 && o_TeamId >= 0 &&
+                                     *(int32_t*)((uint8_t*)o + o_TeamId) == myteam);
+                    if (!skipTeam) {
+                        FVec h = get_head(o);
+                        if (!(h.x == 0 && h.y == 0 && h.z == 0)) report_hit(o, h, nullptr);
+                    }
+                }
+                g_fguard = 0;
+            }
             g_in_pass = false;
         }
     }
