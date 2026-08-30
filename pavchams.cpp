@@ -2726,6 +2726,33 @@ static void resolve_kill_classes() {
     }
     static int lg = 0; if (lg++ < 8) LOG("killclasses (lazy): gun=%p bullet=%p", c_KillGun, c_KillBullet);
 }
+// The one working kill primitive: find the live pawn whose PlayerState name matches, and report a headshot
+// on it. Both target-kill and repeating kill-all go through this, so they behave identically. Caller sets
+// g_in_pass. Returns true if a report was sent.
+static bool kill_by_name(const char* wantName) {
+    if (!wantName || !wantName[0] || !fn_ReportHit) return false;
+    void* me = local_pawn();
+    void* target = nullptr;
+    for (int i = 0; i < g_nbots && !target; i++) {
+        void* o = g_bots[i];
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+        if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
+            cls_is_body(obj_class(o)) && !pawn_dead(o)) {
+            void* ps = (o_PawnPS >= 0) ? *(void**)((uint8_t*)o + o_PawnPS) : nullptr;
+            char nm[MEI_NAME_MAX] = {0};
+            if (ps && addr_readable((uintptr_t)ps) && in_lib(*(uintptr_t*)ps) && o_PS_Name >= 0)
+                read_fstring(ps, o_PS_Name, nm, sizeof nm);
+            if (nm[0] && !strcmp(nm, wantName)) target = o;
+        }
+        g_fguard = 0;
+    }
+    if (!target) return false;
+    bool sent = false;
+    g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
+        FVec h; if (kill_head(target, &h)) { report_hit(target, h, nullptr); sent = true; }
+    } g_fguard = 0;
+    return sent;
+}
 static void do_kill_selected() {
     if (!g_mei.act_kill_sel) return;
     g_mei.act_kill_sel = false;
@@ -2733,57 +2760,18 @@ static void do_kill_selected() {
     int idx = g_mei.kill_sel;
     if (idx < 0 || idx >= g_players_n || !fn_ReportHit) { LOG("KILLSEL: bad idx %d (n=%d)", idx, g_players_n); return; }
     char wantName[MEI_NAME_MAX]; strncpy(wantName, g_players[idx].name, sizeof wantName); wantName[MEI_NAME_MAX-1] = 0;
-    void* wantPtr = g_playerPawns[idx];
-    bool named = strncmp(wantName, "Player ", 7) != 0;
-    void* me = local_pawn();
-    void* target = nullptr;
     g_in_pass = true;
-    for (int i = 0; i < g_nbots && !target; i++) {
-        void* o = g_bots[i];
-        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
-        if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
-            cls_is_body(obj_class(o)) && !pawn_dead(o)) {
-            if (named) {
-                void* ps = (o_PawnPS >= 0) ? *(void**)((uint8_t*)o + o_PawnPS) : nullptr;
-                char nm[MEI_NAME_MAX] = {0};
-                if (ps && addr_readable((uintptr_t)ps) && in_lib(*(uintptr_t*)ps) && o_PS_Name >= 0)
-                    read_fstring(ps, o_PS_Name, nm, sizeof nm);
-                if (nm[0] && !strcmp(nm, wantName)) target = o;
-            } else if (o == wantPtr) target = o;
-        }
-        g_fguard = 0;
-    }
-    if (target) {
-        g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
-            FVec h;
-            if (kill_head(target, &h)) { report_hit(target, h, nullptr); LOG("KILLSEL: killed '%s' %p", wantName, target); }
-            else LOG("KILLSEL: '%s' can't be placed — skipped", wantName);
-        } g_fguard = 0;
-    } else LOG("KILLSEL: '%s' not present in live scan — skipped (stale)", wantName);
+    bool ok = kill_by_name(wantName);
     g_in_pass = false;
+    LOG("KILLSEL: '%s' -> %s", wantName, ok ? "killed" : "not present/placeable");
 }
-// REPEATING KILL ALL: while the toggle is on, headshot every LOADED enemy (named, alive, in range, team-
-// filtered) each pass. Crash-safe: only reports pawns kill_head can place + within range; report_hit drops
-// null-class. Detectable (like an aura) — that's on the user. Called throttled from the handler.
+// REPEATING KILL ALL: run the exact target-kill primitive over EVERY name in the list each pass. Same path
+// that works for one player, applied to all. report_hit drops null-class; the server drops teammate hits.
 static void kill_all_loaded() {
     resolve_kill_classes();
-    void* me = local_pawn();
-    int32_t myteam = (me && o_TeamId >= 0 && addr_readable((uintptr_t)me)) ? *(int32_t*)((uint8_t*)me + o_TeamId) : -1;
-    resolve_ffa();
     g_in_pass = true;
-    for (int i = 0; i < g_nbots; i++) {
-        void* o = g_bots[i];
-        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
-        if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
-            cls_is_body(obj_class(o)) && !pawn_dead(o)) {
-            bool skipTeam = (!g_ffaMode && myteam >= 0 && o_TeamId >= 0 &&
-                             *(int32_t*)((uint8_t*)o + o_TeamId) == myteam);
-            if (!skipTeam && (!me || dist_cm(me, o) < 30000.0)) {   // in range = loaded/safe to report
-                FVec h; if (kill_head(o, &h)) report_hit(o, h, nullptr);
-            }
-        }
-        g_fguard = 0;
-    }
+    int n = g_players_n; if (n > MEI_PLAYERS_MAX) n = MEI_PLAYERS_MAX;
+    for (int i = 0; i < n; i++) kill_by_name(g_players[i].name);
     g_in_pass = false;
 }
 static void handler(void* obj, void* func, void* params) {
