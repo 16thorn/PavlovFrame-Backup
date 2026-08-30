@@ -18,6 +18,7 @@
 #include <dlfcn.h>
 #include <link.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -52,6 +53,23 @@ float        g_esp_fov_used = 97.f;
 #define FFIELD_NEXT_OFF    0x20   // FField::Next
 #define FFIELD_NAME_OFF    0x28   // FField::NamePrivate (FName)
 #define FPROP_OFFSET_OFF   0x4C   // FProperty::Offset_Internal
+// ---- extra UE5.1 layout for the SDK dumper (all verified vs the AndUEDumper FField-5.x profile) ----
+#define UOBJ_OUTER_OFF     0x20   // UObject::OuterPrivate
+#define USTRUCT_PROPSIZE   0x58   // UStruct::PropertiesSize (int32) = struct byte size
+#define UFUNC_FLAGS_OFF    0xB0   // UFunction::FunctionFlags (uint32)
+#define UFUNC_PARMSIZE_OFF 0xB6   // UFunction::ParmsSize (uint16)
+#define UFUNC_FUNC_OFF     0xD8   // UFunction::Func (native thunk ptr)
+#define FPROP_ARRAYDIM_OFF 0x34   // FProperty::ArrayDim (int32)
+#define FPROP_ELEMSIZE_OFF 0x38   // FProperty::ElementSize (int32)
+#define FPROP_FLAGS_OFF    0x40   // FProperty::PropertyFlags (uint64)
+#define FPROP_SUB_OFF      0x78   // first subclass-specific field (PropertyClass/Struct/Inner/Enum/…)
+#define UENUM_NAMES_OFF    0x40   // UEnum::Names (TArray<TPair<FName,int64>>, 16B pairs)
+// EPropertyFlags (param classification)
+#define CPF_Parm           0x0000000000000080ULL
+#define CPF_OutParm        0x0000000000000100ULL
+#define CPF_ReturnParm     0x0000000000000400ULL
+#define CPF_ConstParm      0x0000000000000800ULL
+#define CPF_ReferenceParm  0x0000000008000000ULL
 // FNamePool / FName
 #define FNAME_BLOCK_BITS   16
 #define OBJ_PER_CHUNK      (64 * 1024)
@@ -68,6 +86,7 @@ static uintptr_t g_scriptcore_va = 0;
 
 typedef void (*PFN_PE)(void* obj, void* func, void* params);
 static PFN_PE g_ProcessEvent = nullptr;           // -> trampoline (runs original PE)
+static uintptr_t g_pe_rel = 0;                    // resolved ProcessEvent, module-relative (for the SDK dump)
 
 // ---- self memory map -------------------------------------------------------
 // g_read  : every readable region in the process (block/chunk/object memory is malloc'd, so it
@@ -604,6 +623,7 @@ static bool is_relocatable_verbatim(uint32_t in) {
     return true;                                          // stp/mov/sub etc. — safe to copy
 }
 static bool inline_hook(uintptr_t fn) {
+    g_pe_rel = in_lib(fn) ? fn - g_base : 0;   // record for the SDK dump's Offsets.hpp
     uint32_t* src = (uint32_t*)fn;
     for (int i = 0; i < 4; i++)
         if (!is_relocatable_verbatim(src[i])) {
@@ -675,6 +695,7 @@ static void* fn_SockLoc = nullptr, *fn_LookAt = nullptr, *cdo_KML = nullptr;
 static int32_t o_AvatarSkin = -1, o_SkullSocket = -1;
 static void* g_fire[16]; static int g_nfire = 0;    // gun fire UFunctions (fire-path hook)
 static void* g_kick[8]; static int g_nkick = 0;     // kick RPCs to DROP (anti-votekick)
+static void* g_authfn[12]; static const char* g_authnm[12]; static int g_nauthfn = 0;   // auth-handshake RPCs to TRACE (log-only)
 static void* fn_ChangeName = nullptr;               // ServerChangeName (name spoof for custom-map admin)
 static void* fn_SetPlayerSkin = nullptr;            // PavlovPawn::SetPlayerSkin(FName) — player skin changer
 // ---- trigger-kill (ported from the PC internal: APavlovPlayerController::ServerReportBulletHit) ----
@@ -1263,6 +1284,16 @@ static void resolve_names() {
       for (int k = 0; k < 3 && cpc; k++) { void* fn = find_func(cpc, kn[k]);
           if (fn) { g_kick[g_nkick++] = fn; LOG("kick RPC '%s' = %p", kn[k], fn); } }
       fn_ChangeName = cpc ? find_func(cpc, "ServerChangeName") : nullptr;   // name spoof (custom-map admin)
+      // AUTH TRACE: resolve the join-handshake RPCs so the handler can log the LIVE sequence + params
+      // (which gate fires, what the host demands, what our client actually sends).
+      { void* cpvc0 = find_class("PavlovPlayerController");
+        const char* an[] = { "ClientAuthenticate", "ServerAuthenticate", "ClientRequestAttestation",
+                             "ServerSubmitAttestation", "ServerAnticheatMessage", "ClientAnticheatMessage",
+                             "OnAuthTimedout", "ClientOnConnected", "ServerAuthenticateGuest" };
+        g_nauthfn = 0;
+        for (auto nm : an) { void* fn = cpvc0 ? find_func(cpvc0, nm) : nullptr;
+          if (fn && g_nauthfn < 12) { g_authfn[g_nauthfn] = fn; g_authnm[g_nauthfn] = nm; g_nauthfn++;
+            LOG("auth RPC '%s' = %p", nm, fn); } } }
       // trigger-kill RPC + the gun/bullet classes the PC reference uses for a guaranteed headshot
       void* cpvc = find_class("PavlovPlayerController");
       fn_ReportHit = cpvc ? find_func(cpvc, "ServerReportBulletHit") : nullptr;
@@ -1773,52 +1804,309 @@ static void dump_whitelist() {
     }
     LOG("WHITELIST dump done (scanned %d classes)", nchk);
 }
-static void dump_sdk() {
-    FILE* f = fopen("/sdcard/Android/data/com.vankrupt.pavlov/files/sdk_dump.txt", "w");
-    if (!f) { LOG("sdk dump: fopen failed (errno=%d)", errno); return; }
-    int32_t n = objects_num(); int structs = 0;
-    for (int32_t i = 0; i < n; i++) {
-        void* o = object_at(i);
-        if (!o || !addr_readable((uintptr_t)o)) continue;
-        void* cls = obj_class(o);
-        if (!addr_readable((uintptr_t)cls)) continue;
-        char cn[48]; obj_name(cls, cn, sizeof cn);
-        if (strcmp(cn,"Class") && strcmp(cn,"ScriptStruct") && strcmp(cn,"BlueprintGeneratedClass"))
-            continue;
-        char nm[80]; obj_name(o, nm, sizeof nm);
-        if (!strncmp(nm, "Default__", 9)) continue;
-        void* sup = struct_super(o);
-        char sn[80] = ""; if (addr_readable((uintptr_t)sup)) obj_name(sup, sn, sizeof sn);
-        fprintf(f, "\n%s : %s\n", nm, sn);
-        g_fguard = 1;                                         // properties (this struct only)
-        if (!sigsetjmp(g_fjmp, 1)) {
-            int guard = 0;
-            for (void* p = *(void**)((uint8_t*)o + USTRUCT_CHILDPROPS);
-                 addr_readable((uintptr_t)p) && guard++ < 8192;
-                 p = *(void**)((uint8_t*)p + FFIELD_NEXT_OFF)) {
-                char pn[80]; fname_to_str(*(int32_t*)((uint8_t*)p + FFIELD_NAME_OFF), pn, sizeof pn);
-                char tp[48]; field_type(p, tp, sizeof tp);
-                int32_t off = *(int32_t*)((uint8_t*)p + FPROP_OFFSET_OFF);
-                fprintf(f, "    +0x%-5x %-22s %s\n", off, tp, pn);
-            }
-        }
-        g_fguard = 0;
-        g_fguard = 1;                                         // functions
-        if (!sigsetjmp(g_fjmp, 1)) {
-            int guard = 0;
-            for (void* c = *(void**)((uint8_t*)o + USTRUCT_CHILDREN);
-                 addr_readable((uintptr_t)c) && guard++ < 8192;
-                 c = *(void**)((uint8_t*)c + UFIELD_NEXT_OFF)) {
-                char fnm[80]; obj_name(c, fnm, sizeof fnm);
-                fprintf(f, "    fn   %s()\n", fnm);
-                if (!*(void**)((uint8_t*)c + UFIELD_NEXT_OFF)) break;
-            }
-        }
-        g_fguard = 0;
-        if ((++structs & 0x7f) == 0) fflush(f);
+// ============================================================================
+//  SDK DUMPER v2 — a proper reflection dump modelled on AndUEDumper/CAuthDumper,
+//  but IN-PROCESS (we already own GObjects/GNames/ProcessEvent). One trigger
+//  (chams.txt=9 / menu) writes a full SDK/ tree to the app files dir:
+//    SDK/Offsets.hpp   — module-relative globals + validated member offsets
+//    SDK/Objects.txt   — every reflected object: index, lib+off, class, full path
+//    SDK/SDK.hpp       — C++ enums/structs/classes w/ offset+size comments,
+//                        UFunction param structs (in/out/ret flags), grouped by package
+//    SDK/Metadata.json — structured: packages[]{enums,structs,classes,functions,params}
+//    sdk_dump.txt      — legacy flat human summary (kept for old workflows)
+// ============================================================================
+#define SDK_DIR "/sdcard/Android/data/com.vankrupt.pavlov/files/SDK"
+static const char* g_files = "/sdcard/Android/data/com.vankrupt.pavlov/files";
+
+static int32_t prop_elemsize(void* p) { return addr_readable((uintptr_t)p+FPROP_ELEMSIZE_OFF) ? *(int32_t*)((uint8_t*)p+FPROP_ELEMSIZE_OFF) : 0; }
+static int32_t prop_arraydim(void* p) { return addr_readable((uintptr_t)p+FPROP_ARRAYDIM_OFF) ? *(int32_t*)((uint8_t*)p+FPROP_ARRAYDIM_OFF) : 1; }
+static uint64_t prop_flags(void* p)   { return addr_readable((uintptr_t)p+FPROP_FLAGS_OFF)    ? *(uint64_t*)((uint8_t*)p+FPROP_FLAGS_OFF) : 0; }
+static void* prop_sub(void* p, int i) { void* a=(uint8_t*)p+FPROP_SUB_OFF+(size_t)i*8; return addr_readable((uintptr_t)a)?*(void**)a:nullptr; }
+static void obj_outer(void* o, void** out) { *out = (o && addr_readable((uintptr_t)o+UOBJ_OUTER_OFF)) ? *(void**)((uint8_t*)o+UOBJ_OUTER_OFF) : nullptr; }
+
+// outermost object = the UPackage (its name is the "/Script/X" or "/Game/.." path)
+static void* package_of(void* o) {
+    void* cur = o, *nx = nullptr;
+    for (int i = 0; i < 64 && cur; i++) { obj_outer(cur, &nx); if (!nx) return cur; cur = nx; }
+    return cur;
+}
+// short package name: last path segment of the package ("/Script/Engine" -> "Engine")
+static void pkg_short(void* pkg, char* out, size_t cap) {
+    char full[128]; obj_name(pkg, full, sizeof full);
+    const char* s = strrchr(full, '/'); s = s ? s + 1 : full;
+    strncpy(out, s[0] ? s : "Unknown", cap - 1); out[cap-1] = 0;
+    for (char* q = out; *q; q++) if (!((*q>='A'&&*q<='Z')||(*q>='a'&&*q<='z')||(*q>='0'&&*q<='9')||*q=='_')) *q = '_';
+}
+// class prefix: 'A' for AActor-derived classes, 'U' otherwise. Cached (super-walk is not free).
+static bool is_actor_class(void* cls) {
+    static void* cc[8192]; static uint8_t cb[8192]; static int nc = 0;
+    if (!cls || !addr_readable((uintptr_t)cls)) return false;
+    for (int i = 0; i < nc; i++) if (cc[i] == cls) return cb[i];
+    bool r = false; void* s = cls;
+    for (int g = 0; g < 64 && addr_readable((uintptr_t)s); g++) {
+        char n[48]; obj_name(s, n, sizeof n); if (!strcmp(n, "Actor")) { r = true; break; }
+        void* sp = struct_super(s); if (!sp || sp == s) break; s = sp;
     }
-    fclose(f);
-    LOG("sdk dump: wrote %d structs to sdk_dump.txt", structs);
+    if (nc < 8192) { cc[nc] = cls; cb[nc] = r; nc++; }
+    return r;
+}
+static char cls_prefix(void* cls) { return is_actor_class(cls) ? 'A' : 'U'; }
+
+// C++-ish type string for a property, recursing through Array/Map/Set inners.
+static void prop_typestr(void* p, char* out, size_t cap, int depth) {
+    out[0] = 0;
+    if (!p || !addr_readable((uintptr_t)p) || depth > 5) { strncpy(out, "uint8_t", cap-1); out[cap-1]=0; return; }
+    char k[48]; field_type(p, k, sizeof k);
+    char nm[80];
+    if (!strcmp(k,"ObjectProperty")||!strcmp(k,"ObjectPtrProperty")) { void* c=prop_sub(p,0); obj_name(c,nm,sizeof nm); snprintf(out,cap,"class %c%s*", cls_prefix(c), nm[0]?nm:"Object"); }
+    else if (!strcmp(k,"WeakObjectProperty"))  { void* c=prop_sub(p,0); obj_name(c,nm,sizeof nm); snprintf(out,cap,"TWeakObjectPtr<%c%s>", cls_prefix(c), nm[0]?nm:"Object"); }
+    else if (!strcmp(k,"SoftObjectProperty"))  { void* c=prop_sub(p,0); obj_name(c,nm,sizeof nm); snprintf(out,cap,"TSoftObjectPtr<%c%s>", cls_prefix(c), nm[0]?nm:"Object"); }
+    else if (!strcmp(k,"LazyObjectProperty"))  { void* c=prop_sub(p,0); obj_name(c,nm,sizeof nm); snprintf(out,cap,"TLazyObjectPtr<%c%s>", cls_prefix(c), nm[0]?nm:"Object"); }
+    else if (!strcmp(k,"ClassProperty"))       { void* c=prop_sub(p,1); obj_name(c,nm,sizeof nm); snprintf(out,cap,"TSubclassOf<%c%s>", cls_prefix(c), nm[0]?nm:"Object"); }
+    else if (!strcmp(k,"SoftClassProperty"))   { void* c=prop_sub(p,1); obj_name(c,nm,sizeof nm); snprintf(out,cap,"TSoftClassPtr<%c%s>", cls_prefix(c), nm[0]?nm:"Object"); }
+    else if (!strcmp(k,"StructProperty"))      { void* c=prop_sub(p,0); obj_name(c,nm,sizeof nm); snprintf(out,cap,"struct F%s", nm[0]?nm:"Struct"); }
+    else if (!strcmp(k,"ArrayProperty"))       { char in[96]; prop_typestr(prop_sub(p,0),in,sizeof in,depth+1); snprintf(out,cap,"TArray<%s>", in); }
+    else if (!strcmp(k,"SetProperty"))         { char in[96]; prop_typestr(prop_sub(p,0),in,sizeof in,depth+1); snprintf(out,cap,"TSet<%s>", in); }
+    else if (!strcmp(k,"MapProperty"))         { char kk[96],vv[96]; prop_typestr(prop_sub(p,0),kk,sizeof kk,depth+1); prop_typestr(prop_sub(p,1),vv,sizeof vv,depth+1); snprintf(out,cap,"TMap<%s, %s>", kk, vv); }
+    else if (!strcmp(k,"EnumProperty"))        { void* e=prop_sub(p,1); obj_name(e,nm,sizeof nm); snprintf(out,cap,"%s", nm[0]?nm:"Enum"); }
+    else if (!strcmp(k,"ByteProperty"))        { void* e=prop_sub(p,0); if(e&&addr_readable((uintptr_t)e)){obj_name(e,nm,sizeof nm);snprintf(out,cap,"TEnumAsByte<%s>",nm);} else strncpy(out,"uint8_t",cap-1); out[cap-1]=0; }
+    else if (!strcmp(k,"InterfaceProperty"))   { void* c=prop_sub(p,0); obj_name(c,nm,sizeof nm); snprintf(out,cap,"TScriptInterface<I%s>", nm[0]?nm:"face"); }
+    else if (!strcmp(k,"BoolProperty"))        strncpy(out,"bool",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"FloatProperty"))       strncpy(out,"float",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"DoubleProperty"))      strncpy(out,"double",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"IntProperty"))         strncpy(out,"int32_t",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"Int64Property"))       strncpy(out,"int64_t",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"Int16Property"))       strncpy(out,"int16_t",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"Int8Property"))        strncpy(out,"int8_t",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"UInt64Property"))      strncpy(out,"uint64_t",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"UInt32Property"))      strncpy(out,"uint32_t",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"UInt16Property"))      strncpy(out,"uint16_t",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"NameProperty"))        strncpy(out,"FName",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"StrProperty"))         strncpy(out,"FString",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"TextProperty"))        strncpy(out,"FText",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"DelegateProperty"))    strncpy(out,"FScriptDelegate",cap-1),out[cap-1]=0;
+    else if (strstr(k,"Multicast"))            strncpy(out,"FMulticastScriptDelegate",cap-1),out[cap-1]=0;
+    else if (!strcmp(k,"FieldPathProperty"))   strncpy(out,"FFieldPath",cap-1),out[cap-1]=0;
+    else { snprintf(out, cap, "%.*s", (int)cap-1, k[0]?k:"uint8_t"); }   // fallback: raw kind
+}
+// JSON string escaper (into a fixed buffer)
+static void json_esc(const char* s, char* out, size_t cap) {
+    size_t w=0; for (const char* p=s; *p && w+2<cap; p++) {
+        char c=*p; if (c=='"'||c=='\\'){ out[w++]='\\'; out[w++]=c; }
+        else if (c=='\n'){ out[w++]='\\'; out[w++]='n'; }
+        else if ((unsigned char)c<0x20){ /* skip control */ }
+        else out[w++]=c;
+    } out[w]=0;
+}
+
+// enum -> "Name=Value" pairs (UEnum::Names : TArray<TPair<FName,int64>>, 16B stride)
+static int dump_enum(FILE* hpp, FILE* js, void* e, bool jsfirst) {
+    void* names = *(void**)((uint8_t*)e + UENUM_NAMES_OFF);
+    int32_t cnt = *(int32_t*)((uint8_t*)e + UENUM_NAMES_OFF + 8);
+    char en[80]; obj_name(e, en, sizeof en);
+    if (!addr_readable((uintptr_t)names) || cnt < 1 || cnt > 4096) return 0;
+    if (hpp) fprintf(hpp, "enum class %s : uint8_t {\n", en);   // reflected UEnum name already carries the E prefix
+    if (js)  fprintf(js, "%s\n      {\"name\":\"%s\",\"members\":[", jsfirst?"":",", en);
+    for (int i = 0; i < cnt; i++) {
+        uint8_t* pair = (uint8_t*)names + (size_t)i * 16;
+        if (!addr_readable((uintptr_t)pair + 16)) break;
+        char full[96]; fname_to_str(*(int32_t*)pair, full, sizeof full);
+        int64_t val = *(int64_t*)(pair + 8);
+        const char* mn = strrchr(full, ':'); mn = mn ? mn + 1 : full;   // strip "EName::"
+        if (hpp) fprintf(hpp, "    %-40s = %lld,\n", mn, (long long)val);
+        if (js)  fprintf(js, "%s{\"name\":\"%s\",\"value\":%lld}", i?",":"", mn, (long long)val);
+    }
+    if (hpp) fprintf(hpp, "};\n\n");
+    if (js)  fprintf(js, "]}");
+    return 1;
+}
+
+// one UStruct/UClass: fields (offset,size,type,name) + UFunctions (flags, param struct with in/out/ret)
+static void dump_struct(FILE* hpp, FILE* js, void* o, bool is_class, bool jsfirst) {
+    char nm[80]; obj_name(o, nm, sizeof nm);
+    void* sup = struct_super(o); char sn[80] = "";
+    if (addr_readable((uintptr_t)sup)) obj_name(sup, sn, sizeof sn);
+    int32_t size = addr_readable((uintptr_t)o+USTRUCT_PROPSIZE) ? *(int32_t*)((uint8_t*)o+USTRUCT_PROPSIZE) : 0;
+    char pfx = is_class ? cls_prefix(o) : 'F';
+    char spfx = is_class ? (sn[0] ? cls_prefix(sup) : 'U') : 'F';
+    if (hpp) {
+        if (sn[0]) fprintf(hpp, "// 0x%x bytes\nstruct %c%s : public %c%s {\n", size, pfx, nm, spfx, sn);
+        else       fprintf(hpp, "// 0x%x bytes\nstruct %c%s {\n", size, pfx, nm);
+    }
+    if (js) fprintf(js, "%s\n      {\"name\":\"%s\",\"kind\":\"%s\",\"super\":\"%s\",\"size\":%d,\"fields\":[", jsfirst?"":",", nm, is_class?"class":"struct", sn, size);
+    // ---- fields ----
+    int fi = 0;
+    g_fguard = 1;
+    if (!sigsetjmp(g_fjmp, 1)) {
+        int guard = 0;
+        for (void* p = *(void**)((uint8_t*)o + USTRUCT_CHILDPROPS);
+             addr_readable((uintptr_t)p) && guard++ < 16384;
+             p = *(void**)((uint8_t*)p + FFIELD_NEXT_OFF)) {
+            char pn[80]; fname_to_str(*(int32_t*)((uint8_t*)p + FFIELD_NAME_OFF), pn, sizeof pn);
+            char tp[112]; prop_typestr(p, tp, sizeof tp, 0);
+            int32_t off = *(int32_t*)((uint8_t*)p + FPROP_OFFSET_OFF);
+            int32_t esz = prop_elemsize(p), dim = prop_arraydim(p); if (dim < 1) dim = 1;
+            if (hpp) {
+                if (dim > 1) fprintf(hpp, "    %-48s %s[%d];  // +0x%x (0x%x)\n", tp, pn, dim, off, esz*dim);
+                else         fprintf(hpp, "    %-48s %s;  // +0x%x (0x%x)\n", tp, pn, off, esz);
+            }
+            if (js) { char et[128]; json_esc(tp,et,sizeof et);
+                fprintf(js, "%s{\"name\":\"%s\",\"type\":\"%s\",\"offset\":%d,\"size\":%d}", fi?",":"", pn, et, off, esz*dim); }
+            fi++;
+        }
+    }
+    g_fguard = 0;
+    if (js) fprintf(js, "],\"functions\":[");
+    // ---- functions (classes only carry UFunctions in Children) ----
+    int fnc = 0;
+    g_fguard = 1;
+    if (!sigsetjmp(g_fjmp, 1)) {
+        int guard = 0;
+        for (void* c = *(void**)((uint8_t*)o + USTRUCT_CHILDREN);
+             addr_readable((uintptr_t)c) && guard++ < 16384;
+             c = *(void**)((uint8_t*)c + UFIELD_NEXT_OFF)) {
+            char fnm[80]; obj_name(c, fnm, sizeof fnm);
+            uint32_t flags = addr_readable((uintptr_t)c+UFUNC_FLAGS_OFF) ? *(uint32_t*)((uint8_t*)c+UFUNC_FLAGS_OFF) : 0;
+            uintptr_t func = addr_readable((uintptr_t)c+UFUNC_FUNC_OFF) ? *(uintptr_t*)((uint8_t*)c+UFUNC_FUNC_OFF) : 0;
+            uintptr_t funcrel = (func && in_lib(func)) ? func - g_base : 0;
+            // walk params (ChildProperties of the UFunction) -> in / out / return
+            char ret[112] = "void"; char params[512] = ""; size_t pw = 0;
+            if (js) fprintf(js, "%s{\"name\":\"%s\",\"flags\":\"0x%x\",\"native\":\"lib+0x%lx\",\"params\":[",
+                            fnc?",":"", fnm, flags, (unsigned long)funcrel);
+            int pj = 0;   // params walk stays under the SAME fault-guard as the functions loop (no nested setjmp)
+            int g2 = 0;
+            for (void* pp = *(void**)((uint8_t*)c + USTRUCT_CHILDPROPS);
+                 addr_readable((uintptr_t)pp) && g2++ < 256;
+                 pp = *(void**)((uint8_t*)pp + FFIELD_NEXT_OFF)) {
+                char ppn[80]; fname_to_str(*(int32_t*)((uint8_t*)pp + FFIELD_NAME_OFF), ppn, sizeof ppn);
+                char pt[112]; prop_typestr(pp, pt, sizeof pt, 0);
+                uint64_t pf = prop_flags(pp);
+                const char* dir = (pf & CPF_ReturnParm) ? "ret" : (pf & CPF_OutParm) ? "out" : "in";
+                if (pf & CPF_ReturnParm) { strncpy(ret, pt, sizeof ret-1); ret[sizeof ret-1]=0; }
+                else if (pw < sizeof params - 96)
+                    pw += snprintf(params+pw, sizeof params-pw, "%s%s%s %s",
+                                   pw?", ":"", (pf&CPF_OutParm)?"/*out*/":"", pt, ppn);
+                if (js) { char et[128]; json_esc(pt,et,sizeof et);
+                    fprintf(js, "%s{\"name\":\"%s\",\"type\":\"%s\",\"dir\":\"%s\"}", pj?",":"", ppn, et, dir); pj++; }
+            }
+            if (hpp) fprintf(hpp, "    %-20s %s(%s);  // Function flags=0x%x  [lib+0x%lx]\n",
+                             ret, fnm, params, flags, (unsigned long)funcrel);
+            if (js) fprintf(js, "]}");
+            fnc++;
+        }
+    }
+    g_fguard = 0;
+    if (hpp) fprintf(hpp, "};\n\n");
+    if (js) fprintf(js, "]}");
+}
+
+// full-path name: "Class /Script/Pkg.Outer.Object"
+static void obj_fullname(void* o, char* out, size_t cap) {
+    char cls[48]; obj_name(obj_class(o), cls, sizeof cls);
+    char chain[256] = ""; size_t w = 0; void* parts[16]; int np = 0; void* cur = o, *nx;
+    for (int i = 0; i < 16 && cur; i++) { parts[np++] = cur; obj_outer(cur, &nx); cur = nx; }
+    for (int i = np - 1; i >= 0; i--) { char n[80]; obj_name(parts[i], n, sizeof n);
+        w += snprintf(chain+w, sizeof chain-w, "%s%s", i==np-1?"":".", n); if (w >= sizeof chain-2) break; }
+    snprintf(out, cap, "%s %s", cls, chain);
+}
+
+static void dump_sdk() {
+    mkdir(SDK_DIR, 0777);
+    char path[256];
+    // ---- Offsets.hpp ----
+    snprintf(path, sizeof path, "%s/Offsets.hpp", SDK_DIR);
+    FILE* off = fopen(path, "w");
+    if (off) {
+        fprintf(off, "// Auto-generated by pavchams SDK dumper (in-process). Module-relative offsets.\n");
+        fprintf(off, "#pragma once\n#include <cstdint>\nnamespace Offsets {\n");
+        fprintf(off, "    constexpr uintptr_t GObjects     = 0x%lx;\n", g_gobjects ? (uintptr_t)g_gobjects - g_base : 0);
+        fprintf(off, "    constexpr uintptr_t GNames       = 0x%lx;\n", g_name_blocks ? (uintptr_t)g_name_blocks - g_base : 0);
+        fprintf(off, "    constexpr uintptr_t ProcessEvent = 0x%lx;\n", (unsigned long)g_pe_rel);
+        fprintf(off, "    constexpr int FNameShift = %d;\n", g_name_shift);
+        fprintf(off, "    // member offsets (UE5.1)\n");
+        fprintf(off, "    constexpr int UObject_Class=0x%x, UObject_Name=0x%x, UObject_Outer=0x%x;\n", UOBJ_CLASS_OFF, UOBJ_NAME_OFF, UOBJ_OUTER_OFF);
+        fprintf(off, "    constexpr int UStruct_Super=0x%x, UStruct_Children=0x%x, UStruct_ChildProps=0x%x, UStruct_PropSize=0x%x;\n", USTRUCT_SUPER_OFF, USTRUCT_CHILDREN, USTRUCT_CHILDPROPS, USTRUCT_PROPSIZE);
+        fprintf(off, "    constexpr int FField_Next=0x%x, FField_Name=0x%x;\n", FFIELD_NEXT_OFF, FFIELD_NAME_OFF);
+        fprintf(off, "    constexpr int FProp_ArrayDim=0x%x, FProp_ElemSize=0x%x, FProp_Flags=0x%x, FProp_Offset=0x%x, FProp_Sub=0x%x;\n", FPROP_ARRAYDIM_OFF, FPROP_ELEMSIZE_OFF, FPROP_FLAGS_OFF, FPROP_OFFSET_OFF, FPROP_SUB_OFF);
+        fprintf(off, "    constexpr int UFunction_Flags=0x%x, UFunction_ParmsSize=0x%x, UFunction_Func=0x%x;\n", UFUNC_FLAGS_OFF, UFUNC_PARMSIZE_OFF, UFUNC_FUNC_OFF);
+        fprintf(off, "    constexpr int UEnum_Names=0x%x;\n}\n", UENUM_NAMES_OFF);
+        fclose(off);
+    }
+    // ---- Objects.txt ----
+    int32_t n = objects_num();
+    snprintf(path, sizeof path, "%s/Objects.txt", SDK_DIR);
+    FILE* obj = fopen(path, "w");
+    if (obj) {
+        for (int32_t i = 0; i < n; i++) {
+            void* o = object_at(i);
+            if (!o || !addr_readable((uintptr_t)o)) continue;
+            g_fguard = 1; if (sigsetjmp(g_fjmp,1)) { g_fguard = 0; continue; }
+            char fn[320]; obj_fullname(o, fn, sizeof fn);
+            uintptr_t rel = in_lib(*(uintptr_t*)o) ? 0 : 0;
+            fprintf(obj, "[%06d] %s\n", i, fn);
+            g_fguard = 0;
+            if ((i & 0x3ff) == 0) fflush(obj);
+        }
+        fclose(obj);
+    }
+    // ---- SDK.hpp + Metadata.json + legacy sdk_dump.txt (grouped by package) ----
+    snprintf(path, sizeof path, "%s/SDK.hpp", SDK_DIR);         FILE* hpp = fopen(path, "w");
+    snprintf(path, sizeof path, "%s/Metadata.json", SDK_DIR);   FILE* js  = fopen(path, "w");
+    snprintf(path, sizeof path, "%s/sdk_dump.txt", g_files);     FILE* leg = fopen(path, "w");
+    if (hpp) fprintf(hpp, "// Auto-generated in-process SDK. Types are best-effort reflected layouts.\n#pragma once\n#include <cstdint>\n\n");
+    if (js)  fprintf(js, "{\n  \"game\":\"PavlovShack\",\"engine\":\"UE5.1\",\"packages\":[");
+    // discover unique packages
+    static void* pkgs[4096]; static char pkgnm[4096][48]; int npkg = 0;
+    for (int32_t i = 0; i < n && npkg < 4096; i++) {
+        void* o = object_at(i); if (!o || !addr_readable((uintptr_t)o)) continue;
+        g_fguard = 1; if (sigsetjmp(g_fjmp,1)) { g_fguard = 0; continue; }
+        void* pk = package_of(o); g_fguard = 0;
+        if (!pk) continue; bool seen = false;
+        for (int k = 0; k < npkg; k++) if (pkgs[k] == pk) { seen = true; break; }
+        if (!seen) { pkgs[npkg] = pk; pkg_short(pk, pkgnm[npkg], sizeof pkgnm[npkg]); npkg++; }
+    }
+    int total_structs = 0, total_enums = 0;
+    for (int pi = 0; pi < npkg; pi++) {
+        if (hpp) fprintf(hpp, "\n// ======================= package: %s =======================\n", pkgnm[pi]);
+        if (js)  fprintf(js, "%s\n    {\"name\":\"%s\",\"enums\":[", pi?",":"", pkgnm[pi]);
+        bool jse_first = true;
+        // enums first
+        for (int32_t i = 0; i < n; i++) {
+            void* o = object_at(i); if (!o || !addr_readable((uintptr_t)o)) continue;
+            g_fguard = 1; if (sigsetjmp(g_fjmp,1)) { g_fguard = 0; continue; }
+            void* cls = obj_class(o); char cn[48]; obj_name(cls, cn, sizeof cn);
+            bool isEnum = !strcmp(cn, "Enum") || !strcmp(cn, "UserDefinedEnum");
+            void* pk = isEnum ? package_of(o) : nullptr; g_fguard = 0;
+            if (!isEnum || pk != pkgs[pi]) continue;
+            if (dump_enum(hpp, js, o, jse_first)) { jse_first = false; total_enums++; }
+        }
+        if (js) fprintf(js, "],\"structs\":[");
+        bool jss_first = true;
+        // structs + classes
+        for (int32_t i = 0; i < n; i++) {
+            void* o = object_at(i); if (!o || !addr_readable((uintptr_t)o)) continue;
+            g_fguard = 1; if (sigsetjmp(g_fjmp,1)) { g_fguard = 0; continue; }
+            void* cls = obj_class(o); char cn[48]; obj_name(cls, cn, sizeof cn);
+            bool isClass  = !strcmp(cn,"Class") || !strcmp(cn,"BlueprintGeneratedClass");
+            bool isStruct = !strcmp(cn,"ScriptStruct");
+            char nm[80]; obj_name(o, nm, sizeof nm);
+            bool skip = !strncmp(nm, "Default__", 9);
+            void* pk = (isClass||isStruct) && !skip ? package_of(o) : nullptr; g_fguard = 0;
+            if ((!isClass && !isStruct) || skip || pk != pkgs[pi]) continue;
+            dump_struct(hpp, js, o, isClass, jss_first); jss_first = false; total_structs++;
+            if (leg) {   // legacy flat line
+                void* sup = struct_super(o); char sn[80]=""; if (addr_readable((uintptr_t)sup)) obj_name(sup, sn, sizeof sn);
+                fprintf(leg, "%s%s : %s  [%s]\n", isClass?"class ":"struct ", nm, sn, pkgnm[pi]);
+            }
+            if ((total_structs & 0x1f) == 0 && hpp) fflush(hpp);
+        }
+        if (js) fprintf(js, "]}");
+    }
+    if (js)  fprintf(js, "\n  ]\n}\n");
+    if (hpp) fclose(hpp);
+    if (js)  fclose(js);
+    if (leg) fclose(leg);
+    LOG("SDK dump complete: %d packages, %d structs/classes, %d enums -> %s/", npkg, total_structs, total_enums, SDK_DIR);
 }
 // BACKGROUND thread: heavy scan -> validated enemy pawn list. Off the game thread (no VR hitch);
 // game thread re-validates each before touching it (no stale-pointer corruption).
@@ -2428,6 +2716,32 @@ static void handler(void* obj, void* func, void* params) {
                 if (params && strstr(pcn, "Str")) { char rs[160]; read_fstring(params, po, rs, sizeof rs);
                     LOG("  reason %s='%s'", pn, rs); }
                 else LOG("  param %s : %s @ %d", pn, pcn, po);
+                if (!*(void**)((uint8_t*)p + FFIELD_NEXT_OFF)) break;
+            }
+            break;
+        }
+    }
+    // AUTH TRACE (log-only): whenever a join-handshake RPC fires, print it + its params so we can see
+    // the LIVE sequence on a failing player-hosted join — which gate the host drives, and what our
+    // client actually produces (IdToken/Nonce/AttestationToken lengths+preview, AC DataBlob size).
+    if (g_ready && g_nauthfn) {
+        for (int k = 0; k < g_nauthfn; k++) if (g_authfn[k] == func) {
+            LOG("AUTHTRACE >>> %s", g_authnm[k]);
+            for (void* p = *(void**)((uint8_t*)func + USTRUCT_CHILDPROPS); addr_readable((uintptr_t)p);
+                 p = *(void**)((uint8_t*)p + FFIELD_NEXT_OFF)) {
+                char pn[48]; field_name(p, pn, sizeof pn);
+                int32_t po = *(int32_t*)((uint8_t*)p + FPROP_OFFSET_OFF);
+                void* pc = *(void**)((uint8_t*)p + 0x8); char pcn[48] = "?";
+                if (addr_readable((uintptr_t)pc)) { int32_t ni = *(int32_t*)pc; fname_to_str(ni, pcn, sizeof pcn); }
+                if (params && strstr(pcn, "Str")) {                       // FString: length + preview
+                    char16_t* d = *(char16_t**)((uint8_t*)params + po); int32_t cnt = *(int32_t*)((uint8_t*)params + po + 8);
+                    char rs[200] = ""; if (d && addr_readable((uintptr_t)d) && cnt > 0)
+                        for (int j = 0; j < cnt && j < 199 && d[j]; j++) { char c=(char)d[j]; rs[j]=(c>=32&&c<127)?c:'.'; }
+                    LOG("   %s: FString len=%d '%.80s'", pn, cnt, rs);
+                } else if (params && strstr(pcn, "Array")) {              // TArray<uint8> DataBlob: count
+                    int32_t cnt = *(int32_t*)((uint8_t*)params + po + 8);
+                    LOG("   %s: Array count=%d", pn, cnt);
+                } else LOG("   %s : %s @ %d", pn, pcn, po);
                 if (!*(void**)((uint8_t*)p + FFIELD_NEXT_OFF)) break;
             }
             break;
