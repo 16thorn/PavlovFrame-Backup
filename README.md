@@ -2,8 +2,9 @@
 
 An internal UE5.1 mod library for the **Pavlov "Steam Frame"** build (`com.vankrupt.pavlov`,
 arm64 Android / Quest). It self-resolves the engine at runtime on a fully-stripped
-`libUnreal.so` (no symbols) and drives the game through UObject reflection — chams,
-aim assist, gun/movement tweaks, a runtime SDK dumper, and a client-side name changer.
+`libUnreal.so` (no symbols) and drives the game through UObject reflection — chams, ESP,
+aim assist, client-authoritative hit-reg kills (trigger-kill / kill-all / **pick-a-player**),
+gun/movement tweaks, a TTT buy menu, a runtime SDK dumper, and a client-side name changer.
 
 > **Scope / disclaimer.** This is a reverse-engineering + game-hacking learning project for
 > **your own headset and offline/private testing**. Multiplayer cheating ruins games for real
@@ -20,15 +21,19 @@ the game thread from a hooked `ProcessEvent`.
 
 | Feature | Notes | Online? |
 |---|---|---|
-| **Chams / wallhack** | Force-loads the game's own `M_PlayerXRay` material and applies it to enemy body meshes (team-colored, aim-target highlighted). Skips dead pawns. | ✅ (client-side render) |
-| **Silent aim** | Snaps the gun toward the nearest enemy head. Runs late-frame (`ReceiveDrawHUD`) so the rotation survives to replicate — that's what makes it land online. FFA vs team auto-detected from `GameModeType`. | ✅ |
+| **Chams / wallhack** | Force-loads the game's own `M_PlayerXRay` material onto enemy body meshes. **Styles:** Team, Single-A/B, Flash (pulse), Target-only, **Custom** (per-team RGB via a dynamic material instance). Aim-target highlighted, skips corpses. | ✅ (client-side render) |
+| **ESP overlay** | 2D box / name / distance / health bar / TTT role over each enemy, crosshair dot, aimbot FOV circle. Projected with the game's own camera. | ✅ |
+| **Silent aim** | Snaps the gun toward the enemy head. Runs late-frame (`ReceiveDrawHUD`) so the rotation replicates — that's what lands it online. FFA vs team auto-detected; **Team-check off = target everyone**. | ✅ |
+| **Trigger-kill** | On each real shot, reports a headshot on your aim target via `ServerReportBulletHit` (client-authoritative hit-reg). Lands **weaponless** too. | ✅ |
+| **Kill All** | On-fire: headshots every *loaded* enemy on the bullet. Detectable — use sparingly. | ✅ (loaded enemies) |
+| **Target kill** *(pick-a-player)* | Live player list by name in the Weapon tab — pick one, **KILL SELECTED**. Re-resolves the target fresh by name each press (crash-safe). White = loaded/killable, grey = too far. | ✅ (loaded enemies) |
 | **No-recoil + perfect accuracy** | Zeroes recoil/spread floats on the held gun. | ✅ |
-| **Rapid / auto fire** | Shrinks the fire-rate config; forces `FireMode` to Automatic. | offline; server may cap |
-| **Movement speed** | Boosts `MaxWalkSpeed` / sprint / ADS on `PavlovMovementComponent` (all directions). | client-predicted |
-| **Godmode** | Zeroes `DamageMultiplier`, pins `Health`. | offline only (server-auth) |
-| **Homing knife** | Steers a thrown knife's physics velocity toward the nearest enemy. | offline; server may reject |
-| **Name changer** | Writes `PlayerNamePrivate` in-place (client-side). Unlocks name-gated custom-map perks/VIP. Short names only (buffer-limited). | client-side checks only |
-| **SDK dumper** | Walks all `UClass`/`ScriptStruct` and writes `name : super + props(+offset,type) + funcs` to `sdk_dump.txt`. | tool |
+| **Rapid / auto fire, no-reload, infinite ammo** | Fire-rate config + `FireMode` = Automatic; reload/ammo tweaks. | offline; server may cap |
+| **Movement** | Boosts `MaxWalkSpeed` / sprint / ADS / **crouch** on `PavlovMovementComponent`; optional **noclip** (fly + collision off, offline). | client-predicted |
+| **Anti-flash** | Zeroes the flashbang blind curve on `GlobalPlayerEffects`. | ✅ (client render) |
+| **TTT buy menu** | `ServerBuy(FName)` with a categorized + searchable weapon list (exact Pavlov equipment IDs). | ✅ where buying is on |
+| **Godmode / homing knife / name changer / dev tag** | Server-authoritative or client-view-only — see [Server ceiling](#server-authoritative-ceiling). **⚠️ Name changer / dev tag / noclip crash the game ONLINE** (replicated writes) — offline only. | offline only |
+| **SDK dumper** | Walks all `UClass`/`ScriptStruct` → `name : super + props(+offset,type) + funcs` in `sdk_dump.txt`. | tool |
 
 ---
 
@@ -40,9 +45,26 @@ quad layer and driven by your controller. No more adb for day-to-day toggling.
 - **Open/close:** press in the **left thumbstick (L3)**.
 - **Cursor:** aim the controller at the panel. **Click:** the **right trigger**.
   *(If bindings need tuning on first boot, it auto-falls-back to up-point-to-open + dwell-to-click.)*
-- **Tabs:** Aimbot · Visuals · Weapon · Movement · Player · Config — every feature has its own toggle
-  and sliders (aim FOV/mode, movement multipliers, chams colors, name changer, etc.).
+- **Tabs:** Aimbot · Visuals · Weapon · Movement · Player · TTT · Config — every feature has its own
+  toggle and sliders (aim FOV/mode, cham style + custom colors, movement multipliers, ESP, buy list…).
 - Settings persist to `.../files/mei.cfg`. Master enable is on by default so the mod arms itself.
+
+### How to kill people (for your friends)
+
+Hit-reg in Pavlov is **client-authoritative** (`ServerReportBulletHit`), so kills land **even with no
+weapon in hand** (the report supplies its own gun class — shows as a Hunting Rifle in the feed).
+
+- **One specific player:** Weapon tab → **TARGET KILL** → tap a **white** name → **KILL SELECTED**.
+  White = loaded/killable; grey = too far / not streamed in (can't be reported on — trying crashes the
+  netcode, so it's locked out).
+- **Whoever you point at:** turn on **Trigger kill**, aim, pull the trigger.
+- **Everyone loaded:** **Kill All** (Weapon tab) on your next shot — detectable, use sparingly.
+
+> ### ⚠️ Leave these OFF online — they crash the game
+> **Name changer, Dev tag, and Noclip** write **replicated** properties (`PlayerNamePrivate`, `bDev`,
+> flying `MovementMode`). The server re-serializes them on a net tick and the game **hard-crashes**
+> (`SIGSEGV` in the netcode, uncatchable). They're **offline-only**. Name changer especially: if your
+> name is short enough to fit the buffer it *will* write and *will* crash you online.
 
 Architecture + first-pixel bring-up: **[docs/MEI-MENU.md](docs/MEI-MENU.md)** and
 **[docs/ON-DEVICE.md](docs/ON-DEVICE.md)**. The old `chams.txt` integer still works as a fallback
@@ -162,14 +184,22 @@ comments. The **key online-aim insight**: rotation must be written *late in the 
 
 Pavlov is server-authoritative for gun/health state. **Client-side visual/simulation** (chams,
 movement prediction, aim rotation that replicates) works online; **state the server owns**
-(health, ammo counts, hit registration, real player name, admin status) is validated server-side
-and cannot be forced from the client. Documented limits:
+(health, ammo counts, real player name, admin status) is validated server-side and can't be forced
+from the client. Documented limits:
 
+- **Hit registration is the exception** — `ServerReportBulletHit` is *client-authoritative*, so
+  trigger-kill / target-kill / kill-all land online (even weaponless). BUT the server only accepts a
+  report for a **rendered/loaded** pawn — reporting an un-streamed far player crashes the netcode on a
+  deferred tick, so those are skipped (grey in the list).
+- **Replicated-write features CRASH online** — writing a property the server replicates and
+  re-serializes (`PlayerNamePrivate` = **name changer**, `bDev` = **dev tag**, flying `MovementMode` =
+  **noclip**) hard-crashes the game (`SIGSEGV` deep in the net serializer, on a later tick, so our
+  fault-guard can't catch it). These are **offline-only** — keep them off in a live match.
 - **Godmode / infinite ammo** — server tracks real values → offline only.
 - **Real name change** (`ServerChangeName`) — server forces the account name back (anonymous
-  Device-ID auth = name `"null"`). Only the **client-side** in-place write sticks locally.
+  Device-ID auth = name `"null"`). The client-side in-place write is view-only, short-names-only, and
+  only for **custom maps that gate perks by a client-side name check**.
 - **Anti-votekick / admin / VIP tied to your account** — server-side, not client-reachable.
-  (Custom-map perks that check your *display name client-side* are the exception — those work.)
 
 We don't attempt anti-cheat bypass, ban evasion, or forced disconnect blocking.
 
