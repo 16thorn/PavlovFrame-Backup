@@ -46,15 +46,19 @@ void mei_save() {
     fprintf(f, "wallbang %d\n",        s.wallbang);
     fprintf(f, "aura_rate %.1f\n",     s.aura_rate);
     fprintf(f, "move_enabled %d\n",    s.move_enabled);
+    fprintf(f, "noclip %d\n",          s.noclip);
+    fprintf(f, "anti_flash %d\n",      s.anti_flash);
     fprintf(f, "move_sprint %.3f\n",   s.move_sprint);
     fprintf(f, "move_ads %.3f\n",      s.move_ads);
     fprintf(f, "move_walk %.3f\n",     s.move_walk);
     fprintf(f, "move_crouch %.3f\n",   s.move_crouch);
     fprintf(f, "godmode %d\n",         s.godmode);
     fprintf(f, "dev_tag %d\n",         s.dev_tag);
+    fprintf(f, "force_vote %d\n",      s.force_vote);
     fprintf(f, "homing_knife %d\n",    s.homing_knife);
     fprintf(f, "name_enabled %d\n",    s.name_enabled);
     fprintf(f, "name_text %s\n",       s.name_text[0] ? s.name_text : "-");
+    fprintf(f, "skin_name %s\n",       s.skin_name[0] ? s.skin_name : "-");
     fprintf(f, "panel_dist %.3f\n",    s.panel_dist);
     fprintf(f, "panel_scale %.3f\n",   s.panel_scale);
     fprintf(f, "ui_accent %d\n",       s.ui_accent);
@@ -89,15 +93,19 @@ void mei_load() {
         GI("rapid_fire", rapid_fire) GI("force_auto", force_auto) GI("no_reload", no_reload)
         GI("infinite_ammo", infinite_ammo) GI("trigger_kill", trigger_kill)
         GI("kill_aura", kill_aura) GI("wallbang", wallbang) GF("aura_rate", aura_rate)
-        GI("move_enabled", move_enabled) GF("move_sprint", move_sprint) GF("move_ads", move_ads)
+        GI("move_enabled", move_enabled) GI("noclip", noclip) GI("anti_flash", anti_flash)
+        GF("move_sprint", move_sprint) GF("move_ads", move_ads)
         GF("move_walk", move_walk) GF("move_crouch", move_crouch)
-        GI("godmode", godmode) GI("dev_tag", dev_tag) GI("homing_knife", homing_knife)
+        GI("godmode", godmode) GI("dev_tag", dev_tag) GI("force_vote", force_vote) GI("homing_knife", homing_knife)
         GI("name_enabled", name_enabled) GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)
         GI("ui_accent", ui_accent) GI("panel_custom", panel_custom)
         if (!strcmp(key, "panel_off") &&
             sscanf(line, "%*s %f %f %f", &s.panel_off[0], &s.panel_off[1], &s.panel_off[2]) == 3) continue;
         if (!strcmp(key, "name_text") && sscanf(line, "%*s %127s", sval) == 1) {
             if (strcmp(sval, "-")) { strncpy(s.name_text, sval, MEI_NAME_MAX-1); s.name_text[MEI_NAME_MAX-1]=0; }
+        }
+        if (!strcmp(key, "skin_name") && sscanf(line, "%*s %127s", sval) == 1) {
+            if (strcmp(sval, "-")) { strncpy(s.skin_name, sval, MEI_NAME_MAX-1); s.skin_name[MEI_NAME_MAX-1]=0; }
         }
         #undef GI
         #undef GF

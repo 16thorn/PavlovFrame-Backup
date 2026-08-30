@@ -657,6 +657,7 @@ static void* fn_GetXRay = nullptr;  // GhostPawn::GetXRayMaterial
 static int32_t g_ghost_mat_off = -1;// offset on the ghost holding the xray material (found read-only)
 static int32_t o_SkelAsset = -1;    // SkeletalMeshComponent::SkeletalMeshAsset (renderable check)
 static void* fn_SetVis = nullptr;   // SceneComponent::SetVisibility (hide-test diagnostic)
+static void* fn_SetHidden = nullptr;// AActor::SetActorHiddenInGame (anti-smoke)
 static void* fn_GetItem = nullptr;  // PavlovPawn::GetItemOfClass
 static void* c_Gun = nullptr;       // Gun_Base_C
 static void* c_VRGun = nullptr;     // VRGun
@@ -667,6 +668,7 @@ static int32_t o_AvatarSkin = -1, o_SkullSocket = -1;
 static void* g_fire[16]; static int g_nfire = 0;    // gun fire UFunctions (fire-path hook)
 static void* g_kick[8]; static int g_nkick = 0;     // kick RPCs to DROP (anti-votekick)
 static void* fn_ChangeName = nullptr;               // ServerChangeName (name spoof for custom-map admin)
+static void* fn_SetPlayerSkin = nullptr;            // PavlovPawn::SetPlayerSkin(FName) — player skin changer
 // ---- trigger-kill (ported from the PC internal: APavlovPlayerController::ServerReportBulletHit) ----
 static void* fn_ReportHit = nullptr;                // ServerReportBulletHit(FClientBulletHit)
 static void* c_KillGun = nullptr, *c_KillBullet = nullptr;   // GunClass / BulletClass for the report
@@ -683,12 +685,14 @@ static void* fn_GMChangeName = nullptr; static int32_t o_AuthGM = -1;   // GameM
 static char g_wantName[64] = {0};                   // desired name from name.txt (direct-write spoof)
 static void* g_knife[6]; static int g_nknife = 0;   // knife throw UFunctions (homing-knife hook)
 static void* fn_SetPhysVel = nullptr; static int32_t o_RootComp = -1;
+static void* fn_SetCollision = nullptr;             // AActor::SetActorEnableCollision (noclip)
 static void* g_thrownKnife = nullptr; static long g_throwMs = 0;
 static void* g_drawhud[8]; static int g_ndrawhud = 0;  // ReceiveDrawHUD UFunctions (Canvas source)
 static void* c_Canvas = nullptr; static void* fn_DrawText = nullptr;
 static int g_cfg = 2;                                // cached config (set by chams_pass; read per-PE)
 static void* g_bots[128]; static int g_nbots = 0;   // enemy pawns cached by chams_pass (aim reads this)
 static void* g_aim_target = nullptr;                // current silent-aim target (highlighted)
+static void* g_localMe    = nullptr;                // local pawn cached by chams_pass (aim reads this — no find_world at 90Hz)
 static int32_t g_myteam = -1;                       // local player's team
 struct FVec { double x, y, z; };
 struct FRot { double pitch, yaw, roll; };
@@ -747,6 +751,7 @@ static void* resolve_gun(void* pawn) {
 // zero the four recoil/spread floats on the local held gun (offsets by name, per gun class)
 // magazine ammo offsets (VRMagazine::Bullets/MaxBullets), resolved once from a live mag's class
 static int32_t g_magBul = -1, g_magMax = -1;
+static int g_gunGen = 0;   // bumped by the menu "Refresh mods" action -> do_norecoil re-resolves gun offsets
 // aggressive infinite ammo: cached so the handler can top up mag+chamber every PE (beats server depletion
 // locally so an auto-fire gun never runs dry -> never needs the broken bolt-cock reload).
 static void* g_ammoGun = nullptr; static int32_t g_ammoMagOff = -1, g_ammoBIC = -1;
@@ -842,6 +847,7 @@ static void do_norecoil(void* pawn) {
     static float o_rs[48], o_olsm[48], o_rt[48], o_rm[48], o_ra[48], o_orpb[48], o_ofr[48], o_ofd[48], o_obd[48], o_orc[48], o_omrc[48];
     static uint8_t o_ofm[48];
     static int rn = 0;
+    static int myGen = 0; if (myGen != g_gunGen) { rn = 0; myGen = g_gunGen; }   // "Refresh mods" -> re-resolve
     void* gun = resolve_gun(pawn);   // online-robust (get_item or last-fired gun fallback)
     if (!gun || !addr_readable((uintptr_t)gun) || !in_lib(*(uintptr_t*)gun)) return;
     void* gc = obj_class(gun);
@@ -909,9 +915,27 @@ static void do_norecoil(void* pawn) {
         // no-reload: zero cooldowns when ON, restore originals when OFF
         if (f_nrl) { wf(gun, orc[ci], 0.f); wf(gun, omrc[ci], 0.f); }
         else       { wf(gun, orc[ci], o_orc[ci]); wf(gun, omrc[ci], o_omrc[ci]); }
-        // INFINITE AMMO REMOVED — writing Magazine->Bullets derefs a sub-object and corrupts gun state on
-        // spawn (crash on join). The known-good build removed it for exactly this reason ("bricked cocking").
+        // INFINITE AMMO (opt-in "try"): top up Magazine->Bullets to MaxBullets. The old unconditional write
+        // crashed on join (deref of a half-initialised magazine during spawn), so gate it HARD: only for the
+        // gun we've actually seen fire (== g_heldGun -> stable, past spawn), a fully-validated magazine, and
+        // only when Bullets is a sane value below MaxBullets. Server-authoritative online (offline/custom best).
         g_ammoGun = nullptr;
+        if (M && g_mei.infinite_ammo && omag[ci] >= 0 && gun == g_heldGun) {
+            void* mag = *(void**)((uint8_t*)gun + omag[ci]);
+            if (mag && addr_readable((uintptr_t)mag) && in_lib(*(uintptr_t*)mag)) {
+                char mcn[48]; obj_name(obj_class(mag), mcn, sizeof mcn);
+                if (strstr(mcn, "Magazine")) {                       // confirm it's really a magazine object
+                    if (g_magBul < 0) { void* mgc = obj_class(mag);
+                        g_magBul = prop_offset(mgc, "Bullets"); g_magMax = prop_offset(mgc, "MaxBullets"); }
+                    if (g_magBul >= 0 && g_magMax >= 0) {
+                        int32_t mx = *(int32_t*)((uint8_t*)mag + g_magMax);
+                        int32_t cur = *(int32_t*)((uint8_t*)mag + g_magBul);
+                        if (mx > 0 && mx < 10000 && cur >= 0 && cur < mx)
+                            *(int32_t*)((uint8_t*)mag + g_magBul) = mx;   // top up only when below full
+                    }
+                }
+            }
+        }
     }
     // movement + godmode moved OUT to do_movement()/do_godmode() so they work with NO weapon held.
 }
@@ -919,12 +943,25 @@ static void do_norecoil(void* pawn) {
 // MOVEMENT: apply speeds on the pawn's PavlovMovementComponent — runs on `me` regardless of a held gun.
 static void do_movement(void* pawn) {
     void* mc = nullptr;
-    if (g_mei.master_enabled && g_mei.move_enabled) mc = find_movecomp(pawn);   // scan throttled inside
+    bool wantMc = g_mei.master_enabled && (g_mei.move_enabled || g_mei.noclip);
+    if (wantMc) mc = find_movecomp(pawn);   // scan throttled inside
     else if (g_mc && g_mcPawn == pawn && addr_readable((uintptr_t)g_mc) && in_lib(*(uintptr_t*)g_mc)) mc = g_mc;
     static int dbg = 0;
     if (!mc || !addr_readable((uintptr_t)mc) || !in_lib(*(uintptr_t*)mc)) {
         if (dbg++ < 12) LOG("move: NO movecomp (mc=%p pawn=%p move_enabled=%d)", mc, pawn, g_mei.move_enabled);
         return; }
+    // NOCLIP: force Flying MovementMode (5) while on; toggle actor collision on the edge (offline).
+    { static int32_t o_mm = -2, o_fly = -2; if (o_mm == -2) o_mm = prop_offset(obj_class(mc), "MovementMode");
+      if (o_fly == -2) o_fly = prop_offset(obj_class(mc), "MaxFlySpeed");
+      static bool ncPrev = false; static float flyOrig = 0.f; bool nc = g_mei.master_enabled && g_mei.noclip;
+      if (nc && o_mm >= 0) *(uint8_t*)((uint8_t*)mc + o_mm) = 5;                     // EMovementMode::MOVE_Flying
+      if (nc && o_fly >= 0) *(float*)((uint8_t*)mc + o_fly) = 2400.f * g_mei.move_walk;  // fast fly (scales w/ Walk slider)
+      if (nc != ncPrev) { ncPrev = nc;
+          if (o_fly >= 0) { if (nc) { flyOrig = *(float*)((uint8_t*)mc + o_fly); }   // capture/restore fly speed
+                            else if (flyOrig > 0.f) *(float*)((uint8_t*)mc + o_fly) = flyOrig; }
+          if (fn_SetCollision) { struct { uint8_t on; char p[7]; } p{ (uint8_t)(nc?0:1), {0} }; g_ProcessEvent(pawn, fn_SetCollision, &p); }
+          if (!nc && o_mm >= 0) *(uint8_t*)((uint8_t*)mc + o_mm) = 1;                // restore MOVE_Walking once
+      } }
     if (g_mSprint == -1) { void* mcc = obj_class(mc);
         g_mSprint = prop_offset(mcc, "SprintSpeedMultiplier");
         g_mAds    = prop_offset(mcc, "ADSSpeedMultiplier");
@@ -960,7 +997,62 @@ static void do_godmode(void* pawn) {
     if (g_mei.master_enabled && g_mei.godmode) { g_hc = hc; keep_god(); }
     else { g_hc = nullptr; if (g_hcDmg >= 0) *(float*)((uint8_t*)hc + g_hcDmg) = (dmgOrig >= 0.f ? dmgOrig : 1.f); }
 }
-// per-class verdict cache — decode each class name ONCE, then pointer-compare (kills per-frame decodes)
+// ANTI-FLASH / SMOKE: GlobalPlayerEffects drives the flash/smoke blind via an opacity curve sampled at
+// `Time`. Pin Time past the curve's end so the blind opacity reads ~0 -> screen stays clear.
+// pointer-cached "is this a smoke actor/component" verdict (anti-smoke)
+static void* g_smkC[256]; static uint8_t g_smkB[256]; static int g_smkN = 0;
+static bool cls_is_smoke(void* cls) {
+    if (!addr_readable((uintptr_t)cls)) return false;
+    for (int i = 0; i < g_smkN; i++) if (g_smkC[i] == cls) return g_smkB[i];
+    char c[64]; obj_name(cls, c, sizeof c);
+    bool b = (strstr(c, "Smoke") || strstr(c, "smoke")) && !strstr(c, "Grenade") && !strstr(c, "Commandlet");
+    if (g_smkN < 256) { g_smkC[g_smkN] = cls; g_smkB[g_smkN] = b; g_smkN++; }
+    return b;
+}
+static void do_antiflash() {
+    if (!(g_mei.master_enabled && g_mei.anti_flash)) return;
+    static void* c_gpe = nullptr; if (!c_gpe) c_gpe = find_class("GlobalPlayerEffects");
+    static void* c_actor = nullptr; if (!c_actor) c_actor = find_class("Actor");
+    if (!c_gpe) return;
+    static int32_t o_dis = -2, o_fc = -2, o_sc = -2;
+    if (o_dis == -2) o_dis = prop_offset(c_gpe, "bDisabled");
+    if (o_fc  == -2) o_fc  = prop_offset(c_gpe, "FlashedOpacityCurve");
+    if (o_sc  == -2) o_sc  = prop_offset(c_gpe, "TracerOpacityCurve");
+    // The GlobalPlayerEffects instance keeps changing (transient/GC), so caching one leaves the ACTIVE
+    // one un-zeroed -> the flash flickers in/out. Zero EVERY instance's opacity curve on a fast throttle.
+    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (ms - last < 300) return; last = ms;   // ~3Hz full sweep of all instances
+    int32_t n = objects_num();
+    for (int i = 0; i < n; i++) { void* o = object_at(i);
+        if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o)) continue;
+        void* oc = obj_class(o);
+        // ANTI-SMOKE (best-effort): hide any live *Smoke*-named actor/component client-side. Note: on most
+        // maps the smoke cloud is Niagara/render FX that isn't a reflectable object, so this only helps
+        // where the smoke IS a named actor. The screen flash (above) is the reliable part.
+        if (cls_is_smoke(oc)) {
+            char snm[24]; obj_name(o, snm, sizeof snm); if (!strncmp(snm, "Default__", 9)) continue;
+            g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
+                if (c_actor && is_a(o, c_actor)) { if (fn_SetHidden) { struct { uint8_t b, p[7]; } p{1,{0}}; g_ProcessEvent(o, fn_SetHidden, &p); } }
+                else if (fn_SetVis) { struct { uint8_t v, p; } vp{0,1}; g_ProcessEvent(o, fn_SetVis, &vp); }   // component
+            } g_fguard = 0;
+            continue;
+        }
+        if (!is_a(o, c_gpe)) continue;
+        char nm[24]; obj_name(o, nm, sizeof nm); if (!strncmp(nm, "Default__", 9)) continue;
+        if (o_dis >= 0) *(uint8_t*)((uint8_t*)o + o_dis) = 1;                 // bool kill-switch per instance
+        int32_t offs[2] = { o_fc, o_sc };
+        for (int ci = 0; ci < 2; ci++) { if (offs[ci] < 0) continue;
+            void* curve = *(void**)((uint8_t*)o + offs[ci]);
+            if (!curve || !addr_readable((uintptr_t)curve) || !in_lib(*(uintptr_t*)curve)) continue;
+            uint8_t* keys = *(uint8_t**)((uint8_t*)curve + 0x30 + 0x70);      // FloatCurve.Keys.Data
+            int32_t cnt   = *(int32_t*)((uint8_t*)curve + 0x30 + 0x70 + 8);   // .Num
+            if (!keys || !addr_readable((uintptr_t)keys) || cnt <= 0 || cnt > 1000) continue;
+            for (int k = 0; k < cnt; k++) { float* v = (float*)(keys + (size_t)k * 0x1c + 0x8);
+                if (addr_readable((uintptr_t)v)) *v = 0.f; }
+        }
+    }
+}// per-class verdict cache — decode each class name ONCE, then pointer-compare (kills per-frame decodes)
 static void* g_clsC[256]; static uint8_t g_clsB[256]; static int g_clsN = 0;
 // does `cls` derive from `base` (walk the super chain)?
 static bool cls_derives(void* cls, void* base) {
@@ -1123,6 +1215,7 @@ static void resolve_names() {
     if (o_SkelAsset < 0 && c_Mesh) o_SkelAsset = prop_offset(c_Mesh, "SkinnedAsset");
     void* csc = find_class("SceneComponent");
     fn_SetVis = csc ? find_func(csc, "SetVisibility") : nullptr;
+    { void* cac = find_class("Actor"); fn_SetHidden = cac ? find_func(cac, "SetActorHiddenInGame") : nullptr; }
     fn_GetItem = find_func(c_PavlovPawn, "GetItemOfClass");
     c_Gun = find_class("Gun_Base_C");
     c_VRGun = find_class("VRGun");
@@ -1149,6 +1242,7 @@ static void resolve_names() {
       fn_SetPhysVel = cprim ? find_func(cprim, "SetPhysicsLinearVelocity") : nullptr;
       void* cact = find_class("Actor");
       o_RootComp = cact ? prop_offset(cact, "RootComponent") : -1;
+      fn_SetCollision = cact ? find_func(cact, "SetActorEnableCollision") : nullptr;   // noclip
       LOG("knife: nthrow=%d SetPhysVel=%p RootComp@%d", g_nknife, fn_SetPhysVel, o_RootComp); }
     // anti-votekick: collect the client-side kick RPCs so the handler can DROP them (ignore the kick)
     { void* cpc = find_class("PlayerController");
@@ -1251,6 +1345,8 @@ static void resolve_names() {
     LOG("PavlovPawn=%p Ghost=%p MeshComp=%p SetOverlay=%p XRay0@%d XRay1@%d Team@%d",
         c_PavlovPawn, c_Ghost, c_Mesh, fn_SetOverlay, o_XRay0, o_XRay1, o_TeamId);
     g_ready = (fn_SetOverlay && c_Mesh && c_PavlovPawn && o_XRay0 >= 0);
+    fn_SetPlayerSkin = find_func(c_PavlovPawn, "SetPlayerSkin");   // SetPlayerSkin(FName PlayerSkin)
+    LOG("SetPlayerSkin=%p", fn_SetPlayerSkin);
 }
 // world graph offsets — resolved BY NAME on this build (the frida values were a different build)
 static int32_t O_WORLD_GI = -1, O_GI_LP = -1, O_LP_PC = -1, O_PC_ACKPAWN = -1, O_CTRL_PAWN = -1;
@@ -1736,6 +1832,16 @@ static void scan_bots() {
 static void chams_pass() {
     if (!g_ready) return;
     g_cfg = cfg_value();
+    // "Refresh mods" (menu): drop every per-feature cache so guns/chams/movement re-resolve from scratch.
+    if (g_mei.act_refresh) { g_mei.act_refresh = false;
+        g_gunGen++; g_heldGun = nullptr; g_ammoGun = nullptr;                       // guns re-resolve
+        g_mc = nullptr; g_mcPawn = nullptr; g_walkComp = nullptr;                   // movement re-resolves
+        g_mSprint = g_mAds = g_mWalk = g_mCrouch = -1; g_mSprintOrig = g_mAdsOrig = -1.f; g_walkOrig = g_crouchOrig = 0.f;
+        g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) cham_restore_all(); g_fguard = 0;  // clear chams overrides
+        g_xray0 = g_xray1 = g_xray_mat = nullptr;                                   // reload materials fresh
+        g_myPS = nullptr; g_hc = nullptr; g_aim_target = nullptr;
+        LOG("REFRESH: all mod caches dropped");
+    }
     bool on = g_mei.master_enabled && g_mei.chams_enabled;   // chams gate (menu-driven)
     bool hide = false;                                       // hide-test path retired
     // NAME SPOOF: menu (g_mei.name_text) is primary; name.txt kept as an adb fallback. Applied
@@ -1759,6 +1865,7 @@ static void chams_pass() {
       if (rms - last_ref > 4000) { last_ref = rms; g_xray0 = g_xray1 = g_xray_mat = nullptr; } }
     g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) force_load_xray(); g_fguard = 0;
     void* me = local_pawn();
+    g_localMe = me;   // publish for the 90Hz continuous-aim path (so it never calls find_world itself)
     // POST-DEATH RECOVERY: when the pawn changes (respawn/map), every per-pawn cache is stale. Drop them
     // so movement/name/aim re-resolve for the NEW pawn instead of silently no-op'ing on dead pointers.
     { static void* last_me = nullptr;
@@ -1778,6 +1885,10 @@ static void chams_pass() {
                     if (pc != devCls) { devCls = pc; g_devOff = prop_offset(pc, "bDev");   // re-resolve on class change only
                         LOG("devtag: PlayerState=%p class-changed bDev@%d", ps, g_devOff); }
                     g_myPS = ps; if (g_devOff >= 0) *(uint8_t*)((uint8_t*)ps + g_devOff) = (g_mei.master_enabled && g_mei.dev_tag) ? 1 : 0;
+                    // VOTE UNLOCK: force bCanVote so the vote button shows even in modes that disable it
+                    static int32_t o_vote = -2; static void* voteCls = nullptr;
+                    if (pc != voteCls) { voteCls = pc; o_vote = prop_offset(pc, "bCanVote"); }
+                    if (o_vote >= 0 && g_mei.master_enabled && g_mei.force_vote) *(uint8_t*)((uint8_t*)ps + o_vote) = 1;
                     // our own TTT role (client always knows its own) -> menu TTT tab
                     if (o_PS_Role >= 0) { int32_t rid = *(int32_t*)((uint8_t*)ps + o_PS_Role);
                         if (rid > 0) fname_to_str(rid, g_mei.my_role, sizeof g_mei.my_role); }
@@ -1817,9 +1928,10 @@ static void chams_pass() {
     // movement runs on the pawn regardless of holding a weapon (own guard so a gun-less pawn still gets
     // speed). One extra pass after it goes OFF restores originals, then stops. (godmode removed.)
     static bool ranMove = false;
-    bool wantMove = g_mei.master_enabled && g_mei.move_enabled;
+    bool wantMove = g_mei.master_enabled && (g_mei.move_enabled || g_mei.noclip);
     if ((wantMove || ranMove) && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_movement(me); g_fguard = 0; }
     ranMove = wantMove;
+    g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_antiflash(); g_fguard = 0;   // anti-flash/smoke
     // ESP restore: the moment chams turns OFF, put every overridden mesh back to its original material
     // (else the x-ray stays until respawn). One-shot: cham_restore_all clears the cache.
     if (!on) { if (g_nCham > 0) cham_restore_all(); return; }
@@ -2276,9 +2388,22 @@ static void handler(void* obj, void* func, void* params) {
             g_in_pass = false;
         }
     }
-    // CONTINUOUS AIM REMOVED — it ran do_aim at ~90Hz on the game thread (local_pawn + per-bot socket
-    // RPCs every frame) and lagged horribly. Silent aim now runs ONLY on the fire path above (snaps the
-    // shot to the head the instant you pull the trigger), which is cheap and doesn't hitch.
+    // CONTINUOUS AIM (aim_mode == Continuous): run on the LATE-frame ReceiveDrawHUD path (our PostRender
+    // equivalent) so our rotation is the last write before the frame replicates — that's what makes it
+    // land online. Uses the CACHED pawn (g_localMe), never local_pawn()/find_world, so no 90Hz scan/lag.
+    if (!g_in_pass && g_ready && g_mei.master_enabled && g_mei.aim_enabled && g_mei.aim_mode == AIM_CONTINUOUS) {
+        bool isHud = false; for (int k = 0; k < g_ndrawhud; k++) if (g_drawhud[k] == func) { isHud = true; break; }
+        static long last_aim = 0;
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+        if (isHud || (ms - last_aim >= 11)) {
+            last_aim = ms;
+            void* me = g_localMe;
+            if (me && addr_readable((uintptr_t)me) && in_lib(*(uintptr_t*)me)) {
+                g_in_pass = true; do_aim(me, true, false); g_in_pass = false;   // rotation only (no TP)
+            }
+        }
+    }
     // KILL-AURA: continuously report a headshot on EVERY valid enemy (no need to fire or aim). Throttled
     // to aura_rate. This is the strongest / most detectable feature — reflection-guarded per target.
     if (!g_in_pass && g_ready && g_mei.master_enabled && g_mei.kill_aura && fn_ReportHit && g_nbots) {

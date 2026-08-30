@@ -6,6 +6,7 @@
 #include "mei_esp.h"
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <time.h>
 
 // ---- accents -----------------------------------------------------------------
@@ -80,7 +81,7 @@ static void gb_begin(const char* title){
 static void gb_end(){ ImGui::EndChild(); ImGui::Spacing(); }
 
 // ---- on-screen keyboard ------------------------------------------------------
-static bool g_kb=false, g_shift=false;
+static bool g_kb=false, g_kb2=false, g_shift=false;
 static void kb_append(char* b,int cap,char ch){ int n=(int)strlen(b); if(n<cap-1){b[n]=ch;b[n+1]=0;touched();} }
 static void keyboard(char* buf,int cap){
     const char* rows[4]={"1234567890","QWERTYUIOP","ASDFGHJKL","ZXCVBNM"};
@@ -173,12 +174,15 @@ static void tab_movement(){
     Sl("Walk",&g_mei.move_walk,1.f,5.f,"%.1fx");
     Sl("Crouch",&g_mei.move_crouch,1.f,5.f,"%.1fx");
     ImGui::EndDisabled();
+    Chk("Noclip (fly + no collision)",&g_mei.noclip);
     gb_end();
 }
 static void tab_player(){
     gb_begin("PLAYER");
     Chk("Godmode",&g_mei.godmode);
     Chk("Dev tag",&g_mei.dev_tag);
+    Chk("Vote unlock",&g_mei.force_vote);
+    Chk("Anti flash",&g_mei.anti_flash);
     Chk("Homing knife",&g_mei.homing_knife);
     gb_end();
     gb_begin("NAME CHANGER");
@@ -205,19 +209,55 @@ static void tab_ttt(){
         ImGui::Text("%-14s %-9s %4.0fm", e.name[0] ? e.name : "player", e.role[0] ? e.role : "-", e.dist); }
     gb_end();
     gb_begin("BUY  (ServerBuy)");
-    ImGui::PushItemWidth(-1.f);
-    if (ImGui::InputText("##buy", g_mei.buy_name, MEI_NAME_MAX)) touched();
-    if (ImGui::IsItemActivated()) g_kb = true;   // auto-open keyboard
-    ImGui::PopItemWidth();
-    const char* presets[] = { "Radar","Disguiser","C4","Silenced","Defuser","BodyArmor","Teleporter","HealthStation" };
-    for (int i = 0; i < 8; i++) {
-        if (ImGui::Button(presets[i], ImVec2(150,38))) {
-            strncpy(g_mei.buy_name, presets[i], MEI_NAME_MAX-1); g_mei.buy_name[MEI_NAME_MAX-1]=0; g_mei.act_buy = true; }
-        if (i % 3 != 2) ImGui::SameLine();
+    // EXACT in-game buy IDs, grouped. Click an ID -> ServerBuy fires. Filter box narrows the list.
+    struct BuyCat { const char* name; const char** ids; int n; };
+    static const char* c_pistol[] = {"1911","57","cet9","de","goldengun","luger","m9","revolver","silentcet9","sock","tokarev","webley"};
+    static const char* c_smg[]    = {"ak","ar9","detectivesmg","kross","mp40","mp5","p90","ppsh","skorpion","smg","sten","thompson","uzi"};
+    static const char* c_shot[]   = {"autoshotgun","drumshotgun","sawedoff","shotgun","trenchgun"};
+    static const char* c_rifle[]  = {"ak12","ak47","akshorty","ar","aug","autosniper","g43","galul","m16","m1garand","sks","stg44","svt40","vanas"};
+    static const char* c_lmg[]    = {"bar","bren","dp27","lmga","mg42","pkm","tankmg"};
+    static const char* c_sniper[] = {"antitank","awp","hunting","kar98","leeenfield","mosin","scur","springfield","vzz"};
+    static const char* c_rl[]     = {"rl_m1a1","rl_panzer","rl_piat","rl_rpg","tankturret"};
+    static const char* c_knife[]  = {"knife","tttknife","ww2knife"};
+    static const char* c_special[]= {"flaregun","newtonlauncher","taser","tranqgun"};
+    static const char* c_atts[]   = {"acog","bayonet_kar98","bayonet_leeenfield","bayonet_m1garand","bayonet_mosin","bayonet_springfield","bayonet_trenchgun","canted_reddot","flashlight_rifle","grip_angled","grip_vertical","holo","laser_pistol","laser_rifle","reddot","reddot_pistol","scope","scope_kar98","scope_leeenfield","scope_mosin","scope_springfield","supp_pistol","supp_rifle"};
+    static const char* c_meds[]   = {"adrenaline","bandage","medkit","painkillers","syringe","ww2bandage","ww2medkit","ww2painkillers","ww2syringe"};
+    static const char* c_nades[]  = {"flash","flash_aurora","flash_ru","grenade","grenade_aurora","grenade_dis","grenade_ger","grenade_ru","grenade_svt","grenade_us","smoke","smoke_ger","smoke_ru","smoke_svt","smoke_us"};
+    static const char* c_mines[]  = {"antipersonnelmine","antitankmine","tripalarm"};
+    static const char* c_ammo[]   = {"ammo_pistol","ammo_rifle","ammo_shotgun","ammo_smg","ammo_sniper","ammo_special","ammocrate"};
+    static const char* c_other[]  = {"armour","ballisticsshield","boltcutters","cloakdisrupter","crowbar","dnascanner","handcuffs","healthstation","kevlarhelmet","keycard","lockpick","monocular","pickaxe","pipe","pliers","pushBomb","repairtool","skinhelmet_ger","skinhelmet_svt","skinhelmet_us","snowball","teleporter","tttc4"};
+    #define BC(a) a, (int)(sizeof(a)/sizeof(a[0]))
+    static const BuyCat CATS[] = {
+        {"Pistols",BC(c_pistol)},{"SMGs",BC(c_smg)},{"Shotguns",BC(c_shot)},{"Rifles",BC(c_rifle)},
+        {"LMGs",BC(c_lmg)},{"Snipers",BC(c_sniper)},{"Rocket Launchers",BC(c_rl)},{"Knives",BC(c_knife)},
+        {"Special",BC(c_special)},{"Attachments",BC(c_atts)},{"Meds",BC(c_meds)},{"Grenades",BC(c_nades)},
+        {"Mines",BC(c_mines)},{"Ammo",BC(c_ammo)},{"Other",BC(c_other)} };
+    #undef BC
+    static char filter[32] = {0};
+    ImGui::TextUnformatted("Search:"); ImGui::SameLine(); ImGui::PushItemWidth(-90.f);
+    if (ImGui::InputText("##buyfilter", filter, sizeof filter)) {}
+    if (ImGui::IsItemActivated()) g_kb2 = true;
+    ImGui::PopItemWidth(); ImGui::SameLine();
+    if (ImGui::Button("clear##bf", ImVec2(78,0))) filter[0]=0;
+    char flo[32]; for (int i=0; (flo[i]=(char)tolower((unsigned char)filter[i])); i++) {}
+    ImGui::BeginChild("buylist", ImVec2(0, 300), true);
+    for (int ci = 0; ci < (int)(sizeof(CATS)/sizeof(CATS[0])); ci++) {
+        const BuyCat& c = CATS[ci];
+        bool headerDrawn = false;
+        for (int i = 0; i < c.n; i++) {
+            if (flo[0]) { char lo[48]; int j=0; for(; c.ids[i][j] && j<47; j++) lo[j]=(char)tolower((unsigned char)c.ids[i][j]); lo[j]=0;
+                          if (!strstr(lo, flo)) continue; }
+            if (!headerDrawn) { headerDrawn = true; ImGui::TextColored(v4(ACC()), "%s", c.name); }
+            ImGui::PushID(ci*100+i);
+            if (ImGui::Selectable(c.ids[i], !strcmp(g_mei.buy_name, c.ids[i]))) {
+                strncpy(g_mei.buy_name, c.ids[i], MEI_NAME_MAX-1); g_mei.buy_name[MEI_NAME_MAX-1]=0; g_mei.act_buy = true; }
+            ImGui::PopID();
+        }
     }
-    ImGui::NewLine();
-    if (ImGui::Button("BUY", ImVec2(160,46))) g_mei.act_buy = true;
-    if (g_kb) { ImGui::Spacing(); keyboard(g_mei.buy_name, MEI_NAME_MAX); }
+    ImGui::EndChild();
+    ImGui::Text("selected: %s", g_mei.buy_name[0] ? g_mei.buy_name : "-"); ImGui::SameLine();
+    if (ImGui::Button("BUY", ImVec2(120,40))) g_mei.act_buy = true;
+    if (g_kb2) { ImGui::Spacing(); keyboard(filter, sizeof filter); }
     gb_end();
 }
 static void tab_config(){
@@ -248,6 +288,8 @@ static void tab_config(){
     ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "Move: point OFF the panel, hold trigger, drag. Release to drop.");
     gb_end();
     gb_begin("TOOLS");
+    if(ImGui::Button("Refresh mods",ImVec2(180,44))) g_mei.act_refresh=true;   // re-resolve guns/chams/movement
+    ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "re-hooks guns, chams & movement if they stop");
     if(ImGui::Button("Dump SDK",ImVec2(150,40))) g_mei.act_dump_sdk=true; ImGui::SameLine();
     if(ImGui::Button("Dump whitelist",ImVec2(190,40))) g_mei.act_dump_whitelist=true; ImGui::SameLine();
     if(ImGui::Button("Save",ImVec2(120,40))){ g_mei.act_save=true; g_dirty=false; }
@@ -275,8 +317,8 @@ void mei_menu_frame(int panel_w, int panel_h){
     dl->AddRectFilled(wp, ImVec2(wp.x+W, wp.y+HEAD), IM_COL32(0x16,0x16,0x1C,0xFF));
     dl->AddRectFilled(ImVec2(wp.x, wp.y+HEAD-2), ImVec2(wp.x+W, wp.y+HEAD), ACC());
     ImGui::SetCursorPos(ImVec2(16, 11));
-    ImGui::TextColored(v4(ACC()), "mei mei"); ImGui::SameLine(0,8);
-    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "[private]");
+    ImGui::TextColored(v4(ACC()), "2016"); ImGui::SameLine(0,8);
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "client");
     ImGui::SameLine(0, 20); ImGui::SetCursorPosY(8);
     {
         bool rep = g_mei.reposition;

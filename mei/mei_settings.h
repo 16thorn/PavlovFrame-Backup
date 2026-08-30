@@ -65,6 +65,8 @@ struct MeiSettings {
 
     // ---- Movement (PavlovMovementComponent) ----
     bool  move_enabled     = false;
+    bool  noclip           = false;   // fly + collision off (offline; server-auth online)
+    bool  anti_flash       = false;   // neutralise flashbang/smoke blind (GlobalPlayerEffects)
     float move_sprint      = 2.0f;    // old hardcoded 2.0
     float move_ads         = 5.0f;    // old hardcoded 5.0 (fast while aiming)
     float move_walk        = 2.0f;    // multiplier on original walk (old 2.0x)
@@ -73,9 +75,11 @@ struct MeiSettings {
     // ---- Player ----
     bool  godmode          = false;   // offline only (server-auth)
     bool  dev_tag          = false;   // self-view dev tag
+    bool  force_vote       = false;   // force bCanVote on our PlayerState (vote button even where disabled)
     bool  homing_knife     = false;
     bool  name_enabled     = false;
     char  name_text[MEI_NAME_MAX] = {0};   // client-side PlayerNamePrivate (short!)
+    char  skin_name[MEI_NAME_MAX] = {0};   // player skin FName for SetPlayerSkin
 
     // ---- Menu / panel ----
     bool  menu_open        = false;   // is the panel currently shown
@@ -99,6 +103,8 @@ struct MeiSettings {
     volatile bool act_dump_whitelist = false;
     volatile bool act_save           = false;   // force persist now
     volatile bool act_replace        = false;   // re-anchor the panel in front of the head now (Reset position)
+    volatile bool act_refresh        = false;   // re-resolve all mods (guns/chams/movement) if they stop working
+    volatile bool act_skin           = false;   // apply player skin (SetPlayerSkin) now
 };
 
 // the single shared instance (defined in mei_settings.cpp)
