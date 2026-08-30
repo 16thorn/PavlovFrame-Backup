@@ -4,58 +4,148 @@
 #include "mei_menu.h"
 #include "mei_settings.h"
 #include "mei_esp.h"
+#include "mei_audio.h"
 #include <cstdio>
 #include <cstring>
 #include <cctype>
 #include <time.h>
 
-// ---- accents -----------------------------------------------------------------
+// ---- Pavlov palette (1:1 from Content/UIResources/css/widgets.css + styles.css) ---------------
+namespace Pav {
+    // buttons
+    static const ImU32 BTN_BG      = IM_COL32(0x29,0x19,0x1a,0xFF);  // .btn background
+    static const ImU32 BTN_BORDER  = IM_COL32(0xa9,0x32,0x35,0xFF);  // .btn border
+    static const ImU32 BTN_TEXT    = IM_COL32(0xbc,0x57,0x5c,0xFF);  // .btn color
+    static const ImU32 HOT_TOP     = IM_COL32(0xff,0x0e,0x11,0xFF);  // :hover gradient top/bottom
+    static const ImU32 HOT_MID     = IM_COL32(0x6f,0x1f,0x20,0xFF);  // :hover gradient middle
+    static const ImU32 HOT_BORDER  = IM_COL32(0xd6,0x00,0x04,0xFF);  // :hover / active border
+    static const ImU32 HL_TOP      = IM_COL32(0xf7,0x00,0x04,0xFF);  // .btn-highlight top
+    static const ImU32 HL_MID      = IM_COL32(0x5d,0x08,0x09,0xFF);  // .btn-highlight middle
+    static const ImU32 HL_BOT      = IM_COL32(0x9e,0x00,0x02,0xFF);  // .btn-highlight bottom
+    // accents / structure
+    static const ImU32 RED         = IM_COL32(0xd2,0x21,0x1a,0xFF);  // checkbox check / hover accent
+    static const ImU32 EDGE        = IM_COL32(0xd6,0x00,0x04,0xFF);  // panel left border / needle
+    static const ImU32 MAROON      = IM_COL32(0x8c,0x3a,0x3c,0xFF);  // combobox / separator border
+    static const ImU32 GRAB        = IM_COL32(0x88,0x39,0x3c,0xFF);  // slider handle
+    static const ImU32 TRACK       = IM_COL32(0x28,0x27,0x29,0xFF);  // slider track / label bg
+    static const ImU32 BAR         = IM_COL32(0x6b,0x2d,0x2f,0xFF);  // slider filled bar
+    static const ImU32 LIST        = IM_COL32(0x49,0x1b,0x1d,0xFF);  // combobox dropdown list
+    static const ImU32 LIST_HOT    = IM_COL32(0x6b,0x09,0x0c,0xFF);  // combobox item hover
+    static const ImU32 TEXT        = IM_COL32(0xe6,0xe6,0xe6,0xFF);  // body text
+    static const ImU32 TEXT_DIM    = IM_COL32(0xac,0x5b,0x5d,0xFF);  // combobox idle text
+    // panel gradient (styles.css .panel, 90deg): red edge -> grey -> near-black
+    static const ImU32 PANEL_EDGE  = IM_COL32(0xff,0x12,0x12,0xF2);
+    static const ImU32 PANEL_GREY  = IM_COL32(0x32,0x32,0x32,0xE6);
+    static const ImU32 PANEL_DARK  = IM_COL32(0x14,0x14,0x14,0xE6);
+    // group box (ui-tab .tab-content, 180deg #68292b -> #302e31): maroon top fading to dark
+    static const ImU32 BOX_TOP     = IM_COL32(0x68,0x29,0x2b,0xFF);
+    static const ImU32 BOX_BODY    = IM_COL32(0x30,0x2e,0x31,0xFF);
+    static const ImU32 BOX_BORDER  = IM_COL32(0xd6,0x00,0x04,0xFF);
+    // tab-active button (180deg #ff0e11 -100% -> #683031 100%)
+    static const ImU32 TAB_ACT_TOP = IM_COL32(0xff,0x0e,0x11,0xFF);
+    static const ImU32 TAB_ACT_BOT = IM_COL32(0x68,0x30,0x31,0xFF);
+}
+
+// legacy accent shim: everything that used ACC() now paints the Pavlov red.
 struct Accent { const char* name; ImU32 base; };
-static const Accent ACCENTS[] = {
-    { "pink",   IM_COL32(0xFF,0x4D,0x9A,0xFF) },
-    { "cyan",   IM_COL32(0x2C,0xE0,0xD8,0xFF) },
-    { "violet", IM_COL32(0x9B,0x6C,0xF5,0xFF) },
-    { "lime",   IM_COL32(0x8B,0xE0,0x4A,0xFF) },
-    { "amber",  IM_COL32(0xFF,0xB2,0x3A,0xFF) },
-    { "red",    IM_COL32(0xFF,0x4B,0x4B,0xFF) },
-};
-static const int N_ACCENT = 6;
-static int  accent_idx() { int i = g_mei.ui_accent % N_ACCENT; return i < 0 ? i + N_ACCENT : i; }
-static ImU32 ACC() { return ACCENTS[accent_idx()].base; }
+static const Accent ACCENTS[] = { { "pavlov", Pav::RED } };
+static const int N_ACCENT = 1;
+static int  accent_idx() { return 0; }
+static ImU32 ACC() { return Pav::RED; }
 static ImVec4 v4(ImU32 c){ return ImVec4(((c>>IM_COL32_R_SHIFT)&0xFF)/255.f,((c>>IM_COL32_G_SHIFT)&0xFF)/255.f,((c>>IM_COL32_B_SHIFT)&0xFF)/255.f,((c>>IM_COL32_A_SHIFT)&0xFF)/255.f); }
 static ImVec4 v4a(ImU32 c, float a){ ImVec4 x=v4(c); x.w=a; return x; }
+
+// vertical 3-stop gradient fill (top -> mid -> bottom), matching CSS linear-gradient(0deg,...).
+static void grad3_v(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 top, ImU32 mid, ImU32 bot) {
+    float my = (a.y + b.y) * 0.5f;
+    dl->AddRectFilledMultiColor(a, ImVec2(b.x, my), top, top, mid, mid);
+    dl->AddRectFilledMultiColor(ImVec2(a.x, my), b, mid, mid, bot, bot);
+}
+
+// Pavlov ui-button: flat #29191a idle, hover/active = vertical red gradient, hard red border, centered
+// label. Drawn manually over an InvisibleButton so the gradient sits UNDER the text (ImGui::Button would
+// paint its own fill over ours). Same call shape as PavButton(label,size). `highlight` = .btn-highlight.
+// play the submenu-select blip the instant a new control becomes hovered (Pavlov's hover SFX).
+static ImGuiID g_hoverId = 0;
+static void hover_sfx(){ if(ImGui::IsItemHovered()){ ImGuiID id=ImGui::GetItemID(); if(id!=g_hoverId){ g_hoverId=id; mei_audio_play(MSND_HOVER);} } }
+
+static const char* pav_lbl_end(const char* s){ const char* e=s; while(*e && !(e[0]=='#'&&e[1]=='#')) e++; return e; }
+static bool PavButton(const char* label, ImVec2 size=ImVec2(0,0), bool highlight=false) {
+    if (size.x <= 0.f) { ImVec2 ts = ImGui::CalcTextSize(label, pav_lbl_end(label)); size.x = ts.x + 24.f; }
+    if (size.y <= 0.f) size.y = ImGui::GetFrameHeight();
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::PushID(label);
+    bool clicked = ImGui::InvisibleButton("##pb", size);
+    ImGui::PopID();
+    bool hov = ImGui::IsItemHovered(), act = ImGui::IsItemActive();
+    ImVec2 p1 = ImVec2(p0.x + size.x, p0.y + size.y);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 border, txt;
+    if (act || hov)     { grad3_v(dl, p0, p1, Pav::HOT_TOP, Pav::HOT_MID, Pav::HOT_TOP); border = Pav::HOT_BORDER; txt = IM_COL32_WHITE; }
+    else if (highlight) { grad3_v(dl, p0, p1, Pav::HL_TOP,  Pav::HL_MID,  Pav::HL_BOT);  border = Pav::HOT_BORDER; txt = IM_COL32(0xff,0xcb,0xcb,0xFF); }
+    else                { dl->AddRectFilled(p0, p1, Pav::BTN_BG);                         border = Pav::BTN_BORDER; txt = Pav::BTN_TEXT; }
+    dl->AddRect(p0, p1, border, 0.f, 0, 2.f);
+    const char* end = pav_lbl_end(label);   // hide "##id"
+    ImVec2 ts = ImGui::CalcTextSize(label, end);
+    dl->AddText(ImVec2(p0.x + (size.x - ts.x) * 0.5f, p0.y + (size.y - ts.y) * 0.5f), txt, label, end);
+    hover_sfx();
+    if (clicked) mei_audio_play(MSND_SELECT);
+    return clicked;
+}
+
+// Pavlov ui-tab button: selected = persistent tab gradient (#ff0e11 -> #683031) + white text + red border;
+// idle = flat maroon, dim text. Left-aligned label to suit the vertical rail.
+static bool PavTab(const char* label, bool selected, ImVec2 size) {
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImGui::PushID(label);
+    bool clicked = ImGui::InvisibleButton("##pt", size);
+    ImGui::PopID();
+    bool hov = ImGui::IsItemHovered();
+    ImVec2 p1 = ImVec2(p0.x + size.x, p0.y + size.y);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 txt;
+    if (selected)   { grad3_v(dl, p0, p1, Pav::TAB_ACT_TOP, Pav::HOT_MID, Pav::TAB_ACT_BOT);
+                      dl->AddRect(p0, p1, Pav::HOT_BORDER, 0.f, 0, 2.f); txt = IM_COL32_WHITE; }
+    else if (hov)   { dl->AddRectFilled(p0, p1, Pav::HOT_MID); txt = IM_COL32_WHITE; }
+    else            { dl->AddRectFilled(p0, p1, Pav::BTN_BG);  txt = Pav::BTN_TEXT; }
+    ImVec2 ts = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(p0.x + 14.f, p0.y + (size.y - ts.y) * 0.5f), txt, label);
+    hover_sfx();
+    if (clicked) mei_audio_play(MSND_HOVER);
+    return clicked;
+}
 
 void mei_style() {
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 0.f; s.WindowBorderSize = 0.f; s.WindowPadding = ImVec2(0,0);
-    s.ChildRounding = 4.f; s.FrameRounding = 3.f; s.GrabRounding = 3.f; s.PopupRounding = 3.f;
-    s.ScrollbarRounding = 3.f; s.TabRounding = 3.f; s.ScrollbarSize = 14.f;
+    s.ChildRounding = 0.f; s.FrameRounding = 0.f; s.GrabRounding = 0.f; s.PopupRounding = 0.f;   // Pavlov = hard edges
+    s.ScrollbarRounding = 0.f; s.TabRounding = 0.f; s.ScrollbarSize = 14.f;
     s.FramePadding = ImVec2(9,6); s.ItemSpacing = ImVec2(9,7); s.ItemInnerSpacing = ImVec2(7,5);
-    s.WindowBorderSize = 0.f; s.ChildBorderSize = 1.f; s.FrameBorderSize = 0.f; s.GrabMinSize = 16.f;
+    s.WindowBorderSize = 0.f; s.ChildBorderSize = 1.f; s.FrameBorderSize = 1.f; s.GrabMinSize = 14.f;
     ImVec4* c = s.Colors;
-    ImVec4 acc = v4(ACC());
-    c[ImGuiCol_WindowBg]        = v4(IM_COL32(0x12,0x12,0x16,0xFF));
-    c[ImGuiCol_ChildBg]         = v4(IM_COL32(0x18,0x18,0x1E,0xFF));
-    c[ImGuiCol_PopupBg]         = v4(IM_COL32(0x1A,0x1A,0x20,0xFF));
-    c[ImGuiCol_Border]          = v4(IM_COL32(0x2A,0x2A,0x33,0xFF));
-    c[ImGuiCol_Text]            = v4(IM_COL32(0xE6,0xE6,0xEC,0xFF));
-    c[ImGuiCol_TextDisabled]    = v4(IM_COL32(0x6E,0x6E,0x7C,0xFF));
-    c[ImGuiCol_FrameBg]         = v4(IM_COL32(0x22,0x22,0x2B,0xFF));
-    c[ImGuiCol_FrameBgHovered]  = v4(IM_COL32(0x2C,0x2C,0x38,0xFF));
-    c[ImGuiCol_FrameBgActive]   = v4(IM_COL32(0x34,0x34,0x42,0xFF));
-    c[ImGuiCol_Button]          = v4(IM_COL32(0x26,0x26,0x30,0xFF));
-    c[ImGuiCol_ButtonHovered]   = v4(IM_COL32(0x30,0x30,0x3E,0xFF));
-    c[ImGuiCol_ButtonActive]    = acc;
-    c[ImGuiCol_CheckMark]       = acc;
-    c[ImGuiCol_SliderGrab]      = acc;
-    c[ImGuiCol_SliderGrabActive]= v4(IM_COL32(255,255,255,255));
-    c[ImGuiCol_Header]          = v4a(ACC(),0.32f);
-    c[ImGuiCol_HeaderHovered]   = v4a(ACC(),0.45f);
-    c[ImGuiCol_HeaderActive]    = v4a(ACC(),0.60f);
-    c[ImGuiCol_Separator]       = v4(IM_COL32(0x2A,0x2A,0x33,0xFF));
-    c[ImGuiCol_ScrollbarBg]     = v4(IM_COL32(0x12,0x12,0x16,0xFF));
-    c[ImGuiCol_ScrollbarGrab]   = v4(IM_COL32(0x2C,0x2C,0x38,0xFF));
-    c[ImGuiCol_ScrollbarGrabHovered] = acc;
+    c[ImGuiCol_WindowBg]        = v4(Pav::PANEL_DARK);
+    c[ImGuiCol_ChildBg]         = v4(Pav::BOX_BODY);
+    c[ImGuiCol_PopupBg]         = v4(Pav::LIST);
+    c[ImGuiCol_Border]          = v4(Pav::MAROON);
+    c[ImGuiCol_Text]            = v4(Pav::TEXT);
+    c[ImGuiCol_TextDisabled]    = v4(IM_COL32(0x7a,0x4a,0x4c,0xFF));
+    c[ImGuiCol_FrameBg]         = v4(IM_COL32(0x1c,0x12,0x13,0xFF));   // rgba(0,0,0,.35) over maroon
+    c[ImGuiCol_FrameBgHovered]  = v4(IM_COL32(0x2a,0x18,0x19,0xFF));
+    c[ImGuiCol_FrameBgActive]   = v4(IM_COL32(0x35,0x1c,0x1d,0xFF));
+    c[ImGuiCol_Button]          = v4(Pav::BTN_BG);                     // flat idle; gradient drawn by PavButton
+    c[ImGuiCol_ButtonHovered]   = v4(Pav::HOT_MID);
+    c[ImGuiCol_ButtonActive]    = v4(Pav::HOT_TOP);
+    c[ImGuiCol_CheckMark]       = v4(Pav::RED);
+    c[ImGuiCol_SliderGrab]      = v4(Pav::GRAB);
+    c[ImGuiCol_SliderGrabActive]= v4(Pav::RED);
+    c[ImGuiCol_Header]          = v4a(Pav::LIST_HOT,0.55f);
+    c[ImGuiCol_HeaderHovered]   = v4(Pav::LIST_HOT);
+    c[ImGuiCol_HeaderActive]    = v4(Pav::HOT_MID);
+    c[ImGuiCol_Separator]       = v4(Pav::MAROON);
+    c[ImGuiCol_SeparatorHovered]= v4(Pav::RED);
+    c[ImGuiCol_ScrollbarBg]     = v4(Pav::TRACK);
+    c[ImGuiCol_ScrollbarGrab]   = v4(Pav::GRAB);
+    c[ImGuiCol_ScrollbarGrabHovered] = v4(Pav::RED);
     ImGui::GetIO().FontGlobalScale = 1.25f;   // VR readability
 }
 
@@ -65,7 +155,7 @@ static long now_ms(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); retu
 static void touched(){ g_dirty=true; g_last_ms=now_ms(); }
 
 // ---- widgets -----------------------------------------------------------------
-static bool Chk(const char* l, bool* v){ if(ImGui::Checkbox(l,v)){touched();return true;} return false; }
+static bool Chk(const char* l, bool* v){ bool r=ImGui::Checkbox(l,v); hover_sfx(); if(r){ mei_audio_play(*v?MSND_SELECT:MSND_DESELECT); touched(); } return r; }
 static bool Sl(const char* l, float* v, float lo, float hi, const char* fmt){
     ImGui::PushItemWidth(-1.f);
     ImGui::TextUnformatted(l);
@@ -90,17 +180,17 @@ static void keyboard(char* buf,int cap){
         for(const char* p=rows[r]; *p; p++){
             char ch=*p; if(!g_shift && ch>='A'&&ch<='Z') ch+=32;
             char lab[2]={ch,0};
-            if(ImGui::Button(lab, ImVec2(52,46))) kb_append(buf,cap,ch);
+            if(PavButton(lab, ImVec2(52,46))) kb_append(buf,cap,ch);
             ImGui::SameLine();
         }
         if(r==2) ImGui::Unindent(26.f); if(r==3) ImGui::Unindent(52.f);
         ImGui::NewLine();
     }
-    if(ImGui::Button(g_shift?"SHIFT":"shift",ImVec2(82,46))) g_shift=!g_shift; ImGui::SameLine();
-    if(ImGui::Button("space",ImVec2(220,46))) kb_append(buf,cap,' '); ImGui::SameLine();
-    if(ImGui::Button("back",ImVec2(82,46))){ int n=(int)strlen(buf); if(n>0){buf[n-1]=0;touched();} } ImGui::SameLine();
-    if(ImGui::Button("clear",ImVec2(82,46))){ buf[0]=0; touched(); } ImGui::SameLine();
-    if(ImGui::Button("done",ImVec2(82,46))) g_kb=false;
+    if(PavButton(g_shift?"SHIFT":"shift",ImVec2(82,46))) g_shift=!g_shift; ImGui::SameLine();
+    if(PavButton("space",ImVec2(220,46))) kb_append(buf,cap,' '); ImGui::SameLine();
+    if(PavButton("back",ImVec2(82,46))){ int n=(int)strlen(buf); if(n>0){buf[n-1]=0;touched();} } ImGui::SameLine();
+    if(PavButton("clear",ImVec2(82,46))){ buf[0]=0; touched(); } ImGui::SameLine();
+    if(PavButton("done",ImVec2(82,46))) g_kb=false;
 }
 
 // ---- tabs --------------------------------------------------------------------
@@ -171,6 +261,38 @@ static void tab_weapon(){
     Sl("Aura rate",&g_mei.aura_rate,40.f,500.f,"%.0f ms");
     ImGui::EndDisabled();
     Chk("Wallbang (shoot thru walls)",&g_mei.wallbang);
+    ImGui::Spacing();
+    if(PavButton("KILL ALL",ImVec2(180,48))) g_mei.act_killall=true;
+    ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "one-shot headshot on every enemy");
+    gb_end();
+    gb_begin("TARGET KILL");
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "pick a player, press Kill (weaponless works). grey = too far to kill.");
+    {
+        int n = g_players_n; if (n > MEI_PLAYERS_MAX) n = MEI_PLAYERS_MAX;
+        if (g_mei.kill_sel >= n) g_mei.kill_sel = -1;
+        if (n <= 0) ImGui::TextDisabled("(no players — join a match)");
+        else {
+            ImGui::BeginChild("plist", ImVec2(0, 170), true);
+            for (int i = 0; i < n; i++) {
+                const MeiPlayer& p = g_players[i];
+                char label[72];
+                snprintf(label, sizeof label, "%s   [team %d]%s%s", p.name, p.team,
+                         p.loaded ? "" : "  (far)", p.alive ? "" : "  (dead)");
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    v4(p.loaded ? IM_COL32(0xE2,0xE2,0xEA,0xFF) : IM_COL32(0x6E,0x6E,0x78,0xFF)));
+                if (ImGui::Selectable(label, g_mei.kill_sel == i)) g_mei.kill_sel = i;
+                ImGui::PopStyleColor();
+            }
+            ImGui::EndChild();
+        }
+        bool sel_ok = (g_mei.kill_sel >= 0 && g_mei.kill_sel < n);
+        bool canKill = sel_ok && g_players[g_mei.kill_sel].loaded && g_players[g_mei.kill_sel].alive;
+        ImGui::BeginDisabled(!canKill);
+        if (PavButton("KILL SELECTED", ImVec2(200,46))) g_mei.act_kill_sel = true;
+        ImGui::EndDisabled();
+        if (sel_ok && !g_players[g_mei.kill_sel].loaded) {
+            ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0xC8,0x66,0x66,0xFF)), "too far / not loaded"); }
+    }
     gb_end();
 }
 static void tab_movement(){
@@ -190,6 +312,7 @@ static void tab_player(){
     Chk("Godmode",&g_mei.godmode);
     Chk("Dev tag",&g_mei.dev_tag);
     Chk("Vote unlock",&g_mei.force_vote);
+    Chk("Force moderator",&g_mei.force_moderator);
     Chk("Anti flash",&g_mei.anti_flash);
     Chk("Homing knife",&g_mei.homing_knife);
     gb_end();
@@ -246,7 +369,7 @@ static void tab_ttt(){
     if (ImGui::InputText("##buyfilter", filter, sizeof filter)) {}
     if (ImGui::IsItemActivated()) g_kb2 = true;
     ImGui::PopItemWidth(); ImGui::SameLine();
-    if (ImGui::Button("clear##bf", ImVec2(78,0))) filter[0]=0;
+    if (PavButton("clear##bf", ImVec2(78,0))) filter[0]=0;
     char flo[32]; for (int i=0; (flo[i]=(char)tolower((unsigned char)filter[i])); i++) {}
     ImGui::BeginChild("buylist", ImVec2(0, 300), true);
     for (int ci = 0; ci < (int)(sizeof(CATS)/sizeof(CATS[0])); ci++) {
@@ -264,7 +387,7 @@ static void tab_ttt(){
     }
     ImGui::EndChild();
     ImGui::Text("selected: %s", g_mei.buy_name[0] ? g_mei.buy_name : "-"); ImGui::SameLine();
-    if (ImGui::Button("BUY", ImVec2(120,40))) g_mei.act_buy = true;
+    if (PavButton("BUY", ImVec2(120,40))) g_mei.act_buy = true;
     if (g_kb2) { ImGui::Spacing(); keyboard(filter, sizeof filter); }
     gb_end();
 }
@@ -281,26 +404,29 @@ static void tab_config(){
         ImGui::PushStyleColor(ImGuiCol_Button,v4(ACCENTS[i].base));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,v4(ACCENTS[i].base));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive,v4(ACCENTS[i].base));
-        if(ImGui::Button("  ",ImVec2(34,26))){ g_mei.ui_accent=i; touched(); mei_style(); }
+        if(PavButton("  ",ImVec2(34,26))){ g_mei.ui_accent=i; touched(); mei_style(); }
         ImGui::PopStyleColor(3); ImGui::PopID();
         if(i==accent_idx()){ ImVec2 a=ImGui::GetItemRectMin(),b=ImGui::GetItemRectMax();
             ImGui::GetWindowDrawList()->AddRect(ImVec2(a.x-2,a.y-2),ImVec2(b.x+2,b.y+2),IM_COL32(255,255,255,255),3.f,0,2.f); }
         if(i<N_ACCENT-1) ImGui::SameLine();
     }
     ImGui::Spacing();
-    if(g_mei.reposition) ImGui::PushStyleColor(ImGuiCol_Button, v4(ACC()));
-    if(ImGui::Button(g_mei.reposition?"Exit move mode":"Move panel",ImVec2(150,36))){ g_mei.reposition=!g_mei.reposition; touched(); }
-    if(g_mei.reposition) ImGui::PopStyleColor();
+    bool rep2 = g_mei.reposition;   // capture ONCE — the button toggles g_mei.reposition, so reading it
+    if(rep2) ImGui::PushStyleColor(ImGuiCol_Button, v4(ACC()));   // live for the Pop would unbalance the stack -> SIGABRT
+    if(PavButton(rep2?"Exit move mode":"Move panel",ImVec2(150,36))){ g_mei.reposition=!g_mei.reposition; touched(); }
+    if(rep2) ImGui::PopStyleColor();
     ImGui::SameLine();
-    if(ImGui::Button("Reset position",ImVec2(160,36))){ g_mei.reposition=false; g_mei.act_replace=true; touched(); }
+    if(PavButton("Reset position",ImVec2(160,36))){ g_mei.reposition=false; g_mei.act_replace=true; touched(); }
     ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "Move: point OFF the panel, hold trigger, drag. Release to drop.");
     gb_end();
     gb_begin("TOOLS");
-    if(ImGui::Button("Refresh mods",ImVec2(180,44))) g_mei.act_refresh=true;   // re-resolve guns/chams/movement
+    if(PavButton("Refresh mods",ImVec2(180,44))) g_mei.act_refresh=true;   // re-resolve guns/chams/movement
     ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "re-hooks guns, chams & movement if they stop");
-    if(ImGui::Button("Dump SDK",ImVec2(150,40))) g_mei.act_dump_sdk=true; ImGui::SameLine();
-    if(ImGui::Button("Dump whitelist",ImVec2(190,40))) g_mei.act_dump_whitelist=true; ImGui::SameLine();
-    if(ImGui::Button("Save",ImVec2(120,40))){ g_mei.act_save=true; g_dirty=false; }
+    if(PavButton("Fix pawn",ImVec2(180,44))) g_mei.act_fixpawn=true;        // re-resolve gun/movement only (post-death)
+    ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "press after you die if gun/speed stop — keeps chams");
+    if(PavButton("Dump SDK",ImVec2(150,40))) g_mei.act_dump_sdk=true; ImGui::SameLine();
+    if(PavButton("Dump whitelist",ImVec2(190,40))) g_mei.act_dump_whitelist=true; ImGui::SameLine();
+    if(PavButton("Save",ImVec2(120,40))){ g_mei.act_save=true; g_dirty=false; }
     gb_end();
 }
 
@@ -319,20 +445,24 @@ void mei_menu_frame(int panel_w, int panel_h){
     ImGui::Begin("mei",nullptr,fl);
     ImGuiIO& io = ImGui::GetIO();
 
-    // header
+    // panel background (styles.css .panel): 90deg grey->near-black + red left border 0.5vh + header bar
     ImDrawList* dl = ImGui::GetWindowDrawList(); ImVec2 wp = ImGui::GetWindowPos();
     const float HEAD=44.f;
-    dl->AddRectFilled(wp, ImVec2(wp.x+W, wp.y+HEAD), IM_COL32(0x16,0x16,0x1C,0xFF));
-    dl->AddRectFilled(ImVec2(wp.x, wp.y+HEAD-2), ImVec2(wp.x+W, wp.y+HEAD), ACC());
+    dl->AddRectFilledMultiColor(wp, ImVec2(wp.x+W, wp.y+H),
+                                Pav::PANEL_GREY, Pav::PANEL_DARK, Pav::PANEL_DARK, Pav::PANEL_GREY);
+    dl->AddRectFilled(wp, ImVec2(wp.x+6, wp.y+H), Pav::EDGE);                 // red left border
+    dl->AddRectFilled(ImVec2(wp.x-4, wp.y+HEAD+18), ImVec2(wp.x+6, wp.y+HEAD+26), Pav::EDGE);  // .needle accent
+    dl->AddRectFilled(wp, ImVec2(wp.x+W, wp.y+HEAD), IM_COL32(0x1a,0x14,0x15,0xFF));   // header bar
+    dl->AddRectFilled(ImVec2(wp.x, wp.y+HEAD-2), ImVec2(wp.x+W, wp.y+HEAD), Pav::EDGE); // red underline
     ImGui::SetCursorPos(ImVec2(16, 11));
     ImGui::TextColored(v4(ACC()), "2016"); ImGui::SameLine(0,8);
-    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "client");
+    ImGui::TextColored(v4(IM_COL32(0xd6,0xd6,0xd6,0xFF)), "client");
     ImGui::SameLine(0, 20); ImGui::SetCursorPosY(8);
     {
         bool rep = g_mei.reposition;
         if (rep) { ImGui::PushStyleColor(ImGuiCol_Button, v4(ACC()));
                    ImGui::PushStyleColor(ImGuiCol_Text, v4(IM_COL32(0x12,0x12,0x16,0xFF))); }
-        if (ImGui::Button(rep ? "moving: point off-panel + hold trigger" : "move panel", ImVec2(0,28))) {
+        if (PavButton(rep ? "moving: point off-panel + hold trigger" : "move panel", ImVec2(0,28))) {
             g_mei.reposition = !g_mei.reposition; touched(); }
         if (rep) ImGui::PopStyleColor(2);
     }
@@ -340,22 +470,23 @@ void mei_menu_frame(int panel_w, int panel_h){
       ImVec2 z=ImGui::CalcTextSize(r); ImGui::SetCursorPos(ImVec2(W-z.x-16,13));
       ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)),"%s",r); }
 
-    // body: rail + content
+    // body: rail + content (transparent children so the panel gradient shows through)
     ImGui::SetCursorPos(ImVec2(0, HEAD));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, v4(IM_COL32(0x14,0x14,0x1A,0xFF)));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0,0,0,0));
     ImGui::BeginChild("rail", ImVec2(168, H-HEAD), false);
     ImGui::Dummy(ImVec2(0,6));
     for(int i=0;i<N_TABS;i++){
         ImGui::SetCursorPosX(8);
-        if(ImGui::Selectable(TABS[i], g_tab==i, 0, ImVec2(152,34))) g_tab=i;
+        if(PavTab(TABS[i], g_tab==i, ImVec2(152,36))) g_tab=i;
+        ImGui::Dummy(ImVec2(0,2));
     }
     ImGui::SetCursorPos(ImVec2(12, H-HEAD-30));
-    ImGui::TextColored(v4(IM_COL32(0x55,0x55,0x63,0xFF)), "v4080");
+    ImGui::TextColored(v4(IM_COL32(0x8c,0x3a,0x3c,0xFF)), "v4080");
     ImGui::EndChild();
     ImGui::PopStyleColor();
 
     ImGui::SameLine(0,0);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, v4(IM_COL32(0x12,0x12,0x16,0xFF)));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0,0,0,0));
     ImGui::BeginChild("content", ImVec2(W-168, H-HEAD), false);
     ImGui::Indent(14.f); ImGui::PushItemWidth(-14.f); ImGui::Dummy(ImVec2(0,4));
     switch(g_tab){

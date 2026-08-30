@@ -32,6 +32,7 @@
 #include "mei_settings.h"
 #include "mei_xr.h"
 #include "mei_esp.h"
+#include "mei_audio.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -342,7 +343,13 @@ static bool ensure_init() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;   // stick can also drive
     io.MouseDrawCursor = true;                // draw a SOFTWARE cursor (no OS cursor exists in VR)
     io.ConfigInputTrickleEventQueue = false;  // apply same-frame cursor move + click together (no split)
-    io.Fonts->AddFontDefault();
+    // Pavlov's own UI font (Prime). Pushed to files/ at deploy; fall back to the built-in if absent.
+    { const char* fp = "/sdcard/Android/data/com.vankrupt.pavlov/files/Prime-Regular.ttf";
+      FILE* tf = fopen(fp, "rb");
+      if (tf) { fclose(tf);
+          ImFont* pf = io.Fonts->AddFontFromFileTTF(fp, 22.0f);
+          if (pf) XLOG("mei font: loaded Prime-Regular.ttf"); else { io.Fonts->AddFontDefault(); XLOG("mei font: Prime load FAILED -> default"); }
+      } else { io.Fonts->AddFontDefault(); XLOG("mei font: no Prime ttf -> default"); } }
     mei_style();
 
     // We link libvulkan directly, so imgui_impl_vulkan uses its own prototypes (no loader shim).
@@ -355,6 +362,7 @@ static bool ensure_init() {
     if (!ImGui_ImplVulkan_Init(&ii)) { XLOG("ImGui_ImplVulkan_Init failed"); g_failed = true; return false; }
     ImGui_ImplVulkan_CreateFontsTexture();
 
+    mei_audio_init();   // OpenSL ES UI sounds (silently no-ops if unavailable)
     g_inited = true;
     XLOG("mei backend up: panel %dx%d (%.2fx%.2f m)", g_panel_w, g_panel_h, g_panel_wm, g_panel_hm);
     return true;
@@ -812,6 +820,12 @@ static XrResult XRAPI_PTR hk_xrEndFrame(XrSession session, const XrFrameEndInfo*
         espQuad.size = { wm, hm };
         scratch[nc + extra++] = (const XrCompositionLayerBaseHeader*)&espQuad;
     }
+
+    // Menu open/close SFX — detected here (runs every frame, unlike render_frame which only runs while open).
+    { static bool s_sfx_open = false;
+      if (g_mei.menu_open && !s_sfx_open) mei_audio_play(MSND_OPEN);
+      else if (!g_mei.menu_open && s_sfx_open) mei_audio_play(MSND_CLOSE);
+      s_sfx_open = g_mei.menu_open; }
 
     // Menu quad (world-locked, ON TOP).
     XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};

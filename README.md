@@ -3,7 +3,9 @@
 An internal UE5.1 mod library for the **Pavlov "Steam Frame"** build (`com.vankrupt.pavlov`,
 arm64 Android / Quest). It self-resolves the engine at runtime on a fully-stripped
 `libUnreal.so` (no symbols) and drives the game through UObject reflection — chams,
-aim assist, gun/movement tweaks, a runtime SDK dumper, and a client-side name changer.
+aim assist, ESP, hit-reg kills (trigger-kill / kill-all / pick-a-player), gun/movement tweaks,
+a TTT buy menu, a runtime SDK dumper, and a client-side name changer — all from an in-VR menu
+**reskinned 1:1 to Pavlov's own cohtml UI** (real colors, gradients, Prime font, and UI sounds).
 
 > **Scope / disclaimer.** This is a reverse-engineering + game-hacking learning project for
 > **your own headset and offline/private testing**. Multiplayer cheating ruins games for real
@@ -20,11 +22,17 @@ the game thread from a hooked `ProcessEvent`.
 
 | Feature | Notes | Online? |
 |---|---|---|
-| **Chams / wallhack** | Force-loads the game's own `M_PlayerXRay` material and applies it to enemy body meshes (team-colored, aim-target highlighted). Skips dead pawns. | ✅ (client-side render) |
-| **Silent aim** | Snaps the gun toward the nearest enemy head. Runs late-frame (`ReceiveDrawHUD`) so the rotation survives to replicate — that's what makes it land online. FFA vs team auto-detected from `GameModeType`. | ✅ |
-| **No-recoil + perfect accuracy** | Zeroes recoil/spread floats on the held gun. | ✅ |
+| **Chams / wallhack** | Force-loads the game's own `M_PlayerXRay` material and applies it to enemy body meshes. **Styles:** Team, Single-A/B, Flash (pulse), Target-only, and **Custom** (pick per-team RGB via a dynamic material instance). Aim-target highlighted, skips corpses. | ✅ (client-side render) |
+| **ESP overlay** | 2D box / name / distance / health bar / TTT role over each enemy, center crosshair, aimbot FOV circle. Projected with the game's own camera. | ✅ |
+| **Silent aim** | Snaps the gun toward the enemy head. Runs late-frame (`ReceiveDrawHUD`) so the rotation survives to replicate — that's what makes it land online. FFA vs team auto-detected; **Team-check off = target everyone** (great for custom modes). | ✅ |
+| **Trigger-kill** | On each real shot, reports a headshot on your aim target via `ServerReportBulletHit` (client-authoritative hit-reg). Lands **weaponless too** — the report just needs a gun *class*, which it supplies. | ✅ |
+| **Kill All** | Press → arms 8 s → pull the trigger → headshots **every loaded enemy** on that bullet. Throttled + de-duped so it doesn't crash the netcode. | ✅ (loaded enemies) |
+| **Target kill** | Live player list by name — pick one, **KILL SELECTED**. Re-resolves the target fresh by name each press (crash-safe). White = loaded/killable, grey = too far. | ✅ (loaded enemies) |
+| **No-recoil + perfect accuracy** | Zeroes recoil/spread floats on the held gun. Self-re-resolves after death/respawn. | ✅ |
 | **Rapid / auto fire** | Shrinks the fire-rate config; forces `FireMode` to Automatic. | offline; server may cap |
-| **Movement speed** | Boosts `MaxWalkSpeed` / sprint / ADS on `PavlovMovementComponent` (all directions). | client-predicted |
+| **Movement** | Boosts `MaxWalkSpeed` / sprint / ADS / **crouch** on `PavlovMovementComponent`; optional **noclip** (fly + collision off). Baseline held across respawns; re-resolves on server change. | client-predicted (noclip offline) |
+| **Anti-flash** | Zeroes the flashbang blind curve on `GlobalPlayerEffects`. | ✅ (client render) |
+| **TTT buy menu** | `ServerBuy(FName)` with a **categorized + searchable** weapon list (exact Pavlov equipment IDs). | ✅ where buying is enabled |
 | **Godmode** | Zeroes `DamageMultiplier`, pins `Health`. | offline only (server-auth) |
 | **Homing knife** | Steers a thrown knife's physics velocity toward the nearest enemy. | offline; server may reject |
 | **Name changer** | Writes `PlayerNamePrivate` in-place (client-side). Unlocks name-gated custom-map perks/VIP. Short names only (buffer-limited). | client-side checks only |
@@ -32,21 +40,67 @@ the game thread from a hooked `ProcessEvent`.
 
 ---
 
-## mei mei [private] — in-headset menu
+## 2016 client — in-headset menu
 
-Primary control is now an in-VR **Dear ImGui** panel, **mei mei [private]**, rendered as an OpenXR
-quad layer and driven by your controller. No more adb for day-to-day toggling.
+Primary control is an in-VR **Dear ImGui** panel (**"2016 client"**), rendered as an OpenXR quad
+layer and driven by your controller. No adb needed for day-to-day toggling. The panel is skinned
+**1:1 to Pavlov's real menu** — the exact button colors and red gradients, the **Prime** font, and
+the game's own UI **sounds** on hover/click/open (pulled straight from `Content/UIResources` +
+`Content/Sound/.../MainMenu`).
 
 - **Open/close:** press in the **left thumbstick (L3)**.
 - **Cursor:** aim the controller at the panel. **Click:** the **right trigger**.
   *(If bindings need tuning on first boot, it auto-falls-back to up-point-to-open + dwell-to-click.)*
-- **Tabs:** Aimbot · Visuals · Weapon · Movement · Player · Config — every feature has its own toggle
-  and sliders (aim FOV/mode, movement multipliers, chams colors, name changer, etc.).
-- Settings persist to `.../files/mei.cfg`. Master enable is on by default so the mod arms itself.
+- **Tabs:** Aimbot · Visuals · Weapon · Movement · Player · TTT · Config — every feature has its own
+  toggle and sliders (aim FOV/mode, cham style + custom colors, movement multipliers, ESP, buy list…).
+- **Move the panel:** Config → *Move panel*, then point off the panel and hold the trigger to drag it.
+- **Settings persist** to `.../files/mei.cfg`. Master enable is on by default so the mod arms itself.
+
+### How to kill people (for your friends)
+
+Hit-reg in Pavlov is **client-authoritative** (`ServerReportBulletHit`), so kills land **even with no
+weapon in hand** — the report supplies its own gun class (shows as a Hunting Rifle in the feed).
+
+- **One specific player:** Weapon tab → **TARGET KILL** → tap a **white** name → **KILL SELECTED**.
+  (White = loaded/killable, grey = too far/not rendered. Only loaded players are safe to report on.)
+- **Whoever you point at:** turn on **Trigger kill**, aim, and pull the trigger.
+- **Everyone at once:** hold a gun → press **KILL ALL** → spray for ~8 s. Hits every *loaded* enemy.
+- **Don't leave *Kill aura* on** — it auto-reports every enemy nonstop and is the fastest way to get
+  server-banned. Use the one-shot options above instead.
+
+> ⚠️ You can only kill **loaded/rendered** enemies (their name is white). Someone across the map your
+> client hasn't streamed in can't be reported on — trying to crashes the game's netcode, so those are
+> intentionally skipped.
+
+### If something stops working after you die / change servers
+
+- **Fix pawn** (Config → Tools) re-resolves your gun + movement for the new pawn — press it once if
+  no-recoil/speed drop out after a death. **Refresh mods** does a full re-resolve (chams included).
+- Movement + weapon mods also self-recover on respawn and on server change; the buttons are the manual
+  fallback if a bad spawn slips through.
 
 Architecture + first-pixel bring-up: **[docs/MEI-MENU.md](docs/MEI-MENU.md)** and
 **[docs/ON-DEVICE.md](docs/ON-DEVICE.md)**. The old `chams.txt` integer still works as a fallback
 (and `8`/`9` still force the one-shot dumps from adb).
+
+### UI assets (font + sounds) — one-time device push
+The Pavlov skin needs two things on the headset (extract them from your own FModel dump of
+`Pavlov/Content`):
+
+```sh
+D=/sdcard/Android/data/com.vankrupt.pavlov/files
+# Prime font
+adb push Prime-Regular.ttf                          $D/Prime-Regular.ttf
+# UI sounds (rename to ui_*.wav exactly as below)
+adb push PVR_SFX_UI_MainMenu_Select.wav             $D/ui_Select.wav
+adb push PVR_SFX_UI_MainMenu_Submenu_Select.wav     $D/ui_Submenu_Select.wav
+adb push PVR_SFX_UI_MainMenu_Submenu_Deselect.wav   $D/ui_Submenu_Deselect.wav
+adb push PVR_SFX_UI_MainMenu_Window_SlideOpen.wav   $D/ui_Window_SlideOpen.wav
+adb push PVR_SFX_UI_MainMenu_Window_SlideClose.wav  $D/ui_Window_SlideClose.wav
+```
+
+Both are optional — if a file is missing the menu falls back to the default font / stays silent, no
+crash. (Font is Prime-Regular.ttf; the sounds live under `Content/Sound/NEWAudio/UI/MainMenu`.)
 
 ## Config (legacy fallback)
 
@@ -162,9 +216,13 @@ comments. The **key online-aim insight**: rotation must be written *late in the 
 
 Pavlov is server-authoritative for gun/health state. **Client-side visual/simulation** (chams,
 movement prediction, aim rotation that replicates) works online; **state the server owns**
-(health, ammo counts, hit registration, real player name, admin status) is validated server-side
-and cannot be forced from the client. Documented limits:
+(health, ammo counts, real player name, admin status) is validated server-side and cannot be forced
+from the client. Documented limits:
 
+- **Hit registration is the exception** — `ServerReportBulletHit` is *client-authoritative*, so
+  trigger-kill / kill-all / target-kill land online (even weaponless). BUT the server only accepts a
+  report for a **rendered/loaded** pawn — reporting an un-streamed far player crashes the netcode on a
+  deferred tick (uncatchable), so those are skipped. Reports are throttled + de-duped for stability.
 - **Godmode / infinite ammo** — server tracks real values → offline only.
 - **Real name change** (`ServerChangeName`) — server forces the account name back (anonymous
   Device-ID auth = name `"null"`). Only the **client-side** in-place write sticks locally.
@@ -224,8 +282,9 @@ patchelf on `libUnreal`. The EOS shim also provides anonymous Device-ID online a
 
 **In the repo (our source):**
 - `pavchams.cpp` — the mod (all features + engine self-resolution).
-- `mei/` — the **mei mei [private]** VR ImGui menu: `mei_settings` (state + `mei.cfg`), `mei_menu`
-  (tabs/UI), `mei_input` (controller-ray cursor), `mei_xr` (OpenXR quad-layer + Vulkan backend).
+- `mei/` — the **"2016 client"** VR ImGui menu, Pavlov-skinned: `mei_settings` (state + `mei.cfg`),
+  `mei_menu` (tabs/UI + Pavlov palette/gradients/`PavButton`), `mei_input` (controller-ray cursor),
+  `mei_xr` (OpenXR quad-layer + Vulkan backend + Prime font load), `mei_audio` (OpenSL ES UI sounds).
 - `eosshim.cpp`, `stub.c`, `minisrc/` — the EOS interposer / loader source.
 - `repack.py` — APK repacker.
 - `build.sh` — one-shot build/sign/install.

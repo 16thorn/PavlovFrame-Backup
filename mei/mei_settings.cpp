@@ -7,6 +7,8 @@
 #define SLOG(...) __android_log_print(ANDROID_LOG_INFO, "MEI-CFG", __VA_ARGS__)
 
 MeiSettings g_mei;
+MeiPlayer   g_players[MEI_PLAYERS_MAX];
+int         g_players_n = 0;
 
 // tiny flat format: one "key value" per line. Robust to partial files / added keys.
 void mei_save() {
@@ -58,6 +60,8 @@ void mei_save() {
     fprintf(f, "godmode %d\n",         s.godmode);
     fprintf(f, "dev_tag %d\n",         s.dev_tag);
     fprintf(f, "force_vote %d\n",      s.force_vote);
+    fprintf(f, "force_moderator %d\n", s.force_moderator);
+    fprintf(f, "buy_always %d\n",      s.buy_always);
     fprintf(f, "homing_knife %d\n",    s.homing_knife);
     fprintf(f, "name_enabled %d\n",    s.name_enabled);
     fprintf(f, "name_text %s\n",       s.name_text[0] ? s.name_text : "-");
@@ -101,7 +105,7 @@ void mei_load() {
         GI("move_enabled", move_enabled) GI("noclip", noclip) GI("anti_flash", anti_flash)
         GF("move_sprint", move_sprint) GF("move_ads", move_ads)
         GF("move_walk", move_walk) GF("move_crouch", move_crouch)
-        GI("godmode", godmode) GI("dev_tag", dev_tag) GI("force_vote", force_vote) GI("homing_knife", homing_knife)
+        GI("godmode", godmode) GI("dev_tag", dev_tag) GI("force_vote", force_vote) GI("force_moderator", force_moderator) GI("buy_always", buy_always) GI("homing_knife", homing_knife)
         GI("name_enabled", name_enabled) GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)
         GI("ui_accent", ui_accent) GI("panel_custom", panel_custom)
         if (!strcmp(key, "panel_off") &&

@@ -13,6 +13,18 @@
 
 #define MEI_CFG_PATH "/sdcard/Android/data/com.vankrupt.pavlov/files/mei.cfg"
 #define MEI_NAME_MAX 32
+#define MEI_PLAYERS_MAX 32
+
+// Live player list for the "kill target" dropdown. pavchams populates g_players each pass (name/team/
+// whether the pawn is loaded = safe to report on); the menu renders it and sets kill_sel + act_kill_sel.
+struct MeiPlayer {
+    char name[MEI_NAME_MAX];
+    int  team;
+    bool loaded;   // head/socket resolves -> rendered -> safe to report a hit on (unloaded = would crash netcode)
+    bool alive;
+};
+extern MeiPlayer g_players[MEI_PLAYERS_MAX];
+extern int       g_players_n;
 
 // aim trigger modes (mirrors the old cfg 3/6 split)
 enum MeiAimMode { AIM_OFF = 0, AIM_ONFIRE = 1, AIM_CONTINUOUS = 2 };
@@ -78,7 +90,9 @@ struct MeiSettings {
     // ---- Player ----
     bool  godmode          = false;   // offline only (server-auth)
     bool  dev_tag          = false;   // self-view dev tag
-    bool  force_vote       = false;   // force bCanVote on our PlayerState (vote button even where disabled)
+    bool  force_vote       = false;   // force bCanVote/bCanCallVote on ContentViewGlobals (vote button)
+    bool  force_moderator  = false;   // force bModerator on ContentViewGlobals (moderator/admin UI)
+    bool  buy_always       = false;   // force bBuyingEnabled on the controller (buy menu / ServerBuy anytime)
     bool  homing_knife     = false;
     bool  name_enabled     = false;
     char  name_text[MEI_NAME_MAX] = {0};   // client-side PlayerNamePrivate (short!)
@@ -107,7 +121,11 @@ struct MeiSettings {
     volatile bool act_save           = false;   // force persist now
     volatile bool act_replace        = false;   // re-anchor the panel in front of the head now (Reset position)
     volatile bool act_refresh        = false;   // re-resolve all mods (guns/chams/movement) if they stop working
+    volatile bool act_fixpawn        = false;   // re-resolve pawn-dependent stuff (gun/movement) — leaves chams alone
     volatile bool act_skin           = false;   // apply player skin (SetPlayerSkin) now
+    volatile bool act_killall        = false;   // one-shot: ServerReportBulletHit headshot on every enemy
+    int           kill_sel           = -1;      // selected index into g_players for targeted kill (-1 = none)
+    volatile bool act_kill_sel       = false;   // one-shot: headshot the selected player now
 };
 
 // the single shared instance (defined in mei_settings.cpp)

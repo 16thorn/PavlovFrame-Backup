@@ -43,6 +43,7 @@ SRCS=(
   mei/mei_settings.cpp
   mei/mei_menu.cpp
   mei/mei_input.cpp
+  mei/mei_audio.cpp
   mei/mei_xr.cpp
   "$IMGUI/imgui.cpp"
   "$IMGUI/imgui_draw.cpp"
@@ -52,7 +53,7 @@ SRCS=(
 )
 
 echo "[1/5] compiling libpavchams.so (mod + mei menu + imgui)"
-"$CLANG" $CXXFLAGS -shared -o libpavchams.so "${SRCS[@]}" -llog -lvulkan -ldl
+"$CLANG" $CXXFLAGS -shared -o libpavchams.so "${SRCS[@]}" -llog -lvulkan -ldl -lOpenSLES
 
 echo "[2/5] repacking APK (repack.py)"
 python repack.py

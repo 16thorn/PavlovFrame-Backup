@@ -705,6 +705,7 @@ static int32_t g_myteam = -1;                       // local player's team
 struct FVec { double x, y, z; };
 struct FRot { double pitch, yaw, roll; };
 static FVec g_aim_targetHead{};                     // head pos of current aim target (for trigger-kill)
+static long g_killAllArmed = 0;                      // Kill All pressed -> next real shot blasts everyone (ms deadline; online needs a live shot)
 static FVec  aim_getloc(void* a) { struct { FVec r; } p{}; if (fn_GetLoc) g_ProcessEvent(a, fn_GetLoc, &p); return p.r; }
 static FRot  aim_getrot(void* a) { struct { FRot r; } p{}; if (fn_GetRot) g_ProcessEvent(a, fn_GetRot, &p); return p.r; }
 static void  aim_setrot(void* a, FRot r) { struct { FRot R; uint8_t tp, ret; } p{ r, 0, 0 }; if (fn_SetRot) g_ProcessEvent(a, fn_SetRot, &p); }
@@ -747,19 +748,36 @@ static void* get_item(void* pawn, void* cls) {
 // ONLINE-ROBUST held gun. GetItemOfClass returns null online on this build, so fall back to the last
 // gun we saw actually FIRE (captured in the handler fire-path — unambiguously the weapon in your hand).
 static void* g_heldGun = nullptr;
+static int g_gunGen = 0;   // bumped by "Refresh mods" / respawn -> do_norecoil + resolve_gun re-resolve
 static void* resolve_gun(void* pawn) {
     void* gun = get_item(pawn, c_Gun);
     if (!gun || !addr_readable((uintptr_t)gun)) gun = get_item(pawn, c_VRGun);
     if (gun && addr_readable((uintptr_t)gun) && in_lib(*(uintptr_t*)gun)) return gun;
-    // fallback: the last-fired gun, re-validated (still a live VRGun in the engine)
+    // fallback 1: the last-fired gun, re-validated (still a live VRGun in the engine)
     if (g_heldGun && addr_readable((uintptr_t)g_heldGun) && in_lib(*(uintptr_t*)g_heldGun)
         && c_VRGun && is_a(g_heldGun, c_VRGun)) return g_heldGun;
+    // fallback 2 (online, post-respawn before firing): scan for a VRGun owned by this pawn. Throttled +
+    // cached so it's cheap; recovers no-recoil/rapid right after death without needing to fire first.
+    { static void* cachePawn = nullptr, *cacheGun = nullptr; static long last = 0; static int myGen = -1;
+      if (myGen != g_gunGen) { myGen = g_gunGen; cachePawn = nullptr; cacheGun = nullptr; last = 0; }  // respawn/refresh
+      if (cachePawn == pawn && cacheGun && addr_readable((uintptr_t)cacheGun) && in_lib(*(uintptr_t*)cacheGun)
+          && c_VRGun && is_a(cacheGun, c_VRGun)) { g_heldGun = cacheGun; return cacheGun; }
+      struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000;
+      if (c_VRGun && ms - last >= 400) { last = ms; cachePawn = pawn; cacheGun = nullptr;
+          int32_t n = objects_num();
+          for (int i = 0; i < n; i++) { void* o = object_at(i);
+              if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o) || !is_a(o, c_VRGun)) continue;
+              char nm[24]; obj_name(o, nm, sizeof nm); if (!strncmp(nm, "Default__", 9)) continue;
+              bool owned = false; void* ow = o;   // walk Outer chain up to the pawn
+              for (int d = 0; d < 8 && ow && addr_readable((uintptr_t)ow); d++) { if (ow == pawn) { owned = true; break; }
+                  ow = *(void**)((uint8_t*)ow + 0x20); }
+              if (owned) { cacheGun = o; g_heldGun = o; return o; } } }
+    }
     return nullptr;
 }
 // zero the four recoil/spread floats on the local held gun (offsets by name, per gun class)
 // magazine ammo offsets (VRMagazine::Bullets/MaxBullets), resolved once from a live mag's class
 static int32_t g_magBul = -1, g_magMax = -1;
-static int g_gunGen = 0;   // bumped by the menu "Refresh mods" action -> do_norecoil re-resolves gun offsets
 // aggressive infinite ammo: cached so the handler can top up mag+chamber every PE (beats server depletion
 // locally so an auto-fire gun never runs dry -> never needs the broken bolt-cock reload).
 static void* g_ammoGun = nullptr; static int32_t g_ammoMagOff = -1, g_ammoBIC = -1;
@@ -977,19 +995,20 @@ static void do_movement(void* pawn) {
         g_mCrouch = prop_offset(mcc, "MaxWalkSpeedCrouched");
         char mcn[48]; obj_name(mcc, mcn, sizeof mcn);
         LOG("move: class '%s' sprint@%d ads@%d walk@%d crouch@%d", mcn, g_mSprint, g_mAds, g_mWalk, g_mCrouch); }
-    if (mc != g_walkComp) {   // capture ORIGINALS once per component (for restore)
+    if (mc != g_walkComp) {   // component changed (respawn/map) — re-point g_walkComp, but KEEP the baseline
         g_walkComp = mc;
-        // Only accept a BASELINE value — on respawn the component may still hold OUR cheat value
-        // (e.g. 2940 = 600*4.9); capturing that as "orig" and multiplying again compounds the speed and
-        // breaks movement after death. Pavlov baselines are ~600 walk / ~300 crouch, so reject anything
-        // above a sane ceiling and keep the last good baseline (default 600/300 if never captured).
-        if (g_mWalk   >= 0) { float w = *(float*)((uint8_t*)mc + g_mWalk);
-            if (w > 1.f && w < 1000.f) g_walkOrig = w; else if (g_walkOrig <= 0.f) g_walkOrig = 600.f; }
-        if (g_mCrouch >= 0) { float w = *(float*)((uint8_t*)mc + g_mCrouch);
-            if (w > 1.f && w < 700.f)  g_crouchOrig = w; else if (g_crouchOrig <= 0.f) g_crouchOrig = 300.f; }
-        if (g_mSprint >= 0) { float s = *(float*)((uint8_t*)mc + g_mSprint); if (s > 0.f && s < 3.f) g_mSprintOrig = s; }
-        if (g_mAds    >= 0) { float s = *(float*)((uint8_t*)mc + g_mAds);    if (s > 0.f && s < 3.f) g_mAdsOrig    = s; }
-        LOG("move: orig walk=%.1f crouch=%.1f sprint=%.2f ads=%.2f", g_walkOrig, g_crouchOrig, g_mSprintOrig, g_mAdsOrig); }
+        // Capture ORIGINALS only when we have no good baseline yet. On respawn the FRESH component briefly
+        // reads transient/low speeds (log showed walk=300 vs the real 600, ads=1.00 vs 0.40); re-capturing
+        // then clobbered the baseline so the boost collapsed to normal speed. First-spawn capture is clean.
+        // Fix pawn / Refresh zero these -> a fresh capture on demand (e.g. real map change).
+        if (g_walkOrig   <= 0.f && g_mWalk   >= 0) { float w = *(float*)((uint8_t*)mc + g_mWalk);
+            g_walkOrig   = (w > 1.f && w < 1000.f) ? w : 600.f; }
+        if (g_crouchOrig <= 0.f && g_mCrouch >= 0) { float w = *(float*)((uint8_t*)mc + g_mCrouch);
+            g_crouchOrig = (w > 1.f && w < 700.f)  ? w : 300.f; }
+        if (g_mSprintOrig < 0.f && g_mSprint >= 0) { float s = *(float*)((uint8_t*)mc + g_mSprint); if (s > 0.f && s < 3.f) g_mSprintOrig = s; }
+        if (g_mAdsOrig    < 0.f && g_mAds    >= 0) { float s = *(float*)((uint8_t*)mc + g_mAds);    if (s > 0.f && s < 3.f) g_mAdsOrig    = s; }
+        LOG("move: comp=%p pawn=%p orig walk=%.1f crouch=%.1f sprint=%.2f ads=%.2f (kept baseline)",
+            mc, pawn, g_walkOrig, g_crouchOrig, g_mSprintOrig, g_mAdsOrig); }
     apply_speed();   // cheat speeds if enabled, else restore originals
 }
 // GODMODE: pin health / zero damage on the pawn's HealthComponent — also weapon-independent.
@@ -1016,6 +1035,32 @@ static bool cls_is_smoke(void* cls) {
     bool b = (strstr(c, "Smoke") || strstr(c, "smoke")) && !strstr(c, "Grenade") && !strstr(c, "Commandlet");
     if (g_smkN < 256) { g_smkC[g_smkN] = cls; g_smkB[g_smkN] = b; g_smkN++; }
     return b;
+}
+// VOTE UNLOCK: the vote button is gated by ContentViewGlobals (the UI data model), NOT PlayerState.
+// Force bCanVote + bCanCallVote on it so the button shows even where the mode disables votekick.
+static void do_vote() {
+    if (!(g_mei.master_enabled && (g_mei.force_vote || g_mei.force_moderator))) return;
+    static void* c_cvg = nullptr, *g_cvg = nullptr; static int32_t o_cv = -2, o_ccv = -2, o_mod = -2; static long last = 0;
+    if (!c_cvg) c_cvg = find_class("ContentViewGlobals");
+    { static int d = 0; if (d++ < 4) LOG("vote: class ContentViewGlobals=%p", c_cvg); }
+    if (!c_cvg) return;
+    if (!g_cvg || !addr_readable((uintptr_t)g_cvg) || !is_a(g_cvg, c_cvg)) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000;
+        if (ms - last < 1000) return; last = ms;
+        g_cvg = nullptr; int32_t n = objects_num();
+        for (int i = 0; i < n; i++) { void* o = object_at(i);
+            if (!o || !addr_readable((uintptr_t)o) || !is_a(o, c_cvg)) continue;
+            char nm[24]; obj_name(o, nm, sizeof nm); if (!strncmp(nm, "Default__", 9)) continue;
+            g_cvg = o; break; }
+        if (!g_cvg) return;
+        static int lg = 0; if (lg++ < 4) LOG("vote: ContentViewGlobals=%p", g_cvg);
+    }
+    if (o_cv  == -2) o_cv  = prop_offset(c_cvg, "bCanVote");
+    if (o_ccv == -2) o_ccv = prop_offset(c_cvg, "bCanCallVote");
+    if (o_mod == -2) o_mod = prop_offset(c_cvg, "bModerator");
+    if (g_mei.force_vote) { if (o_cv >= 0) *(uint8_t*)((uint8_t*)g_cvg + o_cv) = 1;
+                            if (o_ccv >= 0) *(uint8_t*)((uint8_t*)g_cvg + o_ccv) = 1; }
+    if (g_mei.force_moderator && o_mod >= 0) *(uint8_t*)((uint8_t*)g_cvg + o_mod) = 1;   // moderator/admin UI
 }
 static void do_antiflash() {
     if (!(g_mei.master_enabled && g_mei.anti_flash)) return;
@@ -1147,7 +1192,7 @@ static void do_aim(void* me, bool rotate, bool tp) {
     int32_t myteam = (me && o_TeamId >= 0 && addr_readable((uintptr_t)me)) ? *(int32_t*)((uint8_t*)me + o_TeamId) : -1;
     // FFA/no-teams -> target everyone; team modes -> skip teammates. From GameModeType (reference-faithful).
     resolve_ffa();
-    bool teamMode = !g_ffaMode;
+    bool teamMode = !g_ffaMode && g_mei.aim_team_check;   // Team check OFF -> target everyone (custom modes)
     void* best = nullptr; FVec bestHead{}; double bestScore = 361.0;
     for (int i = 0; i < g_nbots; i++) {
         void* o = g_bots[i];
@@ -1827,17 +1872,22 @@ static void scan_bots() {
     void* me = local_pawn();
     g_myteam = (me && o_TeamId >= 0 && addr_readable((uintptr_t)me)) ? *(int32_t*)((uint8_t*)me + o_TeamId) : -1;
     g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; return; }
-    int32_t n = objects_num(); int c = 0;
+    int32_t n = objects_num(); int c = 0, nBody = 0, nDflt = 0, nDead = 0;
+    char lastBody[40] = {0};
     for (int32_t i = 0; i < n && c < 128; i++) {
         void* o = object_at(i);
         if (!o || !addr_readable((uintptr_t)o) || o == me || !in_lib(*(uintptr_t*)o)) continue;
         if (!cls_is_body(obj_class(o))) continue;
-        char nm[40]; obj_name(o, nm, sizeof nm);
-        if (!strncmp(nm, "Default__", 9)) continue;
-        if (pawn_dead(o)) continue;                        // skip corpses (frozen ragdoll chams)
+        nBody++;
+        char nm[40]; obj_name(o, nm, sizeof nm); strncpy(lastBody, nm, sizeof lastBody - 1);
+        if (!strncmp(nm, "Default__", 9)) { nDflt++; continue; }
+        if (pawn_dead(o)) { nDead++; continue; }           // skip corpses (frozen ragdoll chams)
         g_bots[c++] = o;
     }
     g_nbots = c;
+    { static long lb = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); long ms = ts.tv_sec*1000+ts.tv_nsec/1000000;
+      if (c == 0 && ms - lb > 2000) { lb = ms;
+          LOG("scan_bots: kept=%d | bodyclass=%d default=%d dead=%d me=%p last='%s'", c, nBody, nDflt, nDead, me, lastBody); } }
     g_fguard = 0;
 }
 // GAME THREAD: cheap — re-validate each cached pawn FRESH (guards stale/reused pointers) + apply.
@@ -1878,13 +1928,28 @@ static void chams_pass() {
     g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) force_load_xray(); g_fguard = 0;
     void* me = local_pawn();
     g_localMe = me;   // publish for the 90Hz continuous-aim path (so it never calls find_world itself)
+    // FIX PAWN (menu button): re-resolve pawn-dependent features (gun/movement/health) without touching chams.
+    if (g_mei.act_fixpawn) { g_mei.act_fixpawn = false;
+        g_heldGun = nullptr; g_gunGen++; g_ammoGun = nullptr;
+        g_mc = nullptr; g_mcPawn = nullptr; g_walkComp = nullptr;
+        g_mSprint = g_mAds = g_mWalk = g_mCrouch = -1; g_mSprintOrig = g_mAdsOrig = -1.f; g_walkOrig = g_crouchOrig = 0.f;
+        g_myPS = nullptr; g_hc = nullptr;
+        LOG("FIXPAWN: pawn-dependent caches dropped");
+    }
     // POST-DEATH RECOVERY: when the pawn changes (respawn/map), every per-pawn cache is stale. Drop them
     // so movement/name/aim re-resolve for the NEW pawn instead of silently no-op'ing on dead pointers.
     { static void* last_me = nullptr;
       if (me && me != last_me) {
+          // A NEW pawn pointer means a genuine context change (server/map switch) — Pavlov REUSES the pawn
+          // across a normal death, so this does NOT fire on respawn (the baseline stays; see do_movement).
+          // Full movement re-resolve here so a different server's movecomp/offsets/baseline are recaptured.
           g_mc = nullptr; g_mcPawn = nullptr; g_walkComp = nullptr;   // movement re-resolves
+          g_mSprint = g_mAds = g_mWalk = g_mCrouch = -1;              // offsets re-resolve for the new movecomp
+          g_mSprintOrig = g_mAdsOrig = -1.f; g_walkOrig = g_crouchOrig = 0.f;   // baseline recaptures on the new server
           g_myPS = nullptr; g_hc = nullptr; g_aim_target = nullptr;   // devtag/name/aim re-resolve
+          g_heldGun = nullptr; g_ammoGun = nullptr; g_gunGen++;       // gun re-resolves for the new pawn
           last_me = me;
+          LOG("pawnchange: new pawn %p -> full movement/gun re-resolve", me);
       } }
     // dev tag (self-view only): force bDev=1 on our own PlayerState (guarded; resolves offset once).
     if (me && addr_readable((uintptr_t)me)) {
@@ -1897,10 +1962,6 @@ static void chams_pass() {
                     if (pc != devCls) { devCls = pc; g_devOff = prop_offset(pc, "bDev");   // re-resolve on class change only
                         LOG("devtag: PlayerState=%p class-changed bDev@%d", ps, g_devOff); }
                     g_myPS = ps; if (g_devOff >= 0) *(uint8_t*)((uint8_t*)ps + g_devOff) = (g_mei.master_enabled && g_mei.dev_tag) ? 1 : 0;
-                    // VOTE UNLOCK: force bCanVote so the vote button shows even in modes that disable it
-                    static int32_t o_vote = -2; static void* voteCls = nullptr;
-                    if (pc != voteCls) { voteCls = pc; o_vote = prop_offset(pc, "bCanVote"); }
-                    if (o_vote >= 0 && g_mei.master_enabled && g_mei.force_vote) *(uint8_t*)((uint8_t*)ps + o_vote) = 1;
                     // our own TTT role (client always knows its own) -> menu TTT tab
                     if (o_PS_Role >= 0) { int32_t rid = *(int32_t*)((uint8_t*)ps + o_PS_Role);
                         if (rid > 0) fname_to_str(rid, g_mei.my_role, sizeof g_mei.my_role); }
@@ -1944,6 +2005,7 @@ static void chams_pass() {
     if ((wantMove || ranMove) && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_movement(me); g_fguard = 0; }
     ranMove = wantMove;
     g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_antiflash(); g_fguard = 0;   // anti-flash/smoke
+    g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_vote();      g_fguard = 0;   // vote unlock (ContentViewGlobals)
     // ESP restore: the moment chams turns OFF, put every overridden mesh back to its original material
     // (else the x-ray stays until respawn). One-shot: cham_restore_all clears the cache.
     if (!on) { if (g_nCham > 0) cham_restore_all(); return; }
@@ -1993,6 +2055,11 @@ static void chams_pass() {
         }
         g_fguard = 0;
     }
+    { static long lh = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+      long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000;
+      if (ms - lh > 2000) { lh = ms;
+          LOG("chams hb: on=%d nbots=%d painted=%d me=%p style=%d x0=%p x1=%p xm=%p aim=%p",
+              on, g_nbots, g_nCham, g_localMe, g_mei.chams_style, g_xray0, g_xray1, g_xray_mat, g_aim_target); } }
 }
 
 // one-shot: find every UFunction named *XRay* anywhere + its owning class (Outer)
@@ -2225,6 +2292,18 @@ static FVec get_head(void* o) {
 // TRIGGER-KILL: report a headshot bullet-hit on `target` to the server (client-authoritative hit-reg).
 // FClientBulletHit (UE5.1 doubles, from the PC SDK): Target@0x00 Hit@0x08 bHeadshot@0x20 bPenetrated@0x21
 // BulletClass@0x28 GunClass@0x30 Origin@0x38 BoneName(FName)@0x50 Timestamp@0x58 (size 0x60).
+// AntiTank/50Cal gun+bullet classes load per-map (null at boot), so re-resolve them lazily, throttled.
+static void resolve_kill_classes() {
+    if (c_KillGun && c_KillBullet) return;
+    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (ms - last < 1500) return; last = ms;
+    if (!c_KillGun)    { const char* g[] = {"Gun_AntiTank_C","Gun_50cal_C","Gun_HuntingRifle_C","Gun_AR9_C","Gun_AK47_C"};
+                         for (auto n : g) { c_KillGun = find_class(n); if (c_KillGun) break; } }
+    if (!c_KillBullet) { const char* b[] = {"Bullet_50Cal_C","Bullet_762_C","Bullet_556_C","Bullet_9mm_C","Bullet_Base_C"};
+                         for (auto n : b) { c_KillBullet = find_class(n); if (c_KillBullet) break; } }
+    static int lg = 0; if (lg++ < 6) LOG("killclasses: gun=%p bullet=%p", c_KillGun, c_KillBullet);
+}
 static void report_hit(void* target, FVec head, void* heldGun) {
     if (!fn_ReportHit || !target || !addr_readable((uintptr_t)target)) return;
     void* pc = local_controller();
@@ -2242,6 +2321,47 @@ static void report_hit(void* target, FVec head, void* heldGun) {
     if (o_HeadBone >= 0) *(uint64_t*)(p + bh_Bone) = *(uint64_t*)((uint8_t*)target + o_HeadBone);  // BoneName
     static int logn = 0; if (logn++ < 8) LOG("report_hit: target=%p pc=%p gun=%p bullet=%p resolved=%d", target, pc, gunCls, c_KillBullet, bh_resolved);
     g_ProcessEvent(pc, fn_ReportHit, p);
+}
+// Report a headshot on EVERY valid enemy. Caller sets g_in_pass. `firingGun` is the real held gun when
+// this is driven from an actual fire event (server accepts hit-reg only when correlated with a live shot).
+static void* g_killRecent[64]; static long g_killRecentMs[64]; static int g_killRecentN = 0;
+static bool kill_recently(void* o, long ms) {   // was `o` reported in the last 1500ms? (skip dying/freed pawns)
+    for (int i = 0; i < g_killRecentN; i++) if (g_killRecent[i] == o && ms - g_killRecentMs[i] < 1500) return true;
+    return false;
+}
+static void kill_mark(void* o, long ms) {
+    for (int i = 0; i < g_killRecentN; i++) if (g_killRecent[i] == o) { g_killRecentMs[i] = ms; return; }
+    if (g_killRecentN < 64) { g_killRecent[g_killRecentN] = o; g_killRecentMs[g_killRecentN] = ms; g_killRecentN++; }
+    else { int old = 0; for (int i = 1; i < 64; i++) if (g_killRecentMs[i] < g_killRecentMs[old]) old = i;
+           g_killRecent[old] = o; g_killRecentMs[old] = ms; }   // evict oldest
+}
+static int report_all_bots(void* firingGun) {
+    void* me = local_pawn();
+    int32_t myteam = (me && o_TeamId >= 0 && addr_readable((uintptr_t)me)) ? *(int32_t*)((uint8_t*)me + o_TeamId) : -1;
+    resolve_ffa();
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000;
+    int hits = 0, sInval = 0, sTeam = 0, sHead = 0, sDedup = 0;
+    for (int i = 0; i < g_nbots; i++) {
+        void* o = g_bots[i];
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+        if (!o || !addr_readable((uintptr_t)o) || o == me || !in_lib(*(uintptr_t*)o) ||
+            !cls_is_body(obj_class(o)) || pawn_dead(o)) { sInval++; g_fguard = 0; continue; }
+        if (kill_recently(o, ms)) { sDedup++; g_fguard = 0; continue; }
+        if (!g_ffaMode && myteam >= 0 && o_TeamId >= 0 &&
+            *(int32_t*)((uint8_t*)o + o_TeamId) == myteam) { sTeam++; g_fguard = 0; continue; }
+        // Only report enemies whose skull socket resolves — that means the pawn is RENDERED/loaded and
+        // safe to serialize. Reporting a far/unrendered pawn (head==0) sends a half-initialized actor to the
+        // netcode, which derefs its null sub-pointers on a later tick and crashes uncatchably. So headzero
+        // targets are intentionally skipped: Kill All hits every LOADED enemy (the ones actually in play).
+        FVec h = get_head(o);
+        if (h.x == 0 && h.y == 0 && h.z == 0) { sHead++; g_fguard = 0; continue; }
+        report_hit(o, h, firingGun); kill_mark(o, ms); hits++;
+        g_fguard = 0;
+    }
+    static int lg = 0; if (lg++ < 40)
+        LOG("report_all: nbots=%d hits=%d | invalid=%d team=%d headzero=%d dedup=%d ffa=%d myteam=%d",
+            g_nbots, hits, sInval, sTeam, sHead, sDedup, g_ffaMode, myteam);
+    return hits;
 }
 
 // read an FString (char16 data@0, num@8) at `off` on `obj` into an ascii buffer
@@ -2333,6 +2453,75 @@ static void esp_gather() {
     g_esp_n = cnt;
 }
 
+// Build the live player list for the menu's kill-target dropdown. Parallel g_playerPawns[] holds the raw
+// pawn pointers (validated again at kill time). "loaded" = the skull socket resolves = the pawn is rendered
+// and SAFE to report a hit on (unloaded pawns crash the netcode — see report_all_bots).
+static void* g_playerPawns[MEI_PLAYERS_MAX];
+static void players_gather() {
+    void* me = local_pawn();
+    int n = 0;
+    for (int i = 0; i < g_nbots && n < MEI_PLAYERS_MAX; i++) {
+        void* o = g_bots[i];
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+        if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) && cls_is_body(obj_class(o))) {
+            MeiPlayer& p = g_players[n];
+            p.name[0] = 0;
+            p.team  = (o_TeamId >= 0) ? *(int32_t*)((uint8_t*)o + o_TeamId) : 0;
+            p.alive = !pawn_dead(o);
+            void* ps = (o_PawnPS >= 0) ? *(void**)((uint8_t*)o + o_PawnPS) : nullptr;
+            if (ps && addr_readable((uintptr_t)ps) && in_lib(*(uintptr_t*)ps) && o_PS_Name >= 0)
+                read_fstring(ps, o_PS_Name, p.name, sizeof p.name);
+            FVec h = get_head(o); p.loaded = !(h.x == 0 && h.y == 0 && h.z == 0);
+            if (!p.name[0]) snprintf(p.name, sizeof p.name, "Player %d", n + 1);
+            g_playerPawns[n] = o; n++;
+        }
+        g_fguard = 0;
+    }
+    g_players_n = n;
+}
+// Consume the menu's "Kill selected" one-shot: report a headshot on the chosen player. The stored pointer
+// can be REUSED/freed by the time you press Kill (the list refreshes at 3Hz), and reporting on a stale
+// pawn is what crashes the netcode. So we RE-RESOLVE the target FRESH by name from the current pawn list,
+// and only fire if a live, loaded pawn with that exact name still exists this instant.
+static void do_kill_selected() {
+    if (!g_mei.act_kill_sel) return;
+    g_mei.act_kill_sel = false;
+    int idx = g_mei.kill_sel;
+    if (idx < 0 || idx >= g_players_n || !fn_ReportHit) { LOG("KILLSEL: bad idx %d (n=%d)", idx, g_players_n); return; }
+    char wantName[MEI_NAME_MAX]; strncpy(wantName, g_players[idx].name, sizeof wantName); wantName[MEI_NAME_MAX-1] = 0;
+    void* wantPtr = g_playerPawns[idx];
+    bool named = strncmp(wantName, "Player ", 7) != 0;   // real PlayerState name vs our "Player N" placeholder
+    resolve_kill_classes();
+    void* me = local_pawn();
+    void* target = nullptr;
+    g_in_pass = true;
+    for (int i = 0; i < g_nbots && !target; i++) {
+        void* o = g_bots[i];   // g_bots is the FRESH live scan — a pointer only in here is not freed
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+        if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
+            cls_is_body(obj_class(o)) && !pawn_dead(o)) {
+            if (named) {   // match by PlayerState name — robust to pointer reuse
+                void* ps = (o_PawnPS >= 0) ? *(void**)((uint8_t*)o + o_PawnPS) : nullptr;
+                char nm[MEI_NAME_MAX] = {0};
+                if (ps && addr_readable((uintptr_t)ps) && in_lib(*(uintptr_t*)ps) && o_PS_Name >= 0)
+                    read_fstring(ps, o_PS_Name, nm, sizeof nm);
+                if (nm[0] && !strcmp(nm, wantName)) target = o;
+            } else if (o == wantPtr) {   // unnamed: only accept if the exact pointer is STILL in the live scan
+                target = o;
+            }
+        }
+        g_fguard = 0;
+    }
+    if (target) {
+        g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
+            FVec h = get_head(target);
+            if (!(h.x == 0 && h.y == 0 && h.z == 0)) { report_hit(target, h, g_heldGun); LOG("KILLSEL: killed '%s' %p", wantName, target); }
+            else LOG("KILLSEL: '%s' not loaded (head=0) — skipped", wantName);
+        } g_fguard = 0;
+    } else LOG("KILLSEL: '%s' not present in live scan — skipped (was stale)", wantName);
+    g_in_pass = false;
+}
+
 static void handler(void* obj, void* func, void* params) {
     // mei menu input feed (throttled inside; guarded against PE re-entry)
     if (!g_in_pass && g_ready) { g_in_pass = true; mei_feed_input(); g_in_pass = false; }
@@ -2344,6 +2533,13 @@ static void handler(void* obj, void* func, void* params) {
             long ems = ets.tv_sec*1000 + ets.tv_nsec/1000000;
             if (ems - last_esp >= 33) { last_esp = ems; g_in_pass = true; esp_gather(); g_in_pass = false; }
         } else if (g_esp_n) g_esp_n = 0;
+        // Player list for the kill-target dropdown (refresh ~3 Hz while the menu is open), + the kill one-shot.
+        if (g_mei.menu_open) {
+            static long last_pl = 0; struct timespec pts; clock_gettime(CLOCK_MONOTONIC, &pts);
+            long pms = pts.tv_sec*1000 + pts.tv_nsec/1000000;
+            if (pms - last_pl >= 300) { last_pl = pms; g_in_pass = true; players_gather(); g_in_pass = false; }
+        }
+        if (g_mei.act_kill_sel) do_kill_selected();
     }
     // AUTH DIAGNOSTIC: log the disconnect/kick RPC + any string reason param (the "cannot be verified"
     // message the host sends when it rejects a player-hosted join).
@@ -2421,6 +2617,19 @@ static void handler(void* obj, void* func, void* params) {
                 in_lib(*(uintptr_t*)g_aim_target)) {
                 g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) report_hit(g_aim_target, g_aim_targetHead, obj); g_fguard = 0;
             }
+            // KILL ALL / kill-aura DURING a real shot: reports are correlated with a live bullet, so the
+            // server accepts them online (the standalone aura sweep gets dropped online — no bullet fired).
+            struct timespec kts; clock_gettime(CLOCK_MONOTONIC, &kts); long kms = kts.tv_sec*1000 + kts.tv_nsec/1000000;
+            bool armed = g_killAllArmed && ((kms - g_killAllArmed) < 8000);   // latch stays hot 8s
+            // THROTTLE: one sweep per 200ms max. Blasting every fire tick queued hundreds of ServerReportBulletHit
+            // bunches; one referencing a just-killed (freed) pawn crashed libUnreal's network serialize on a later
+            // tick — outside our fault guard, so uncatchable. 200ms is plenty to drop the lobby without the flood.
+            static long lastBlast = 0;
+            if ((g_mei.kill_aura || armed) && kms - lastBlast >= 200) {
+                lastBlast = kms;
+                int h = report_all_bots(obj);   // reports ride THIS real bullet -> server accepts them online
+                if (armed) LOG("KILLALL: blasted %d on fire (armed %ldms left)", h, 8000 - (kms - g_killAllArmed));
+            }
             g_in_pass = false;
         }
     }
@@ -2442,31 +2651,23 @@ static void handler(void* obj, void* func, void* params) {
     }
     // KILL-AURA: continuously report a headshot on EVERY valid enemy (no need to fire or aim). Throttled
     // to aura_rate. This is the strongest / most detectable feature — reflection-guarded per target.
-    if (!g_in_pass && g_ready && g_mei.master_enabled && g_mei.kill_aura && fn_ReportHit && g_nbots) {
+    bool doAura = g_mei.master_enabled && g_mei.kill_aura;
+    bool doOnce = g_mei.act_killall;   // one-shot "Kill All" button
+    if (doOnce) {   // ARM the next real shot (server accepts hit-reg online only when a live bullet fired)
+        g_mei.act_killall = false;
+        struct timespec ats; clock_gettime(CLOCK_MONOTONIC, &ats); g_killAllArmed = ats.tv_sec*1000 + ats.tv_nsec/1000000;
+        LOG("KILLALL: armed — pull the trigger once to blast everyone");
+    }
+    if (!g_in_pass && g_ready && fn_ReportHit && g_nbots && (doAura || doOnce)) {
+        resolve_kill_classes();        // AntiTank gun + 50Cal bullet (lazy, per-map)
         static long last_aura = 0;
         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
         long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
         long iv = (long)g_mei.aura_rate; if (iv < 40) iv = 40;
-        if (ms - last_aura >= iv) {
+        if (doOnce || ms - last_aura >= iv) {   // immediate sweep too (works OFFLINE; online it piggybacks the shot)
             last_aura = ms;
             g_in_pass = true;
-            void* me = local_pawn();
-            int32_t myteam = (me && o_TeamId >= 0 && addr_readable((uintptr_t)me)) ? *(int32_t*)((uint8_t*)me + o_TeamId) : -1;
-            resolve_ffa();
-            for (int i = 0; i < g_nbots; i++) {
-                void* o = g_bots[i];
-                g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
-                if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
-                    cls_is_body(obj_class(o)) && !pawn_dead(o)) {
-                    bool skipTeam = (!g_ffaMode && myteam >= 0 && o_TeamId >= 0 &&
-                                     *(int32_t*)((uint8_t*)o + o_TeamId) == myteam);
-                    if (!skipTeam) {
-                        FVec h = get_head(o);
-                        if (!(h.x == 0 && h.y == 0 && h.z == 0)) report_hit(o, h, nullptr);
-                    }
-                }
-                g_fguard = 0;
-            }
+            report_all_bots(nullptr);
             g_in_pass = false;
         }
     }
