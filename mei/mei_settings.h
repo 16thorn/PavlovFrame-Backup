@@ -33,8 +33,11 @@ struct MeiSettings {
 
     // ---- Visuals / chams ----
     bool  chams_enabled    = true;
-    bool  chams_team_color = true;    // team-0/1 xray materials (vs single color)
+    bool  chams_team_color = true;    // team-0/1 xray materials (vs single color)  [legacy; style overrides]
     bool  chams_highlight  = true;    // brighten the current aim target
+    int   chams_style      = 0;       // 0 Team, 1 Single-A, 2 Single-B, 3 Flash, 4 Target-only, 5 Custom
+    float chams_col[3]     = {1.f, 0.f, 0.f};   // custom cham RGB, team 0 (style 5)
+    float chams_col2[3]    = {0.f, 0.3f, 1.f};  // custom cham RGB, team 1 (style 5)
     bool  chams_skip_dead  = true;    // never chams a corpse (keep true; cheap + correct)
 
     // ---- ESP overlay (view-locked quad drawn by mei_xr from pavchams-projected positions) ----

@@ -25,6 +25,9 @@ void mei_save() {
     fprintf(f, "chams_enabled %d\n",   s.chams_enabled);
     fprintf(f, "chams_team_color %d\n",s.chams_team_color);
     fprintf(f, "chams_highlight %d\n", s.chams_highlight);
+    fprintf(f, "chams_style %d\n",     s.chams_style);
+    fprintf(f, "chams_col %.3f %.3f %.3f\n", s.chams_col[0], s.chams_col[1], s.chams_col[2]);
+    fprintf(f, "chams_col2 %.3f %.3f %.3f\n", s.chams_col2[0], s.chams_col2[1], s.chams_col2[2]);
     fprintf(f, "esp_enabled %d\n",     s.esp_enabled);
     fprintf(f, "esp_box %d\n",         s.esp_box);
     fprintf(f, "esp_name %d\n",        s.esp_name);
@@ -84,7 +87,9 @@ void mei_load() {
         GF("aim_smooth", aim_smooth) GI("aim_target_head", aim_target_head)
         GF("aim_head_z", aim_head_z)
         GI("chams_enabled", chams_enabled) GI("chams_team_color", chams_team_color)
-        GI("chams_highlight", chams_highlight)
+        GI("chams_highlight", chams_highlight) GI("chams_style", chams_style)
+        if (!strcmp(key, "chams_col") && sscanf(line, "%*s %f %f %f", &s.chams_col[0], &s.chams_col[1], &s.chams_col[2]) == 3) continue;
+        if (!strcmp(key, "chams_col2") && sscanf(line, "%*s %f %f %f", &s.chams_col2[0], &s.chams_col2[1], &s.chams_col2[2]) == 3) continue;
         GI("esp_enabled", esp_enabled) GI("esp_box", esp_box) GI("esp_name", esp_name)
         GI("esp_dist", esp_dist) GI("esp_health", esp_health) GI("esp_role", esp_role)
         GI("esp_crosshair", esp_crosshair) GI("esp_fov_circle", esp_fov_circle)

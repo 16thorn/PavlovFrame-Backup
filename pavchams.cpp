@@ -646,8 +646,16 @@ static void* c_PavlovPawn = nullptr;
 static void* c_PawnBase = nullptr;
 static void* fn_IsDead = nullptr;
 static void* fn_SetMaterial = nullptr;
+static void* fn_CreateMID = nullptr;   // MeshComponent::CreateDynamicMaterialInstance (custom cham colors)
+static void* fn_SetVecParam = nullptr; // MaterialInstanceDynamic::SetVectorParameterValue
+static int32_t g_colorNameId = -1;     // FName id of "Color" (the xray material's tint param)
 static void* fn_GetMaterial = nullptr;                       // UMeshComponent::GetMaterial (for ESP restore)
 static void* g_chamMesh[256]; static void* g_chamOrig[256]; static int g_nCham = 0;   // orig material cache
+static void* g_midMesh[256]; static void* g_midObj[256]; static int g_nMid = 0;        // per-mesh custom-color MID cache
+static void* mid_for(void* mesh) { for (int i=0;i<g_nMid;i++) if (g_midMesh[i]==mesh) {
+    void* m=g_midObj[i]; return (m && addr_readable((uintptr_t)m) && in_lib(*(uintptr_t*)m)) ? m : nullptr; } return nullptr; }
+static void mid_store(void* mesh, void* mid) { for (int i=0;i<g_nMid;i++) if (g_midMesh[i]==mesh) { g_midObj[i]=mid; return; }
+    if (g_nMid<256){ g_midMesh[g_nMid]=mesh; g_midObj[g_nMid]=mid; g_nMid++; } else { g_midMesh[0]=mesh; g_midObj[0]=mid; } }
 static int32_t o_Avatar = -1, o_XRay0 = -1, o_XRay1 = -1, o_bValid = -1, o_TeamId = -1, o_bDead = -1;
 static inline bool pawn_dead(void* o) { return o_bDead >= 0 && *(uint8_t*)((uint8_t*)o + o_bDead) != 0; }
 static void* c_Mesh = nullptr;
@@ -1209,6 +1217,10 @@ static void resolve_names() {
     c_Mesh = find_class("SkeletalMeshComponent");    // only skinned meshes (renderable bodies)
     fn_SetOverlay = c_Mesh ? find_func(c_Mesh, "SetOverlayMaterial") : nullptr;
     fn_SetMaterial = c_Mesh ? find_func(c_Mesh, "SetMaterial") : nullptr;
+    fn_CreateMID = c_Mesh ? find_func(c_Mesh, "CreateDynamicMaterialInstance") : nullptr;   // custom cham colors
+    { void* cmid = find_class("MaterialInstanceDynamic");
+      fn_SetVecParam = cmid ? find_func(cmid, "SetVectorParameterValue") : nullptr; }
+    LOG("customcolor: CreateMID=%p SetVecParam=%p", fn_CreateMID, fn_SetVecParam);
     fn_GetMaterial = c_Mesh ? find_func(c_Mesh, "GetMaterial") : nullptr;   // for ESP restore-on-disable
     fn_CompLoc = c_Mesh ? find_func(c_Mesh, "K2_GetComponentLocation") : nullptr;
     o_SkelAsset = c_Mesh ? prop_offset(c_Mesh, "SkeletalMeshAsset") : -1;
@@ -1943,10 +1955,34 @@ static void chams_pass() {
         void* avatar = (o_Avatar >= 0) ? rd_obj(o, o_Avatar) : nullptr;   // read fresh
         if (!avatar || !addr_readable((uintptr_t)avatar) || !in_lib(*(uintptr_t*)avatar)) continue;
         int32_t team = (o_TeamId >= 0) ? *(int32_t*)((uint8_t*)o + o_TeamId) : 0;
-        void* mat = g_mei.chams_team_color ? ((team == 0) ? g_xray1 : g_xray0)   // swapped: colors were reversed
-                                           : g_xray_mat;                          // single-color mode
+        void* mat = nullptr;
+        switch (g_mei.chams_style) {
+            case 1: mat = g_xray1; break;                                        // Single-A (one color for all)
+            case 2: mat = g_xray0; break;                                        // Single-B
+            case 3: { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);    // Flash (pulse both colors)
+                      long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000; mat = ((ms/220)&1) ? g_xray1 : g_xray0; } break;
+            case 4: if (o != g_aim_target) continue; mat = (team==0)?g_xray0:g_xray1; break;  // Target-only
+            case 5: mat = g_xray1; break;   // Custom color (tinted below via a dynamic instance)
+            default: mat = (team == 0) ? g_xray1 : g_xray0; break;               // Team colors (swapped)
+        }
+        // CUSTOM COLOR: make (once) a dynamic instance of the xray material for this mesh and set its
+        // "Color" param to the user's RGB. The MID is reused per mesh; SetMaterial below applies it.
+        if (g_mei.chams_style == 5 && fn_CreateMID && fn_SetVecParam && is_material(g_xray1)) {
+            g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
+                void* mid = mid_for(avatar);
+                if (!mid) { struct { int32_t idx; int32_t _p; void* src; int32_t nId, nNum; void* ret; }
+                        cp{ 0, 0, g_xray1, 0, 0, nullptr };
+                    g_ProcessEvent(avatar, fn_CreateMID, &cp); mid = cp.ret; if (mid) mid_store(avatar, mid); }
+                if (mid && addr_readable((uintptr_t)mid) && in_lib(*(uintptr_t*)mid)) {
+                    if (g_colorNameId < 0) g_colorNameId = fname_find("Color");
+                    const float* col = (team == 0) ? g_mei.chams_col : g_mei.chams_col2;   // per-team custom color
+                    struct { int32_t nId, nNum; float r, g, b, a; }
+                        sp{ g_colorNameId, 0, col[0], col[1], col[2], 1.f };
+                    g_ProcessEvent(mid, fn_SetVecParam, &sp); mat = mid; }
+            } g_fguard = 0;
+        }
         if (!is_material(mat)) mat = g_xray_mat;
-        if (g_mei.chams_highlight && o == g_aim_target) {
+        if (g_mei.chams_highlight && g_mei.chams_style != 4 && o == g_aim_target) {
             void* hl = (team == 0) ? g_xray0 : g_xray1; if (is_material(hl)) mat = hl; }
         if (!is_material(mat)) continue;
         g_fguard = 1;

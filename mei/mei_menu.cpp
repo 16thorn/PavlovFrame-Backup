@@ -125,7 +125,15 @@ static void tab_visuals(){
     gb_begin("CHAMS");
     Chk("Enabled",&g_mei.chams_enabled);
     ImGui::BeginDisabled(!g_mei.chams_enabled);
-    Chk("Team colors",&g_mei.chams_team_color);
+    const char* styles[] = { "Team colors","Single A","Single B","Flash","Target only","Custom color" };
+    ImGui::PushItemWidth(-1.f);
+    if (ImGui::Combo("##chstyle",&g_mei.chams_style,styles,6)) touched();
+    ImGui::PopItemWidth();
+    if (g_mei.chams_style == 5) {
+        if (ImGui::ColorEdit3("Team 0", g_mei.chams_col,  ImGuiColorEditFlags_NoInputs)) touched();
+        if (ImGui::ColorEdit3("Team 1", g_mei.chams_col2, ImGuiColorEditFlags_NoInputs)) touched();
+        ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "recolor each team (see-through tint)");
+    }
     Chk("Highlight target",&g_mei.chams_highlight);
     Chk("Skip dead",&g_mei.chams_skip_dead);
     ImGui::EndDisabled();
