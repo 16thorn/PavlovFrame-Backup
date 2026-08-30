@@ -198,6 +198,9 @@ static void tab_weapon(){
         ImGui::EndDisabled();
         if (sel_ok && !g_players[g_mei.kill_sel].loaded) {
             ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0xC8,0x66,0x66,0xFF)), "far — may not land"); }
+        ImGui::Separator();
+        Chk("KILL ALL (repeat — kills everyone loaded)", &g_mei.kill_all_loop);
+        ImGui::TextColored(v4(IM_COL32(0xC8,0x66,0x66,0xFF)), "loud / very detectable — ban risk");
     }
     gb_end();
 }

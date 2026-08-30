@@ -2663,6 +2663,21 @@ static void esp_gather() {
 // chosen player, re-resolved FRESH by name at press time (the stored pointer can be reused/freed between
 // refresh and press — reporting a stale pawn is what crashes the netcode). Only loaded pawns are reported.
 static void* g_playerPawns[MEI_PLAYERS_MAX];
+// Robust head for kill/list: prefer the skull socket; if that hasn't resolved (common even for nearby
+// pawns), fall back to the actor location + head height. Returns false only if we can't place the pawn
+// at all. This is what fixes "someone right next to me shows as far" (socket was just null).
+static bool kill_head(void* o, FVec* out) {
+    FVec h = get_head(o);
+    if (!(h.x == 0 && h.y == 0 && h.z == 0)) { *out = h; return true; }
+    FVec f = aim_getloc(o);
+    if (f.x == 0 && f.y == 0 && f.z == 0) return false;
+    *out = FVec{ f.x, f.y, f.z + 150.0 }; return true;
+}
+static double dist_cm(void* a, void* b) {
+    FVec p = aim_getloc(a), q = aim_getloc(b);
+    double dx = p.x - q.x, dy = p.y - q.y, dz = p.z - q.z;
+    return sqrt(dx*dx + dy*dy + dz*dz);
+}
 static void players_gather() {
     void* me = local_pawn();
     int n = 0;
@@ -2670,15 +2685,17 @@ static void players_gather() {
         void* o = g_bots[i];
         g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
         if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) && cls_is_body(obj_class(o))) {
-            MeiPlayer& p = g_players[n];
-            p.name[0] = 0;
-            p.team  = (o_TeamId >= 0) ? *(int32_t*)((uint8_t*)o + o_TeamId) : 0;
-            p.alive = !pawn_dead(o);
+            char nm[MEI_NAME_MAX] = {0};
             void* ps = (o_PawnPS >= 0) ? *(void**)((uint8_t*)o + o_PawnPS) : nullptr;
             if (ps && addr_readable((uintptr_t)ps) && in_lib(*(uintptr_t*)ps) && o_PS_Name >= 0)
-                read_fstring(ps, o_PS_Name, p.name, sizeof p.name);
-            FVec h = get_head(o); p.loaded = !(h.x == 0 && h.y == 0 && h.z == 0);
-            if (!p.name[0]) snprintf(p.name, sizeof p.name, "Player %d", n + 1);
+                read_fstring(ps, o_PS_Name, nm, sizeof nm);
+            if (!nm[0]) { g_fguard = 0; continue; }   // skip unnamed pawns (the "Player N" duplicates)
+            MeiPlayer& p = g_players[n];
+            strncpy(p.name, nm, sizeof p.name); p.name[sizeof p.name - 1] = 0;
+            p.team  = (o_TeamId >= 0) ? *(int32_t*)((uint8_t*)o + o_TeamId) : 0;
+            p.alive = !pawn_dead(o);
+            FVec h; double d = (me ? dist_cm(me, o) : 0.0);
+            p.loaded = kill_head(o, &h) && (me ? d < 30000.0 : true);   // placeable AND within ~300m = killable
             g_playerPawns[n] = o; n++;
         }
         g_fguard = 0;
@@ -2738,11 +2755,35 @@ static void do_kill_selected() {
     }
     if (target) {
         g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
-            FVec h = get_head(target);
-            if (!(h.x == 0 && h.y == 0 && h.z == 0)) { report_hit(target, h, nullptr); LOG("KILLSEL: killed '%s' %p", wantName, target); }
-            else LOG("KILLSEL: '%s' not loaded (head=0) — skipped", wantName);
+            FVec h;
+            if (kill_head(target, &h)) { report_hit(target, h, nullptr); LOG("KILLSEL: killed '%s' %p", wantName, target); }
+            else LOG("KILLSEL: '%s' can't be placed — skipped", wantName);
         } g_fguard = 0;
     } else LOG("KILLSEL: '%s' not present in live scan — skipped (stale)", wantName);
+    g_in_pass = false;
+}
+// REPEATING KILL ALL: while the toggle is on, headshot every LOADED enemy (named, alive, in range, team-
+// filtered) each pass. Crash-safe: only reports pawns kill_head can place + within range; report_hit drops
+// null-class. Detectable (like an aura) — that's on the user. Called throttled from the handler.
+static void kill_all_loaded() {
+    resolve_kill_classes();
+    void* me = local_pawn();
+    int32_t myteam = (me && o_TeamId >= 0 && addr_readable((uintptr_t)me)) ? *(int32_t*)((uint8_t*)me + o_TeamId) : -1;
+    resolve_ffa();
+    g_in_pass = true;
+    for (int i = 0; i < g_nbots; i++) {
+        void* o = g_bots[i];
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+        if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
+            cls_is_body(obj_class(o)) && !pawn_dead(o)) {
+            bool skipTeam = (!g_ffaMode && myteam >= 0 && o_TeamId >= 0 &&
+                             *(int32_t*)((uint8_t*)o + o_TeamId) == myteam);
+            if (!skipTeam && (!me || dist_cm(me, o) < 30000.0)) {   // in range = loaded/safe to report
+                FVec h; if (kill_head(o, &h)) report_hit(o, h, nullptr);
+            }
+        }
+        g_fguard = 0;
+    }
     g_in_pass = false;
 }
 static void handler(void* obj, void* func, void* params) {
@@ -2763,6 +2804,13 @@ static void handler(void* obj, void* func, void* params) {
             if (pms - last_pl >= 300) { last_pl = pms; g_in_pass = true; players_gather(); g_in_pass = false; }
         }
         if (g_mei.act_kill_sel) do_kill_selected();
+        // Repeating KILL ALL: while on, blast every loaded enemy on a throttle (rate = aura_rate, min 100ms).
+        if (g_mei.kill_all_loop && g_ready && fn_ReportHit && g_nbots) {
+            static long last_ka = 0; struct timespec kt; clock_gettime(CLOCK_MONOTONIC, &kt);
+            long kms = kt.tv_sec*1000 + kt.tv_nsec/1000000;
+            long iv = (long)g_mei.aura_rate; if (iv < 100) iv = 100;
+            if (kms - last_ka >= iv) { last_ka = kms; kill_all_loaded(); }
+        }
     }
     // AUTH DIAGNOSTIC: log the disconnect/kick RPC + any string reason param (the "cannot be verified"
     // message the host sends when it rejects a player-hosted join).

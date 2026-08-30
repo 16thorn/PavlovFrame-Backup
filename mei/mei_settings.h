@@ -118,6 +118,7 @@ struct MeiSettings {
     volatile bool act_skin           = false;   // apply player skin (SetPlayerSkin) now
     int           kill_sel           = -1;      // selected index into g_players (pick-a-target kill)
     volatile bool act_kill_sel       = false;   // one-shot: headshot the selected player now
+    bool          kill_all_loop      = false;   // repeating: headshot every loaded enemy each pass (aura_rate)
 };
 
 // the single shared instance (defined in mei_settings.cpp)

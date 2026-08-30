@@ -48,6 +48,7 @@ void mei_save() {
     fprintf(f, "infinite_ammo %d\n",   s.infinite_ammo);
     fprintf(f, "trigger_kill %d\n",    s.trigger_kill);
     fprintf(f, "kill_aura %d\n",       s.kill_aura);
+    fprintf(f, "kill_all_loop %d\n",   s.kill_all_loop);
     fprintf(f, "wallbang %d\n",        s.wallbang);
     fprintf(f, "aura_rate %.1f\n",     s.aura_rate);
     fprintf(f, "move_enabled %d\n",    s.move_enabled);
@@ -99,7 +100,7 @@ void mei_load() {
         GI("no_recoil", no_recoil) GI("perfect_accuracy", perfect_accuracy)
         GI("rapid_fire", rapid_fire) GI("force_auto", force_auto) GI("no_reload", no_reload)
         GI("infinite_ammo", infinite_ammo) GI("trigger_kill", trigger_kill)
-        GI("kill_aura", kill_aura) GI("wallbang", wallbang) GF("aura_rate", aura_rate)
+        GI("kill_aura", kill_aura) GI("kill_all_loop", kill_all_loop) GI("wallbang", wallbang) GF("aura_rate", aura_rate)
         GI("move_enabled", move_enabled) GI("noclip", noclip) GI("anti_flash", anti_flash)
         GF("move_sprint", move_sprint) GF("move_ads", move_ads)
         GF("move_walk", move_walk) GF("move_crouch", move_crouch)
