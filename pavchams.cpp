@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/prctl.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <time.h>
@@ -1423,6 +1424,30 @@ static void resolve_graph() {
 static void* g_world = nullptr;
 // Walk World -> GI -> LocalPlayers[0] -> PlayerController -> (Acknowledged|Controlled) Pawn.
 // Returns our pawn, or null if this world doesn't currently yield one.
+// FALLBACK for lobby/map switches: the engine leaves LocalPlayer->PlayerController NULL after travel
+// (diagnosed: worlds=1 GI=1 LP=1 PC=0). Find the local PlayerController by scanning for the PC whose
+// ->Player back-points to our LocalPlayer. Cached + throttled (this runs off the 90Hz pawn path).
+static void* g_localPC = nullptr;
+static void* resolve_local_pc(void* lp) {
+    static int32_t o_player = -2; static void* pcCls = nullptr;
+    if (!pcCls) pcCls = find_class("PlayerController");
+    if (!pcCls || !lp) return nullptr;
+    if (o_player == -2) o_player = prop_offset(pcCls, "Player");
+    if (o_player < 0) return nullptr;
+    // validate the cache first (cheap)
+    if (g_localPC && addr_readable((uintptr_t)g_localPC) && in_lib(*(uintptr_t*)g_localPC) && is_a(g_localPC, pcCls) &&
+        *(void**)((uint8_t*)g_localPC + o_player) == lp) return g_localPC;
+    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000; if (ms - last < 300) return nullptr; last = ms;
+    g_localPC = nullptr;
+    int32_t n = objects_num();
+    for (int32_t i = 0; i < n; i++) { void* o = object_at(i);
+        if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o) || !is_a(o, pcCls)) continue;
+        char nm[24]; obj_name(o, nm, sizeof nm); if (!strncmp(nm, "Default__", 9)) continue;
+        if (*(void**)((uint8_t*)o + o_player) == lp) { g_localPC = o; return o; }
+    }
+    return nullptr;
+}
 static void* pawn_from_world(void* w) {
     if (!w || !addr_readable((uintptr_t)w) || O_WORLD_GI < 0 || O_GI_LP < 0 || O_LP_PC < 0) return nullptr;
     void* gi = *(void**)((uint8_t*)w + O_WORLD_GI);
@@ -1433,6 +1458,7 @@ static void* pawn_from_world(void* w) {
     void* lp = ((void**)lpData)[0];
     if (!addr_readable((uintptr_t)lp)) return nullptr;
     void* pc = *(void**)((uint8_t*)lp + O_LP_PC);
+    if (!addr_readable((uintptr_t)pc)) pc = resolve_local_pc(lp);   // LP->PC null after travel -> find it by ->Player
     if (!addr_readable((uintptr_t)pc)) return nullptr;
     void* pawn = (O_PC_ACKPAWN >= 0) ? *(void**)((uint8_t*)pc + O_PC_ACKPAWN) : nullptr;
     if (!addr_readable((uintptr_t)pawn) && O_CTRL_PAWN >= 0) pawn = *(void**)((uint8_t*)pc + O_CTRL_PAWN);
@@ -1457,9 +1483,33 @@ static void* find_world() {
     }
     return nullptr;
 }
+// Diagnostic: walk the chain across ALL worlds and log where it breaks (throttled; only when we have no pawn).
+static void diag_pawn_chain() {
+    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000; if (ms - last < 2000) return; last = ms;
+    void* wc = find_class("World");
+    int worlds=0, withGI=0, withLP=0, withPC=0, withPawn=0; char best[160]="";
+    int32_t n = objects_num();
+    for (int32_t i = 0; i < n; i++) { void* o = object_at(i);
+        if (!o || !addr_readable((uintptr_t)o) || obj_class(o) != wc) continue;
+        char nm[32]; obj_name(o, nm, sizeof nm); if (!strncmp(nm,"Default__",9)) continue;
+        worlds++;
+        void* gi = (O_WORLD_GI>=0)? *(void**)((uint8_t*)o+O_WORLD_GI):nullptr; if(!addr_readable((uintptr_t)gi))continue; withGI++;
+        void* lpData = *(void**)((uint8_t*)gi+O_GI_LP); int32_t lpNum=*(int32_t*)((uint8_t*)gi+O_GI_LP+8);
+        if(!addr_readable((uintptr_t)lpData)||lpNum<1)continue; withLP++;
+        void* lp=((void**)lpData)[0]; if(!addr_readable((uintptr_t)lp))continue;
+        void* pc=*(void**)((uint8_t*)lp+O_LP_PC); if(!addr_readable((uintptr_t)pc))continue; withPC++;
+        void* ack=(O_PC_ACKPAWN>=0)?*(void**)((uint8_t*)pc+O_PC_ACKPAWN):nullptr;
+        void* ctp=(O_CTRL_PAWN>=0)?*(void**)((uint8_t*)pc+O_CTRL_PAWN):nullptr;
+        if(addr_readable((uintptr_t)ack)||addr_readable((uintptr_t)ctp))withPawn++;
+        snprintf(best,sizeof best,"world='%s' gi=%p lpNum=%d pc=%p ack=%p ctrl=%p",nm,gi,lpNum,pc,ack,ctp);
+    }
+    LOG("pawnchain: worlds=%d GI=%d LP=%d PC=%d PAWN=%d | %s", worlds,withGI,withLP,withPC,withPawn,best);
+}
 static void* local_pawn() {
-    void* w = find_world(); if (!w) return nullptr;
-    return pawn_from_world(w);
+    void* w = find_world(); if (!w) { diag_pawn_chain(); return nullptr; }
+    void* p = pawn_from_world(w); if (!p) diag_pawn_chain();
+    return p;
 }
 static void resolve_setmaterial(void* mesh) {
     if (fn_SetMaterial) return;
@@ -1687,6 +1737,7 @@ static void* local_controller() {
     if (!addr_readable((uintptr_t)lpData) || num < 1) return nullptr;
     void* lp = ((void**)lpData)[0]; if (!addr_readable((uintptr_t)lp)) return nullptr;
     void* pc = *(void**)((uint8_t*)lp + O_LP_PC);
+    if (!addr_readable((uintptr_t)pc)) pc = resolve_local_pc(lp);   // lobby-switch fallback (LP->PC null)
     return addr_readable((uintptr_t)pc) ? pc : nullptr;
 }
 static void menu_spawn(void* me) {
@@ -2523,6 +2574,13 @@ static void do_kill_selected() {
 }
 
 static void handler(void* obj, void* func, void* params) {
+    // GAME-THREAD GUARD: ProcessEvent is called on MANY threads (engine task/foreground workers too).
+    // Our feature passes read/write shared game state + caches with no cross-thread locking, so running
+    // them on a worker thread races the game thread -> SEGV_ACCERR on a worker (seen in the wild). Only
+    // run features on UE's "GameThread"; every other thread falls straight through to the original PE.
+    { static thread_local int t_game = -1;
+      if (t_game < 0) { char nm[16] = {0}; prctl(PR_GET_NAME, nm); t_game = (strcmp(nm, "GameThread") == 0); }
+      if (!t_game) { g_ProcessEvent(obj, func, params); return; } }
     // mei menu input feed (throttled inside; guarded against PE re-entry)
     if (!g_in_pass && g_ready) { g_in_pass = true; mei_feed_input(); g_in_pass = false; }
     // ESP gather (~30 Hz) — project enemies for the overlay quad; consume the Buy action.
@@ -2649,27 +2707,16 @@ static void handler(void* obj, void* func, void* params) {
             }
         }
     }
-    // KILL-AURA: continuously report a headshot on EVERY valid enemy (no need to fire or aim). Throttled
-    // to aura_rate. This is the strongest / most detectable feature — reflection-guarded per target.
-    bool doAura = g_mei.master_enabled && g_mei.kill_aura;
-    bool doOnce = g_mei.act_killall;   // one-shot "Kill All" button
-    if (doOnce) {   // ARM the next real shot (server accepts hit-reg online only when a live bullet fired)
+    // KILL ALL: arm the next real shot. The kill-report ONLY goes out on an actual fire event (handled in
+    // the ProcessEvent fire path: report_all_bots(obj), throttled + de-duped + loaded-only). The old
+    // standalone sweep (report_all_bots(nullptr), no bullet, continuous) was BOTH the top ban vector AND a
+    // crash vector — an un-backed report on a marginal pawn crashes libUnreal's netcode on a deferred tick,
+    // uncatchable by our fault guard. Removed. kill_aura likewise now only reports while you're firing.
+    if (g_mei.act_killall) {
         g_mei.act_killall = false;
+        resolve_kill_classes();
         struct timespec ats; clock_gettime(CLOCK_MONOTONIC, &ats); g_killAllArmed = ats.tv_sec*1000 + ats.tv_nsec/1000000;
-        LOG("KILLALL: armed — pull the trigger once to blast everyone");
-    }
-    if (!g_in_pass && g_ready && fn_ReportHit && g_nbots && (doAura || doOnce)) {
-        resolve_kill_classes();        // AntiTank gun + 50Cal bullet (lazy, per-map)
-        static long last_aura = 0;
-        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-        long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-        long iv = (long)g_mei.aura_rate; if (iv < 40) iv = 40;
-        if (doOnce || ms - last_aura >= iv) {   // immediate sweep too (works OFFLINE; online it piggybacks the shot)
-            last_aura = ms;
-            g_in_pass = true;
-            report_all_bots(nullptr);
-            g_in_pass = false;
-        }
+        LOG("KILLALL: armed — pull the trigger once to blast every loaded enemy");
     }
     // world-space TextRender menu DISABLED: it doesn't render in this VR pipeline (like SetOverlay)
     // and hammering the FText system per-frame corrupted a UE background worker -> crash.
