@@ -34,6 +34,11 @@
 #include "mei/mei_settings.h"   // granular feature state (menu <-> core)
 #include "mei/mei_input.h"      // controller-ray -> ImGui cursor bridge
 #include "mei/mei_xr.h"         // OpenXR/Vulkan menu injection
+#include "mei/mei_esp.h"        // shared ESP entry buffer (we project, mei_xr draws)
+
+EspEntry     g_esp[MEI_ESP_MAX];
+volatile int g_esp_n = 0;
+float        g_esp_fov_used = 97.f;
 
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "PAVCHAMS", __VA_ARGS__)
 
@@ -671,6 +676,9 @@ static int32_t o_HeadBone = -2;                     // PavlovPawn::HeadBoneName 
 static int32_t bh_Target=0x00, bh_Hit=0x08, bh_Head=0x20, bh_Pen=0x21,
                bh_Bullet=0x28, bh_Gun=0x30, bh_Origin=0x38, bh_Bone=0x50, bh_Size=0x60;
 static bool    bh_resolved = false;
+// ---- ESP + TTT ----
+static void*   fn_ServerBuy = nullptr;              // APavlovPlayerController::ServerBuy(FName)
+static int32_t o_PawnPS = -2, o_PS_Name = -2, o_PawnHC = -2, o_HC_H = -2, o_HC_MH = -2, o_PS_Role = -2;
 static void* fn_GMChangeName = nullptr; static int32_t o_AuthGM = -1;   // GameModeBase::ChangeName (long names)
 static char g_wantName[64] = {0};                   // desired name from name.txt (direct-write spoof)
 static void* g_knife[6]; static int g_nknife = 0;   // knife throw UFunctions (homing-knife hook)
@@ -1139,6 +1147,19 @@ static void resolve_names() {
       }
       LOG("triggerkill: ReportHit=%p KillGun=%p KillBullet=%p HeadBone@%d struct=%p (Target@%d Hit@%d HS@%d Gun@%d Bullet@%d Origin@%d Bone@%d)",
           fn_ReportHit, c_KillGun, c_KillBullet, o_HeadBone, bhs, bh_Target, bh_Hit, bh_Head, bh_Gun, bh_Bullet, bh_Origin, bh_Bone);
+      // ESP + TTT plumbing: buy RPC, per-pawn PlayerState/HealthComponent, name, health, role field
+      fn_ServerBuy = cpvc ? find_func(cpvc, "ServerBuy") : nullptr;
+      o_PawnPS = c_PavlovPawn ? prop_offset(c_PavlovPawn, "PlayerState") : -1;
+      o_PawnHC = c_PavlovPawn ? prop_offset(c_PavlovPawn, "HealthComponent") : -1;
+      { void* cps = find_class("PlayerState"); o_PS_Name = cps ? prop_offset(cps, "PlayerNamePrivate") : -1; }
+      { void* chc = find_class("HealthComponent"); if (chc) { o_HC_H = prop_offset(chc, "Health"); o_HC_MH = prop_offset(chc, "MaxHealth"); } }
+      // TTT role: try a client-visible field on PavlovPlayerState (best-effort; server usually hides it)
+      { void* cps2 = find_class("PavlovPlayerState");
+        const char* rn[] = { "TTTRole", "RoleName", "Role", "CurrentRole", "PlayerRole" };
+        for (auto r : rn) { if (cps2) { int32_t o = prop_offset(cps2, r); if (o >= 0) { o_PS_Role = o; break; } } }
+        if (o_PS_Role < 0) o_PS_Role = -1; }
+      LOG("esp/ttt: ServerBuy=%p PawnPS@%d PawnHC@%d PSName@%d HC.H@%d HC.MH@%d PSRole@%d",
+          fn_ServerBuy, o_PawnPS, o_PawnHC, o_PS_Name, o_HC_H, o_HC_MH, o_PS_Role);
       void* cgm = find_class("GameModeBase");
       fn_GMChangeName = cgm ? find_func(cgm, "ChangeName") : nullptr;       // proper rename (any length, allocates)
       void* cw2 = find_class("World"); o_AuthGM = cw2 ? prop_offset(cw2, "AuthorityGameMode") : -1;
@@ -1714,6 +1735,9 @@ static void chams_pass() {
                     if (pc != devCls) { devCls = pc; g_devOff = prop_offset(pc, "bDev");   // re-resolve on class change only
                         LOG("devtag: PlayerState=%p class-changed bDev@%d", ps, g_devOff); }
                     g_myPS = ps; if (g_devOff >= 0) *(uint8_t*)((uint8_t*)ps + g_devOff) = (g_mei.master_enabled && g_mei.dev_tag) ? 1 : 0;
+                    // our own TTT role (client always knows its own) -> menu TTT tab
+                    if (o_PS_Role >= 0) { int32_t rid = *(int32_t*)((uint8_t*)ps + o_PS_Role);
+                        if (rid > 0) fname_to_str(rid, g_mei.my_role, sizeof g_mei.my_role); }
                     // NAME SPOOF: in-place write ONLY if our string fits the game's existing FString
                     // buffer (never change the Data pointer -> game still owns/frees it -> no crash).
                     static int32_t o_pn = -2; if (o_pn == -2) o_pn = prop_offset(pc, "PlayerNamePrivate");
@@ -2023,9 +2047,127 @@ static void report_hit(void* target, FVec head, void* heldGun) {
     g_ProcessEvent(pc, fn_ReportHit, p);
 }
 
+// read an FString (char16 data@0, num@8) at `off` on `obj` into an ascii buffer
+static void read_fstring(void* obj, int32_t off, char* out, int cap) {
+    out[0] = 0; if (off < 0 || !obj) return;
+    char16_t* d = *(char16_t**)((uint8_t*)obj + off);
+    int32_t cnt = *(int32_t*)((uint8_t*)obj + off + 8);
+    if (!d || !addr_readable((uintptr_t)d) || cnt <= 0) return;
+    int n = 0; for (int i = 0; i < cnt && n < cap-1 && d[i]; i++) { char c = (char)d[i]; if (c >= 32 && c < 127) out[n++] = c; }
+    out[n] = 0;
+}
+// TTT ServerBuy(FName): resolve the item's FName id and call the RPC on the local controller.
+static void do_buy(const char* itemName) {
+    if (!fn_ServerBuy || !itemName || !itemName[0]) return;
+    void* pc = local_controller();
+    if (!pc || !addr_readable((uintptr_t)pc) || !in_lib(*(uintptr_t*)pc)) return;
+    int32_t id = fname_find(itemName);        // find existing FName id for the equipment
+    if (id < 0) { LOG("buy: FName '%s' not found in pool", itemName); return; }
+    struct { int32_t id; int32_t num; } p{ id, 0 };   // FName param (comparison id + number)
+    g_ProcessEvent(pc, fn_ServerBuy, &p);
+    LOG("buy: ServerBuy('%s' id=%d)", itemName, id);
+}
+// ESP: project every enemy with the game's own camera into screen [0,1] + read name/health/team/role.
+static void esp_gather() {
+    if (!g_ready) { g_esp_n = 0; return; }
+    void* pc = local_controller();
+    if (!pc || !addr_readable((uintptr_t)pc)) { g_esp_n = 0; return; }
+    if (!fn_ViewPoint) fn_ViewPoint = find_func(obj_class(pc), "GetPlayerViewPoint");
+    if (!fn_ViewPoint) { g_esp_n = 0; return; }
+    uint8_t vp[64]; memset(vp, 0, sizeof vp);
+    g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; g_esp_n = 0; return; }
+    g_ProcessEvent(pc, fn_ViewPoint, vp); g_fguard = 0;
+    double* L = (double*)(vp + 0); double* R = (double*)(vp + 24);   // camera loc + rot
+    const double D2R = 0.017453292519943295;
+    double cyaw = R[1]*D2R, cpit = R[0]*D2R;
+    double cy = cos(cyaw), sy = sin(cyaw), cpp = cos(cpit), sp = sin(cpit);
+    FVec fwd{ cpp*cy, cpp*sy, sp }, right{ -sy, cy, 0 };
+    FVec up{ fwd.y*right.z - fwd.z*right.y, fwd.z*right.x - fwd.x*right.z, fwd.x*right.y - fwd.y*right.x };
+    double fovH = g_mei.esp_fov; if (fovH < 40) fovH = 40; if (fovH > 140) fovH = 140;
+    g_esp_fov_used = (float)fovH;
+    double tanH = tan(fovH*0.5*D2R), tanV = tanH / (double)MEI_ESP_ASPECT;
+    void* me = local_pawn();
+    int32_t myteam = (me && o_TeamId >= 0 && addr_readable((uintptr_t)me)) ? *(int32_t*)((uint8_t*)me + o_TeamId) : -1;
+    int cnt = 0;
+    for (int i = 0; i < g_nbots && cnt < MEI_ESP_MAX; i++) {
+        void* o = g_bots[i];
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+        if (!o || !addr_readable((uintptr_t)o) || o == me || !in_lib(*(uintptr_t*)o) ||
+            !cls_is_body(obj_class(o)) || pawn_dead(o)) { g_fguard = 0; continue; }
+        FVec feet = aim_getloc(o); FVec head = get_head(o);
+        if (head.x == 0 && head.y == 0 && head.z == 0) head = FVec{ feet.x, feet.y, feet.z + 180.0 };
+        // project a world point -> screen [0,1]; returns false if behind camera
+        auto proj = [&](FVec w, float* su, float* sv) -> bool {
+            FVec rel{ w.x - L[0], w.y - L[1], w.z - L[2] };
+            double x = rel.x*right.x + rel.y*right.y + rel.z*right.z;
+            double y = rel.x*up.x + rel.y*up.y + rel.z*up.z;
+            double z = rel.x*fwd.x + rel.y*fwd.y + rel.z*fwd.z;
+            if (z <= 1.0) return false;
+            *su = (float)(0.5 + (x/z)/(2.0*tanH));
+            *sv = (float)(0.5 - (y/z)/(2.0*tanV));
+            return true;
+        };
+        float fu, fv, hu, hv;
+        if (!proj(feet, &fu, &fv) || !proj(head, &hu, &hv)) { g_fguard = 0; continue; }
+        double dcm = sqrt((feet.x-L[0])*(feet.x-L[0]) + (feet.y-L[1])*(feet.y-L[1]) + (feet.z-L[2])*(feet.z-L[2]));
+        float distM = (float)(dcm / 100.0);   // UE units are cm
+        if (distM > g_mei.esp_max_dist) { g_fguard = 0; continue; }
+        EspEntry& e = g_esp[cnt];
+        e.u = fu; e.v = fv; e.uh = hu; e.vh = hv; e.dist = distM;
+        e.team = (o_TeamId >= 0) ? *(int32_t*)((uint8_t*)o + o_TeamId) : 0;
+        (void)myteam;
+        // name via PlayerState
+        e.name[0] = 0; e.role[0] = 0; e.credits = -1; e.health = -1.f;
+        void* ps = (o_PawnPS >= 0) ? *(void**)((uint8_t*)o + o_PawnPS) : nullptr;
+        if (ps && addr_readable((uintptr_t)ps) && in_lib(*(uintptr_t*)ps)) {
+            if (o_PS_Name >= 0) read_fstring(ps, o_PS_Name, e.name, sizeof e.name);
+            if (o_PS_Role >= 0) { int32_t rid = *(int32_t*)((uint8_t*)ps + o_PS_Role);
+                if (rid > 0) fname_to_str(rid, e.role, sizeof e.role); }
+        }
+        // health via HealthComponent
+        void* hc = (o_PawnHC >= 0) ? *(void**)((uint8_t*)o + o_PawnHC) : nullptr;
+        if (hc && addr_readable((uintptr_t)hc) && in_lib(*(uintptr_t*)hc) && o_HC_H >= 0 && o_HC_MH >= 0) {
+            float h = *(float*)((uint8_t*)hc + o_HC_H), mx = *(float*)((uint8_t*)hc + o_HC_MH);
+            if (mx > 0.f) { e.health = h/mx; if (e.health < 0) e.health = 0; if (e.health > 1) e.health = 1; }
+        }
+        e.valid = true; cnt++;
+        g_fguard = 0;
+    }
+    g_esp_n = cnt;
+}
+
 static void handler(void* obj, void* func, void* params) {
     // mei menu input feed (throttled inside; guarded against PE re-entry)
     if (!g_in_pass && g_ready) { g_in_pass = true; mei_feed_input(); g_in_pass = false; }
+    // ESP gather (~30 Hz) — project enemies for the overlay quad; consume the Buy action.
+    if (!g_in_pass && g_ready && g_mei.master_enabled) {
+        if (g_mei.act_buy) { g_mei.act_buy = false; g_in_pass = true; do_buy(g_mei.buy_name); g_in_pass = false; }
+        if (g_mei.esp_enabled) {
+            static long last_esp = 0; struct timespec ets; clock_gettime(CLOCK_MONOTONIC, &ets);
+            long ems = ets.tv_sec*1000 + ets.tv_nsec/1000000;
+            if (ems - last_esp >= 33) { last_esp = ems; g_in_pass = true; esp_gather(); g_in_pass = false; }
+        } else if (g_esp_n) g_esp_n = 0;
+    }
+    // AUTH DIAGNOSTIC: log the disconnect/kick RPC + any string reason param (the "cannot be verified"
+    // message the host sends when it rejects a player-hosted join).
+    if (g_ready && g_nkick) {
+        for (int k = 0; k < g_nkick; k++) if (g_kick[k] == func) {
+            char kn[64]; obj_name(func, kn, sizeof kn);
+            LOG("DISCONNECT RPC fired: '%s'", kn);
+            for (void* p = *(void**)((uint8_t*)func + USTRUCT_CHILDPROPS); addr_readable((uintptr_t)p);
+                 p = *(void**)((uint8_t*)p + FFIELD_NEXT_OFF)) {
+                char pn[48]; field_name(p, pn, sizeof pn);
+                int32_t po = *(int32_t*)((uint8_t*)p + FPROP_OFFSET_OFF);
+                void* pc = *(void**)((uint8_t*)p + 0x8); char pcn[40] = "?";
+                if (addr_readable((uintptr_t)pc)) { int32_t ni = *(int32_t*)pc; fname_to_str(ni, pcn, sizeof pcn); }
+                if (params && strstr(pcn, "Str")) { char rs[160]; read_fstring(params, po, rs, sizeof rs);
+                    LOG("  reason %s='%s'", pn, rs); }
+                else LOG("  param %s : %s @ %d", pn, pcn, po);
+                if (!*(void**)((uint8_t*)p + FFIELD_NEXT_OFF)) break;
+            }
+            break;
+        }
+    }
     // homing knife: mark the thrown knife on a throw call, then steer it per-PE toward nearest enemy
     if (g_ready && g_mei.master_enabled && g_mei.homing_knife && g_nknife) {
         for (int k = 0; k < g_nknife; k++) if (g_knife[k] == func) { g_thrownKnife = obj;
@@ -2150,8 +2292,31 @@ static void handler(void* obj, void* func, void* params) {
 // ===========================================================================
 //  boot
 // ===========================================================================
+// AUTH DIAGNOSTIC: list loaded libs that reveal the join-verification mechanism (EAC / attestation /
+// Meta platform / EOS). Tells us whether player-hosted join rejection is anti-cheat or EOS identity.
+static void log_auth_libs() {
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[512]; char seen[4096] = {0};
+    const char* keys[] = { "easyanti", "anticheat", "eac", "EOSSDK", "libEOSDK", "ovrplatform",
+                           "OVRPlugin", "oculus", "horizon", "attest", "integrity", "splash" };
+    while (fgets(line, sizeof line, f)) {
+        for (auto k : keys) {
+            const char* p = strstr(line, k);
+            if (p) { // log each matching lib basename once
+                char base[128] = {0}; const char* s = strrchr(line, '/'); if (!s) s = line; else s++;
+                int i = 0; while (s[i] && s[i] != '\n' && i < 127) { base[i] = s[i]; i++; } base[i] = 0;
+                if (!strstr(seen, base)) { strncat(seen, base, sizeof seen - strlen(seen) - 2); strcat(seen, "|");
+                    LOG("AUTH-LIB: %s", base); }
+                break;
+            }
+        }
+    }
+    fclose(f);
+}
 static void* boot(void*) {
     install_fault();
+    log_auth_libs();            // one-time: what verification libs are in the process?
     mei_load();                 // pull saved feature state (mei.cfg) before anything gates on it
     scan_maps();
     if (!g_base) { LOG("libUnreal not mapped yet"); return nullptr; }

@@ -3,6 +3,7 @@
 #include "imgui.h"
 #include "mei_menu.h"
 #include "mei_settings.h"
+#include "mei_esp.h"
 #include <cstdio>
 #include <cstring>
 #include <time.h>
@@ -128,6 +129,20 @@ static void tab_visuals(){
     Chk("Skip dead",&g_mei.chams_skip_dead);
     ImGui::EndDisabled();
     gb_end();
+    gb_begin("ESP OVERLAY");
+    Chk("Enabled",&g_mei.esp_enabled);
+    ImGui::BeginDisabled(!g_mei.esp_enabled);
+    Chk("Box",&g_mei.esp_box);
+    Chk("Name",&g_mei.esp_name);
+    Chk("Distance",&g_mei.esp_dist);
+    Chk("Health bar",&g_mei.esp_health);
+    Chk("Role",&g_mei.esp_role);
+    Chk("Crosshair",&g_mei.esp_crosshair);
+    Chk("FOV circle",&g_mei.esp_fov_circle);
+    Sl("Calibrate FOV",&g_mei.esp_fov,60.f,130.f,"%.0f");
+    Sl("Max distance",&g_mei.esp_max_dist,20.f,400.f,"%.0f m");
+    ImGui::EndDisabled();
+    gb_end();
 }
 static void tab_weapon(){
     gb_begin("RECOIL");
@@ -176,6 +191,34 @@ static void tab_player(){
     ImGui::EndDisabled();
     gb_end();
 }
+static void tab_ttt(){
+    gb_begin("YOU");
+    ImGui::Text("Role: %s", g_mei.my_role[0] ? g_mei.my_role : "?");
+    if (g_mei.my_credits >= 0) ImGui::Text("Credits: %d", g_mei.my_credits);
+    else ImGui::TextDisabled("Credits: ?");
+    gb_end();
+    gb_begin("PLAYERS");
+    int n = g_esp_n; if (n > MEI_ESP_MAX) n = MEI_ESP_MAX;
+    if (n == 0) ImGui::TextDisabled("(enable ESP and be in a match)");
+    for (int i = 0; i < n; i++) { EspEntry& e = g_esp[i];
+        ImGui::Text("%-14s %-9s %4.0fm", e.name[0] ? e.name : "player", e.role[0] ? e.role : "-", e.dist); }
+    gb_end();
+    gb_begin("BUY  (ServerBuy)");
+    ImGui::PushItemWidth(-1.f);
+    if (ImGui::InputText("##buy", g_mei.buy_name, MEI_NAME_MAX)) touched();
+    if (ImGui::IsItemActivated()) g_kb = true;   // auto-open keyboard
+    ImGui::PopItemWidth();
+    const char* presets[] = { "Radar","Disguiser","C4","Silenced","Defuser","BodyArmor","Teleporter","HealthStation" };
+    for (int i = 0; i < 8; i++) {
+        if (ImGui::Button(presets[i], ImVec2(150,38))) {
+            strncpy(g_mei.buy_name, presets[i], MEI_NAME_MAX-1); g_mei.buy_name[MEI_NAME_MAX-1]=0; g_mei.act_buy = true; }
+        if (i % 3 != 2) ImGui::SameLine();
+    }
+    ImGui::NewLine();
+    if (ImGui::Button("BUY", ImVec2(160,46))) g_mei.act_buy = true;
+    if (g_kb) { ImGui::Spacing(); keyboard(g_mei.buy_name, MEI_NAME_MAX); }
+    gb_end();
+}
 static void tab_config(){
     gb_begin("GENERAL");
     Chk("Master enable",&g_mei.master_enabled);
@@ -212,8 +255,8 @@ static void tab_config(){
 
 // ---- frame -------------------------------------------------------------------
 static int g_tab=0;
-static const char* TABS[]={"Aimbot","Visuals","Weapon","Movement","Player","Config"};
-static const int N_TABS=6;
+static const char* TABS[]={"Aimbot","Visuals","Weapon","Movement","Player","TTT","Config"};
+static const int N_TABS=7;
 
 void mei_menu_frame(int panel_w, int panel_h){
     float W=(float)panel_w, H=(float)panel_h;
@@ -266,7 +309,8 @@ void mei_menu_frame(int panel_w, int panel_h){
     ImGui::Indent(14.f); ImGui::PushItemWidth(-14.f); ImGui::Dummy(ImVec2(0,4));
     switch(g_tab){
         case 0: tab_aimbot(); break;   case 1: tab_visuals(); break;  case 2: tab_weapon(); break;
-        case 3: tab_movement(); break; case 4: tab_player(); break;   case 5: tab_config(); break;
+        case 3: tab_movement(); break; case 4: tab_player(); break;   case 5: tab_ttt(); break;
+        case 6: tab_config(); break;
     }
     ImGui::Dummy(ImVec2(0,12));
     ImGui::PopItemWidth(); ImGui::Unindent(14.f);

@@ -25,6 +25,16 @@ void mei_save() {
     fprintf(f, "chams_enabled %d\n",   s.chams_enabled);
     fprintf(f, "chams_team_color %d\n",s.chams_team_color);
     fprintf(f, "chams_highlight %d\n", s.chams_highlight);
+    fprintf(f, "esp_enabled %d\n",     s.esp_enabled);
+    fprintf(f, "esp_box %d\n",         s.esp_box);
+    fprintf(f, "esp_name %d\n",        s.esp_name);
+    fprintf(f, "esp_dist %d\n",        s.esp_dist);
+    fprintf(f, "esp_health %d\n",      s.esp_health);
+    fprintf(f, "esp_role %d\n",        s.esp_role);
+    fprintf(f, "esp_crosshair %d\n",   s.esp_crosshair);
+    fprintf(f, "esp_fov_circle %d\n",  s.esp_fov_circle);
+    fprintf(f, "esp_fov %.2f\n",       s.esp_fov);
+    fprintf(f, "esp_max_dist %.1f\n",  s.esp_max_dist);
     fprintf(f, "no_recoil %d\n",       s.no_recoil);
     fprintf(f, "perfect_accuracy %d\n",s.perfect_accuracy);
     fprintf(f, "rapid_fire %d\n",      s.rapid_fire);
@@ -70,6 +80,10 @@ void mei_load() {
         GF("aim_head_z", aim_head_z)
         GI("chams_enabled", chams_enabled) GI("chams_team_color", chams_team_color)
         GI("chams_highlight", chams_highlight)
+        GI("esp_enabled", esp_enabled) GI("esp_box", esp_box) GI("esp_name", esp_name)
+        GI("esp_dist", esp_dist) GI("esp_health", esp_health) GI("esp_role", esp_role)
+        GI("esp_crosshair", esp_crosshair) GI("esp_fov_circle", esp_fov_circle)
+        GF("esp_fov", esp_fov) GF("esp_max_dist", esp_max_dist)
         GI("no_recoil", no_recoil) GI("perfect_accuracy", perfect_accuracy)
         GI("rapid_fire", rapid_fire) GI("force_auto", force_auto) GI("no_reload", no_reload)
         GI("infinite_ammo", infinite_ammo) GI("trigger_kill", trigger_kill)

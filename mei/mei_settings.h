@@ -37,6 +37,18 @@ struct MeiSettings {
     bool  chams_highlight  = true;    // brighten the current aim target
     bool  chams_skip_dead  = true;    // never chams a corpse (keep true; cheap + correct)
 
+    // ---- ESP overlay (view-locked quad drawn by mei_xr from pavchams-projected positions) ----
+    bool  esp_enabled      = false;
+    bool  esp_box          = true;    // 2D box around each enemy
+    bool  esp_name         = true;    // player name
+    bool  esp_dist         = true;    // distance in metres
+    bool  esp_health       = true;    // health bar
+    bool  esp_role         = true;    // TTT role (where the client has it)
+    bool  esp_crosshair    = true;    // center crosshair dot
+    bool  esp_fov_circle   = true;    // draw the aimbot FOV cone as a circle
+    float esp_fov          = 97.0f;   // horizontal FOV (deg) used to project — calibrate to your headset
+    float esp_max_dist     = 200.0f;  // metres; hide entries beyond this
+
     // ---- Weapon ----
     bool  no_recoil        = true;
     bool  perfect_accuracy = true;
@@ -75,8 +87,14 @@ struct MeiSettings {
     bool  panel_custom     = false;   // user manually placed the panel -> skip auto front-anchor on open
     float panel_off[3]     = {0.f, 0.f, -0.85f};  // panel position in HEAD-LOCAL frame (metres); used when panel_custom
 
+    // ---- Buy (TTT ServerBuy) ----
+    char  buy_name[MEI_NAME_MAX] = {0};   // equipment FName to buy
+    int   my_credits             = -1;    // last-read local credits (display only, -1 = unknown)
+    char  my_role[12]            = {0};   // last-read local role (display only)
+
     // ---- one-shot actions (menu sets true, worker consumes + clears) ----
     volatile bool act_dump_sdk       = false;
+    volatile bool act_buy            = false;   // ServerBuy(buy_name) now
     volatile bool act_dump_whitelist = false;
     volatile bool act_save           = false;   // force persist now
     volatile bool act_replace        = false;   // re-anchor the panel in front of the head now (Reset position)

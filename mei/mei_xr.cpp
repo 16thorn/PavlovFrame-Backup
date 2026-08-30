@@ -31,12 +31,14 @@
 #include "mei_input.h"
 #include "mei_settings.h"
 #include "mei_xr.h"
+#include "mei_esp.h"
 
 #include <dlfcn.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 #include <time.h>
 #include <math.h>
@@ -77,6 +79,20 @@ static bool g_gfx_captured = false;   // vk handles + session valid
 static bool g_inited       = false;   // full backend up
 static bool g_failed       = false;   // gave up (log once)
 static double g_last_time  = 0.0;
+static ImGuiContext* g_menuCtx = nullptr;   // the menu's ImGui context
+
+// ---- ESP overlay: a SECOND view-locked quad with its own swapchain + ImGui context ----
+static const uint32_t ESP_W = 1280, ESP_H = 800;   // aspect must match MEI_ESP_ASPECT (1.6)
+static XrSwapchain    g_espSwap = XR_NULL_HANDLE;
+static std::vector<VkImage>       g_espImages;
+static std::vector<VkImageView>   g_espViews;
+static std::vector<VkFramebuffer> g_espFbs;
+static VkDescriptorPool g_espDpool = VK_NULL_HANDLE;
+static std::vector<VkCommandBuffer> g_espCmds;
+static std::vector<VkFence>         g_espFences;
+static ImGuiContext*  g_espCtx = nullptr;
+static bool           g_espInited = false, g_espFailed = false;
+static uint32_t       g_espSlot = 0;
 
 // cached per-frame OpenXR PFNs (resolved once; no loader string-walk on the compositor thread)
 static PFN_xrAcquireSwapchainImage  pfn_xrAcquire = nullptr;
@@ -319,7 +335,7 @@ static bool ensure_init() {
     if (!make_vk_objects()){ g_failed = true; return false; }
 
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    g_menuCtx = ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;                 // no disk ini
     io.DisplaySize = ImVec2((float)g_swapW, (float)g_swapH);
@@ -540,6 +556,136 @@ static void render_frame(XrTime displayTime) {
 }
 
 // ============================================================================
+//  ESP overlay surface (second view-locked quad, own swapchain + ImGui context)
+// ============================================================================
+static bool esp_ensure_init() {
+    if (g_espInited) return true;
+    if (g_espFailed || !g_gfx_captured || !g_inited) return false;   // needs the menu backend (g_rp/g_cpool/format)
+    PFN_xrCreateSwapchain mkSc; PFN_xrEnumerateSwapchainImages enumSc;
+    if (!xr_get("xrCreateSwapchain",&mkSc) || !xr_get("xrEnumerateSwapchainImages",&enumSc)) { g_espFailed=true; return false; }
+    XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    ci.usageFlags=XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT|XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    ci.format=g_swapFmt; ci.sampleCount=1; ci.width=ESP_W; ci.height=ESP_H; ci.faceCount=1; ci.arraySize=1; ci.mipCount=1;
+    if (XR_FAILED(mkSc(g_session,&ci,&g_espSwap))) { g_espFailed=true; XLOG("esp xrCreateSwapchain failed"); return false; }
+    uint32_t n=0; enumSc(g_espSwap,0,&n,nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n,{XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    enumSc(g_espSwap,n,&n,(XrSwapchainImageBaseHeader*)imgs.data());
+    g_espImages.clear(); for(auto&im:imgs) g_espImages.push_back(im.image);
+    for (VkImage img : g_espImages) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image=img; vi.viewType=VK_IMAGE_VIEW_TYPE_2D; vi.format=(VkFormat)g_swapFmt;
+        vi.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+        VkImageView v; check(vkCreateImageView(g_vkDev,&vi,nullptr,&v),"esp view"); g_espViews.push_back(v);
+        VkFramebufferCreateInfo fi{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fi.renderPass=g_rp; fi.attachmentCount=1; fi.pAttachments=&v; fi.width=ESP_W; fi.height=ESP_H; fi.layers=1;
+        VkFramebuffer fb; check(vkCreateFramebuffer(g_vkDev,&fi,nullptr,&fb),"esp fb"); g_espFbs.push_back(fb);
+    }
+    VkDescriptorPoolSize sz{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,8};
+    VkDescriptorPoolCreateInfo dp{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dp.flags=VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; dp.maxSets=8; dp.poolSizeCount=1; dp.pPoolSizes=&sz;
+    check(vkCreateDescriptorPool(g_vkDev,&dp,nullptr,&g_espDpool),"esp dpool");
+    uint32_t N=(uint32_t)g_espImages.size(); if(N==0){ g_espFailed=true; return false; }
+    g_espCmds.resize(N); g_espFences.resize(N);
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool=g_cpool; ai.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount=N;
+    check(vkAllocateCommandBuffers(g_vkDev,&ai,g_espCmds.data()),"esp cmds");
+    VkFenceCreateInfo ff{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; ff.flags=VK_FENCE_CREATE_SIGNALED_BIT;
+    for(uint32_t i=0;i<N;i++) check(vkCreateFence(g_vkDev,&ff,nullptr,&g_espFences[i]),"esp fence");
+
+    g_espCtx = ImGui::CreateContext();
+    ImGui::SetCurrentContext(g_espCtx);
+    ImGuiIO& io=ImGui::GetIO(); io.IniFilename=nullptr; io.DisplaySize=ImVec2((float)ESP_W,(float)ESP_H);
+    io.Fonts->AddFontDefault();
+    ImGui_ImplVulkan_InitInfo ii{};
+    ii.Instance=g_vkInst; ii.PhysicalDevice=g_vkPhys; ii.Device=g_vkDev; ii.QueueFamily=g_vkQF; ii.Queue=g_vkQueue;
+    ii.DescriptorPool=g_espDpool; ii.RenderPass=g_rp; ii.MinImageCount=N; ii.ImageCount=N; ii.MSAASamples=VK_SAMPLE_COUNT_1_BIT;
+    bool ok = ImGui_ImplVulkan_Init(&ii);
+    if(ok) ImGui_ImplVulkan_CreateFontsTexture();
+    ImGui::SetCurrentContext(g_menuCtx);
+    if(!ok){ g_espFailed=true; XLOG("esp ImGui_ImplVulkan_Init failed"); return false; }
+    g_espInited=true; XLOG("esp overlay up: %ux%u images=%u", ESP_W, ESP_H, N);
+    return true;
+}
+
+// draw the ESP into the CURRENT (esp) context's background draw-list
+static void esp_draw() {
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    ImFont* font = ImGui::GetFont();
+    const float W=(float)ESP_W, H=(float)ESP_H;
+    if (g_mei.esp_crosshair) {
+        float cx=W*0.5f, cy=H*0.5f; ImU32 c=IM_COL32(255,255,255,230);
+        dl->AddLine(ImVec2(cx-11,cy),ImVec2(cx+11,cy),c,1.6f);
+        dl->AddLine(ImVec2(cx,cy-11),ImVec2(cx,cy+11),c,1.6f);
+    }
+    if (g_mei.esp_fov_circle && g_mei.aim_enabled) {
+        const double D2R=0.017453292519943295;
+        double ta=tan((g_mei.aim_fov*0.5)*D2R), tf=tan((g_esp_fov_used*0.5)*D2R);
+        float r=(float)((ta/tf)*(W*0.5)); if(r<4)r=4; if(r>H)r=H;
+        dl->AddCircle(ImVec2(W*0.5f,H*0.5f), r, IM_COL32(255,255,255,90), 48, 1.4f);
+    }
+    int n=g_esp_n; if(n>MEI_ESP_MAX)n=MEI_ESP_MAX;
+    for(int i=0;i<n;i++){
+        EspEntry&e=g_esp[i]; if(!e.valid) continue;
+        float fx=e.u*W, fy=e.v*H, hx=e.uh*W, hy=e.vh*H;
+        float boxH=fy-hy; if(boxH<6) boxH=6; float boxW=boxH*0.42f;
+        float cx=(fx+hx)*0.5f, left=cx-boxW*0.5f, right=cx+boxW*0.5f, top=hy, bot=fy;
+        ImU32 col = e.team==0 ? IM_COL32(80,170,255,255) : IM_COL32(255,90,90,255);
+        if(e.role[0]){ if(strstr(e.role,"raitor")) col=IM_COL32(255,60,60,255);
+            else if(strstr(e.role,"etective")) col=IM_COL32(60,120,255,255);
+            else col=IM_COL32(120,230,120,255); }
+        if(g_mei.esp_box){ dl->AddRect(ImVec2(left-1,top-1),ImVec2(right+1,bot+1),IM_COL32(0,0,0,200),0,0,3.f);
+            dl->AddRect(ImVec2(left,top),ImVec2(right,bot),col,0,0,1.5f); }
+        if(g_mei.esp_health && e.health>=0.f){ float bx=left-6.f;
+            dl->AddRectFilled(ImVec2(bx-2,top),ImVec2(bx+2,bot),IM_COL32(0,0,0,200));
+            float hh=(bot-top)*e.health; ImU32 hc=IM_COL32((int)(255*(1.f-e.health)),(int)(255*e.health),40,255);
+            dl->AddRectFilled(ImVec2(bx-1,bot-hh),ImVec2(bx+1,bot),hc); }
+        char t1[56]=""; int tn=0;
+        if(g_mei.esp_name && e.name[0]) tn+=snprintf(t1+tn,sizeof t1-tn,"%s",e.name);
+        if(g_mei.esp_role && e.role[0]) tn+=snprintf(t1+tn,sizeof t1-tn," [%s]",e.role);
+        if(t1[0]){ ImVec2 ts=font->CalcTextSizeA(20,FLT_MAX,0,t1);
+            dl->AddText(font,20,ImVec2(cx-ts.x*0.5f+1,top-23),IM_COL32(0,0,0,220),t1);
+            dl->AddText(font,20,ImVec2(cx-ts.x*0.5f,top-24),col,t1); }
+        if(g_mei.esp_dist){ char db[24]; snprintf(db,sizeof db,"%.0fm",e.dist);
+            ImVec2 ts=font->CalcTextSizeA(18,FLT_MAX,0,db);
+            dl->AddText(font,18,ImVec2(cx-ts.x*0.5f+1,bot+4),IM_COL32(0,0,0,220),db);
+            dl->AddText(font,18,ImVec2(cx-ts.x*0.5f,bot+3),IM_COL32(230,230,230,255),db); }
+    }
+}
+
+static void esp_render(XrTime) {
+    if(!g_espInited || !pfn_xrAcquire || !pfn_xrWait || !pfn_xrRelease) return;
+    static bool have=false; static uint32_t aidx=0; uint32_t idx=0;
+    if(!have){ XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+        if(XR_FAILED(pfn_xrAcquire(g_espSwap,&ai,&idx))) return; aidx=idx; have=true; } else idx=aidx;
+    XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; wi.timeout=5000000;
+    XrResult wr=pfn_xrWait(g_espSwap,&wi);
+    if(wr==XR_TIMEOUT_EXPIRED) return;
+    if(wr!=XR_SUCCESS){ have=false; return; }
+    have=false;
+    if(idx>=g_espFbs.size()){ XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}; pfn_xrRelease(g_espSwap,&ri); return; }
+    uint32_t N=(uint32_t)g_espFences.size(); uint32_t slot=g_espSlot%N;
+    vkWaitForFences(g_vkDev,1,&g_espFences[slot],VK_TRUE,UINT64_MAX); vkResetFences(g_vkDev,1,&g_espFences[slot]);
+    ImGui::SetCurrentContext(g_espCtx);
+    ImGuiIO& io=ImGui::GetIO(); io.DisplaySize=ImVec2((float)ESP_W,(float)ESP_H); io.DeltaTime=1.f/72.f;
+    ImGui_ImplVulkan_NewFrame(); ImGui::NewFrame();
+    esp_draw();
+    ImGui::Render(); ImDrawData* dd=ImGui::GetDrawData();
+    VkCommandBuffer cmd=g_espCmds[slot]; vkResetCommandBuffer(cmd,0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd,&bi);
+    VkClearValue cl{}; cl.color={{0,0,0,0}};
+    VkRenderPassBeginInfo rpi{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO}; rpi.renderPass=g_rp; rpi.framebuffer=g_espFbs[idx];
+    rpi.renderArea.extent={ESP_W,ESP_H}; rpi.clearValueCount=1; rpi.pClearValues=&cl;
+    vkCmdBeginRenderPass(cmd,&rpi,VK_SUBPASS_CONTENTS_INLINE);
+    ImGui_ImplVulkan_RenderDrawData(dd,cmd);
+    vkCmdEndRenderPass(cmd); vkEndCommandBuffer(cmd);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&cmd;
+    vkQueueSubmit(g_vkQueue,1,&si,g_espFences[slot]); g_espSlot++;
+    XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}; pfn_xrRelease(g_espSwap,&ri);
+    ImGui::SetCurrentContext(g_menuCtx);
+}
+
+// ============================================================================
 //  injected input action set  (real controller buttons: R-trigger click, L-stick toggle)
 // ============================================================================
 static XrPath xr_path(const char* s) {
@@ -641,39 +787,51 @@ static XrResult XRAPI_PTR hk_xrEndFrame(XrSession session, const XrFrameEndInfo*
     // Build the backend EAGERLY (before first open) so opening the menu never hitches on the
     // one-time swapchain/pipeline/font-texture creation. Runs on this (render) thread, as required.
     if (g_gfx_captured && !g_inited && !g_failed) ensure_init();
+    // ESP backend up eagerly when enabled (never blocks the menu path)
+    if (g_gfx_captured && g_inited && g_mei.esp_enabled && !g_espInited && !g_espFailed) esp_ensure_init();
 
-    if (!g_mei.menu_open || !info || !g_inited) return real_xrEndFrame(session, info);
+    if (!info) return real_xrEndFrame(session, info);
 
-    render_frame(info->displayTime);
-
-    // build our quad layer (VIEW space, in front of the face)
-    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    // ImGui outputs STRAIGHT (non-premultiplied) alpha -> the unpremultiplied bit is required or the
-    // compositor darkens every alpha<1 texel (washed-out panel). Chromatic-aberration bit is deprecated.
-    quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
-                      XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
-    // world-locked: anchored in LOCAL space at the pose captured when the menu opened (stays put as
-    // you look around / walk). Falls back to VIEW space if LOCAL never came up.
-    quad.space = (g_localspace != XR_NULL_HANDLE) ? g_localspace : g_viewspace;
-    quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
-    quad.subImage.swapchain = g_swap;
-    quad.subImage.imageRect.offset = { 0, 0 };
-    quad.subImage.imageRect.extent = { (int32_t)g_swapW, (int32_t)g_swapH };
-    quad.subImage.imageArrayIndex = 0;
-    if (g_localspace != XR_NULL_HANDLE) { quad.pose = g_panelPose; }
-    else { quad.pose.orientation = { 0,0,0,1 }; quad.pose.position = { 0.f, 0.f, -g_mei.panel_dist }; }
-    quad.size = { g_panel_wm, g_panel_hm };
-
-    // append our quad to the app's layer list using a REUSED scratch buffer (no per-frame malloc).
-    // Quest caps composition layers at 16; guard against overflow.
-    static const XrCompositionLayerBaseHeader* scratch[32];
-    uint32_t nc = info->layerCount;
-    if (nc > 31) nc = 31;                       // leave room for ours; never overflow
+    static const XrCompositionLayerBaseHeader* scratch[34];
+    uint32_t nc = info->layerCount; if (nc > 32) nc = 32;
     for (uint32_t i = 0; i < nc; i++) scratch[i] = info->layers[i];
-    scratch[nc] = (const XrCompositionLayerBaseHeader*)&quad;
+    uint32_t extra = 0;
 
+    // ESP overlay quad FIRST (composited UNDER the menu). VIEW space, full-FOV, transparent.
+    XrCompositionLayerQuad espQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    if (g_mei.esp_enabled && g_espInited) {
+        esp_render(info->displayTime);
+        const double D2R = 0.017453292519943295;
+        float wm = (float)(2.0 * tan((g_esp_fov_used*0.5)*D2R) * 1.0);   // spans esp_fov at 1 m
+        float hm = wm / MEI_ESP_ASPECT;
+        espQuad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+        espQuad.space = g_viewspace; espQuad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        espQuad.subImage.swapchain = g_espSwap; espQuad.subImage.imageRect.offset = { 0, 0 };
+        espQuad.subImage.imageRect.extent = { (int32_t)ESP_W, (int32_t)ESP_H }; espQuad.subImage.imageArrayIndex = 0;
+        espQuad.pose.orientation = { 0,0,0,1 }; espQuad.pose.position = { 0.f, 0.f, -1.0f };
+        espQuad.size = { wm, hm };
+        scratch[nc + extra++] = (const XrCompositionLayerBaseHeader*)&espQuad;
+    }
+
+    // Menu quad (world-locked, ON TOP).
+    XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+    if (g_mei.menu_open && g_inited) {
+        ImGui::SetCurrentContext(g_menuCtx);
+        render_frame(info->displayTime);
+        quad.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+        quad.space = (g_localspace != XR_NULL_HANDLE) ? g_localspace : g_viewspace;
+        quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        quad.subImage.swapchain = g_swap; quad.subImage.imageRect.offset = { 0, 0 };
+        quad.subImage.imageRect.extent = { (int32_t)g_swapW, (int32_t)g_swapH }; quad.subImage.imageArrayIndex = 0;
+        if (g_localspace != XR_NULL_HANDLE) { quad.pose = g_panelPose; }
+        else { quad.pose.orientation = { 0,0,0,1 }; quad.pose.position = { 0.f, 0.f, -g_mei.panel_dist }; }
+        quad.size = { g_panel_wm, g_panel_hm };
+        scratch[nc + extra++] = (const XrCompositionLayerBaseHeader*)&quad;
+    }
+
+    if (extra == 0) return real_xrEndFrame(session, info);
     XrFrameEndInfo mod = *info;
-    mod.layerCount = nc + 1;
+    mod.layerCount = nc + extra;
     mod.layers = scratch;
     return real_xrEndFrame(session, &mod);
 }
