@@ -732,6 +732,18 @@ static void* get_item(void* pawn, void* cls) {
     g_ProcessEvent(pawn, fn_GetItem, &p);
     return p.Ret;
 }
+// ONLINE-ROBUST held gun. GetItemOfClass returns null online on this build, so fall back to the last
+// gun we saw actually FIRE (captured in the handler fire-path — unambiguously the weapon in your hand).
+static void* g_heldGun = nullptr;
+static void* resolve_gun(void* pawn) {
+    void* gun = get_item(pawn, c_Gun);
+    if (!gun || !addr_readable((uintptr_t)gun)) gun = get_item(pawn, c_VRGun);
+    if (gun && addr_readable((uintptr_t)gun) && in_lib(*(uintptr_t*)gun)) return gun;
+    // fallback: the last-fired gun, re-validated (still a live VRGun in the engine)
+    if (g_heldGun && addr_readable((uintptr_t)g_heldGun) && in_lib(*(uintptr_t*)g_heldGun)
+        && c_VRGun && is_a(g_heldGun, c_VRGun)) return g_heldGun;
+    return nullptr;
+}
 // zero the four recoil/spread floats on the local held gun (offsets by name, per gun class)
 // magazine ammo offsets (VRMagazine::Bullets/MaxBullets), resolved once from a live mag's class
 static int32_t g_magBul = -1, g_magMax = -1;
@@ -741,8 +753,8 @@ static void* g_ammoGun = nullptr; static int32_t g_ammoMagOff = -1, g_ammoBIC = 
 static void keep_loaded() { /* infinite ammo removed (broke cocking) */ }
 // movement (PavlovMovementComponent) — the pawn has no reflected pointer to it, so find the
 // instance whose Outer == our pawn. Cached per pawn (only re-scans on respawn/match change).
-static int32_t g_mSprint = -1, g_mAds = -1, g_mWalk = -1;
-static void* g_walkComp = nullptr; static float g_walkOrig = 0.f;
+static int32_t g_mSprint = -1, g_mAds = -1, g_mWalk = -1, g_mCrouch = -1;
+static void* g_walkComp = nullptr; static float g_walkOrig = 0.f, g_crouchOrig = 0.f;
 static float g_mSprintOrig = -1.f, g_mAdsOrig = -1.f;   // originals (restore when movement disabled)
 static void* g_mcPawn = nullptr; static void* g_mc = nullptr;
 static void* g_myPS = nullptr; static int32_t g_devOff = -2;   // local PlayerState + bDev (self-view dev tag; -2=unresolved)
@@ -755,6 +767,13 @@ static void keep_god() {   // no-damage + pin health; per-PE so a hit can't slip
 }
 static void* find_movecomp(void* pawn) {
     if (pawn == g_mcPawn && g_mc && addr_readable((uintptr_t)g_mc)) return g_mc;
+    // The scan below walks the whole object array. On death/respawn the cache misses, so without a
+    // throttle chams_pass (10Hz) re-scans every tick -> post-death lag. Cap the rescan to ~3Hz.
+    static long last_scan = 0;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (ms - last_scan < 350) return g_mc;   // between attempts: keep last (may be null), don't scan
+    last_scan = ms;
     static void* mcClass = nullptr;
     if (!mcClass) mcClass = find_class("PavlovMovementComponent");
     g_mcPawn = pawn; g_mc = nullptr;
@@ -777,11 +796,13 @@ static void apply_speed() {
     if (g_mei.master_enabled && g_mei.move_enabled) {             // ON: cheat speeds
         if (g_mSprint >= 0) *(float*)((uint8_t*)mc + g_mSprint) = g_mei.move_sprint;
         if (g_mAds    >= 0) *(float*)((uint8_t*)mc + g_mAds)    = g_mei.move_ads;
-        if (g_mWalk >= 0 && g_walkOrig > 0.f) *(float*)((uint8_t*)mc + g_mWalk) = g_walkOrig * g_mei.move_walk;
+        if (g_mWalk   >= 0 && g_walkOrig   > 0.f) *(float*)((uint8_t*)mc + g_mWalk)   = g_walkOrig   * g_mei.move_walk;
+        if (g_mCrouch >= 0 && g_crouchOrig > 0.f) *(float*)((uint8_t*)mc + g_mCrouch) = g_crouchOrig * g_mei.move_crouch;
     } else {                                                      // OFF: restore captured originals
         if (g_mSprint >= 0 && g_mSprintOrig >= 0.f) *(float*)((uint8_t*)mc + g_mSprint) = g_mSprintOrig;
         if (g_mAds    >= 0 && g_mAdsOrig    >= 0.f) *(float*)((uint8_t*)mc + g_mAds)    = g_mAdsOrig;
         if (g_mWalk   >= 0 && g_walkOrig    >  0.f) *(float*)((uint8_t*)mc + g_mWalk)   = g_walkOrig;
+        if (g_mCrouch >= 0 && g_crouchOrig  >  0.f) *(float*)((uint8_t*)mc + g_mCrouch) = g_crouchOrig;
     }
 }
 // resolve the "Automatic/FullAuto" value of the gun FireMode enum (UEnum Names@0x40 num@0x48). Cached.
@@ -817,8 +838,7 @@ static void do_norecoil(void* pawn) {
     static float o_rs[48], o_olsm[48], o_rt[48], o_rm[48], o_ra[48], o_orpb[48], o_ofr[48], o_ofd[48], o_obd[48], o_orc[48], o_omrc[48];
     static uint8_t o_ofm[48];
     static int rn = 0;
-    void* gun = get_item(pawn, c_Gun);
-    if (!gun || !addr_readable((uintptr_t)gun)) gun = get_item(pawn, c_VRGun);
+    void* gun = resolve_gun(pawn);   // online-robust (get_item or last-fired gun fallback)
     if (!gun || !addr_readable((uintptr_t)gun) || !in_lib(*(uintptr_t*)gun)) return;
     void* gc = obj_class(gun);
     int ci = 0; for (; ci < rn; ci++) if (rcls[ci] == gc) break;
@@ -874,72 +894,59 @@ static void do_norecoil(void* pawn) {
                 else if (*fr >= 5.f) *fr = 1200.f;            // rounds/min -> high (faster)
             }
         } else { wf(gun, ofd[ci], o_ofd[ci]); wf(gun, obd[ci], o_obd[ci]); wf(gun, ofr[ci], o_ofr[ci]); }
-        // auto-fire: force FireMode to Automatic when ON, restore the original fire mode when OFF.
+        // auto-fire: force FireMode to Automatic when ON. Apply-only (do NOT restore the byte enum, and
+        // NEVER touch cocking/bolt) — the known-good build did exactly this; restoring FireMode from a
+        // snapshot was a new write that could brick the gun's fire state on spawn.
         if (f_auto && ofm[ci] >= 0) {
             int av = fire_auto_value(); if (av >= 0) *(uint8_t*)((uint8_t*)gun + ofm[ci]) = (uint8_t)av; }
-        else if (!f_auto) wb(gun, ofm[ci], o_ofm[ci]);
-        (void)odc; (void)obl; (void)ocl; (void)olb; (void)obta; (void)obic;
+        (void)odc; (void)obl; (void)ocl; (void)olb; (void)obta; (void)obic; (void)omag; (void)g_magBul; (void)g_magMax;
         // no-reload: zero cooldowns when ON, restore originals when OFF
         if (f_nrl) { wf(gun, orc[ci], 0.f); wf(gun, omrc[ci], 0.f); }
         else       { wf(gun, orc[ci], o_orc[ci]); wf(gun, omrc[ci], o_omrc[ci]); }
-        // infinite ammo (PC reference: Magazine->Bullets = MaxBullets). Purely a top-up; no chamber/bolt.
-        if (M && g_mei.infinite_ammo && omag[ci] >= 0) {
-            void* mag = *(void**)((uint8_t*)gun + omag[ci]);
-            if (mag && addr_readable((uintptr_t)mag) && in_lib(*(uintptr_t*)mag)) {
-                if (g_magBul < 0) { void* mgc = obj_class(mag);
-                    g_magBul = prop_offset(mgc, "Bullets"); g_magMax = prop_offset(mgc, "MaxBullets");
-                    LOG("mag: Bullets@%d MaxBullets@%d", g_magBul, g_magMax); }
-                if (g_magBul >= 0 && g_magMax >= 0) {
-                    int32_t mx = *(int32_t*)((uint8_t*)mag + g_magMax);
-                    if (mx > 0 && mx < 10000) *(int32_t*)((uint8_t*)mag + g_magBul) = mx;
-                }
-            }
-        }
-        // publish for the per-PE keep_loaded() (only while rapid/auto wants a topped mag)
-        if (f_rapid || f_auto) { g_ammoGun = gun; g_ammoMagOff = omag[ci]; g_ammoBIC = obic[ci]; }
-        // movement speed. Only SCAN for the movecomp when the feature is ON (the scan is expensive and
-        // re-fires on respawn -> post-death lag). When OFF, restore via the cached component only if
-        // it's still the same live pawn; a respawn drops the cache and the game resets speeds anyway.
-        void* mc = nullptr;
-        if (g_mei.master_enabled && g_mei.move_enabled) mc = find_movecomp(pawn);
-        else if (g_mc && g_mcPawn == pawn && addr_readable((uintptr_t)g_mc) && in_lib(*(uintptr_t*)g_mc)) mc = g_mc;
-        static int mdbg = 0; if (mdbg++ < 3) LOG("move dbg: mc=%p", mc);
-        if (mc && addr_readable((uintptr_t)mc) && in_lib(*(uintptr_t*)mc)) {
-            if (g_mSprint == -1) { void* mcc = obj_class(mc);
-                g_mSprint = prop_offset(mcc, "SprintSpeedMultiplier");
-                g_mAds    = prop_offset(mcc, "ADSSpeedMultiplier");
-                g_mWalk   = prop_offset(mcc, "MaxWalkSpeed");
-                char mcn[48]; obj_name(mcc, mcn, sizeof mcn);
-                LOG("move: class '%s' sprint@%d ads@%d walk@%d", mcn, g_mSprint, g_mAds, g_mWalk);
-            }
-            if (mc != g_walkComp) {   // capture ORIGINALS once per component (for restore)
-                g_walkComp = mc;
-                if (g_mWalk >= 0)   { float w = *(float*)((uint8_t*)mc + g_mWalk);   g_walkOrig   = (w>20.f&&w<4000.f)?w:0.f; }
-                if (g_mSprint >= 0) g_mSprintOrig = *(float*)((uint8_t*)mc + g_mSprint);
-                if (g_mAds >= 0)    g_mAdsOrig    = *(float*)((uint8_t*)mc + g_mAds);
-            }
-            apply_speed();   // writes cheat speeds if enabled, else restores originals
-        }
-        // godmode: resolve the health component + offsets. Resolve it EVEN WHEN OFF so we can restore
-        // the original DamageMultiplier (else you stay invincible after disabling).
-        static int32_t o_hcp = -2; static float g_hcDmgOrig = -1.f;
-        {
-        if (o_hcp == -2) o_hcp = prop_offset(obj_class(pawn), "HealthComponent");
-        if (o_hcp >= 0) { void* hc = *(void**)((uint8_t*)pawn + o_hcp);
-            if (hc && addr_readable((uintptr_t)hc) && in_lib(*(uintptr_t*)hc)) {
-                if (g_hcDmg == -2) { void* c = obj_class(hc);
-                    g_hcDmg = prop_offset(c, "DamageMultiplier");
-                    g_hcH   = prop_offset(c, "Health");
-                    g_hcMH  = prop_offset(c, "MaxHealth");
-                    if (g_hcDmg >= 0) g_hcDmgOrig = *(float*)((uint8_t*)hc + g_hcDmg);   // capture original
-                    LOG("god: hc=%p dm@%d h@%d mh@%d orig=%.2f", hc, g_hcDmg, g_hcH, g_hcMH, g_hcDmgOrig); }
-                if (M && g_mei.godmode) { g_hc = hc; keep_god(); }
-                else { g_hc = nullptr;                                    // restore original damage taken
-                    if (g_hcDmg >= 0) *(float*)((uint8_t*)hc + g_hcDmg) = (g_hcDmgOrig >= 0.f ? g_hcDmgOrig : 1.f); }
-            }
-        } else g_hc = nullptr;
-        }   // end else (godmode enabled)
+        // INFINITE AMMO REMOVED — writing Magazine->Bullets derefs a sub-object and corrupts gun state on
+        // spawn (crash on join). The known-good build removed it for exactly this reason ("bricked cocking").
+        g_ammoGun = nullptr;
     }
+    // movement + godmode moved OUT to do_movement()/do_godmode() so they work with NO weapon held.
+}
+
+// MOVEMENT: apply speeds on the pawn's PavlovMovementComponent — runs on `me` regardless of a held gun.
+static void do_movement(void* pawn) {
+    void* mc = nullptr;
+    if (g_mei.master_enabled && g_mei.move_enabled) mc = find_movecomp(pawn);   // scan throttled inside
+    else if (g_mc && g_mcPawn == pawn && addr_readable((uintptr_t)g_mc) && in_lib(*(uintptr_t*)g_mc)) mc = g_mc;
+    static int dbg = 0;
+    if (!mc || !addr_readable((uintptr_t)mc) || !in_lib(*(uintptr_t*)mc)) {
+        if (dbg++ < 12) LOG("move: NO movecomp (mc=%p pawn=%p move_enabled=%d)", mc, pawn, g_mei.move_enabled);
+        return; }
+    if (g_mSprint == -1) { void* mcc = obj_class(mc);
+        g_mSprint = prop_offset(mcc, "SprintSpeedMultiplier");
+        g_mAds    = prop_offset(mcc, "ADSSpeedMultiplier");
+        g_mWalk   = prop_offset(mcc, "MaxWalkSpeed");
+        g_mCrouch = prop_offset(mcc, "MaxWalkSpeedCrouched");
+        char mcn[48]; obj_name(mcc, mcn, sizeof mcn);
+        LOG("move: class '%s' sprint@%d ads@%d walk@%d crouch@%d", mcn, g_mSprint, g_mAds, g_mWalk, g_mCrouch); }
+    if (mc != g_walkComp) {   // capture ORIGINALS once per component (for restore)
+        g_walkComp = mc;
+        if (g_mWalk   >= 0) { float w = *(float*)((uint8_t*)mc + g_mWalk);   g_walkOrig   = (w>1.f&&w<20000.f)?w:0.f; }
+        if (g_mCrouch >= 0) { float w = *(float*)((uint8_t*)mc + g_mCrouch); g_crouchOrig = (w>1.f&&w<20000.f)?w:0.f; }
+        if (g_mSprint >= 0) g_mSprintOrig = *(float*)((uint8_t*)mc + g_mSprint);
+        if (g_mAds >= 0)    g_mAdsOrig    = *(float*)((uint8_t*)mc + g_mAds);
+        LOG("move: orig walk=%.1f crouch=%.1f sprint=%.2f ads=%.2f", g_walkOrig, g_crouchOrig, g_mSprintOrig, g_mAdsOrig); }
+    apply_speed();   // cheat speeds if enabled, else restore originals
+}
+// GODMODE: pin health / zero damage on the pawn's HealthComponent — also weapon-independent.
+static void do_godmode(void* pawn) {
+    static int32_t o_hcp = -2; static float dmgOrig = -1.f;
+    if (o_hcp == -2) o_hcp = prop_offset(obj_class(pawn), "HealthComponent");
+    if (o_hcp < 0) { g_hc = nullptr; return; }
+    void* hc = *(void**)((uint8_t*)pawn + o_hcp);
+    if (!hc || !addr_readable((uintptr_t)hc) || !in_lib(*(uintptr_t*)hc)) { g_hc = nullptr; return; }
+    if (g_hcDmg == -2) { void* c = obj_class(hc);
+        g_hcDmg = prop_offset(c, "DamageMultiplier"); g_hcH = prop_offset(c, "Health"); g_hcMH = prop_offset(c, "MaxHealth");
+        if (g_hcDmg >= 0) dmgOrig = *(float*)((uint8_t*)hc + g_hcDmg); }
+    if (g_mei.master_enabled && g_mei.godmode) { g_hc = hc; keep_god(); }
+    else { g_hc = nullptr; if (g_hcDmg >= 0) *(float*)((uint8_t*)hc + g_hcDmg) = (dmgOrig >= 0.f ? dmgOrig : 1.f); }
 }
 // per-class verdict cache — decode each class name ONCE, then pointer-compare (kills per-frame decodes)
 static void* g_clsC[256]; static uint8_t g_clsB[256]; static int g_clsN = 0;
@@ -1003,8 +1010,7 @@ static void do_aim(void* me, bool rotate, bool tp) {
     // fault inside libUnreal -> must be fault-guarded (esp. at 30Hz continuous aim).
     void* gun = nullptr;
     g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; return; }
-    gun = get_item(me, c_Gun);
-    if (!gun || !addr_readable((uintptr_t)gun)) gun = get_item(me, c_VRGun);
+    gun = resolve_gun(me);   // online-robust (get_item or last-fired gun fallback)
     g_fguard = 0;
     static int ec = 0; if (rotate && ec++ < 20)
         LOG("do_aim: GetLoc=%p GetRot=%p SetRot=%p gun=%p nbots=%d", fn_GetLoc, fn_GetRot, fn_SetRot, gun, g_nbots);
@@ -1722,8 +1728,21 @@ static void chams_pass() {
         g_wantName[0] = 0;
         if (want[0]) strncpy(g_wantName, want, sizeof g_wantName - 1);
     }
+    // CHAMS REFRESH: every few seconds drop the cached xray materials so a GC that collected them
+    // (heavy death/respawn/map change) is recovered — force_load_xray reloads them fresh next line.
+    { static long last_ref = 0; struct timespec rt; clock_gettime(CLOCK_MONOTONIC, &rt);
+      long rms = rt.tv_sec * 1000 + rt.tv_nsec / 1000000;
+      if (rms - last_ref > 4000) { last_ref = rms; g_xray0 = g_xray1 = g_xray_mat = nullptr; } }
     g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) force_load_xray(); g_fguard = 0;
     void* me = local_pawn();
+    // POST-DEATH RECOVERY: when the pawn changes (respawn/map), every per-pawn cache is stale. Drop them
+    // so movement/name/aim re-resolve for the NEW pawn instead of silently no-op'ing on dead pointers.
+    { static void* last_me = nullptr;
+      if (me && me != last_me) {
+          g_mc = nullptr; g_mcPawn = nullptr; g_walkComp = nullptr;   // movement re-resolves
+          g_myPS = nullptr; g_hc = nullptr; g_aim_target = nullptr;   // devtag/name/aim re-resolve
+          last_me = me;
+      } }
     // dev tag (self-view only): force bDev=1 on our own PlayerState (guarded; resolves offset once).
     if (me && addr_readable((uintptr_t)me)) {
         g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
@@ -1771,6 +1790,12 @@ static void chams_pass() {
     static bool ranLast = false;
     if ((anyFeat || ranLast) && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_norecoil(me); g_fguard = 0; }
     ranLast = anyFeat;   // when all go off, we run ONE more restore pass next tick, then stop
+    // movement runs on the pawn regardless of holding a weapon (own guard so a gun-less pawn still gets
+    // speed). One extra pass after it goes OFF restores originals, then stops. (godmode removed.)
+    static bool ranMove = false;
+    bool wantMove = g_mei.master_enabled && g_mei.move_enabled;
+    if ((wantMove || ranMove) && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_movement(me); g_fguard = 0; }
+    ranMove = wantMove;
     // ESP restore: the moment chams turns OFF, put every overridden mesh back to its original material
     // (else the x-ray stays until respawn). One-shot: cham_restore_all clears the cache.
     if (!on) { if (g_nCham > 0) cham_restore_all(); return; }
@@ -2181,7 +2206,7 @@ static void handler(void* obj, void* func, void* params) {
     // do_norecoil — NEVER scan the object array per-PE here (that was a 20k-object scan every frame = 1fps).
     if (g_mei.move_enabled && g_mc && addr_readable((uintptr_t)g_mc) && in_lib(*(uintptr_t*)g_mc)) apply_speed();
     // godmode: per-PE so no hit slips through (offline; server-auth online)
-    if (g_mei.godmode && g_hc) keep_god();
+    // godmode removed (offline-only / server-authoritative anyway)
     // dev tag (self-view): keep bDev=1 per-PE so it holds against server replication
     if (g_mei.master_enabled && g_mei.dev_tag && g_ready && g_myPS && g_devOff >= 0 && addr_readable((uintptr_t)g_myPS) &&
         in_lib(*(uintptr_t*)g_myPS)) *(uint8_t*)((uint8_t*)g_myPS + g_devOff) = 1;
@@ -2192,6 +2217,9 @@ static void handler(void* obj, void* func, void* params) {
         bool aimOn = g_mei.aim_enabled && g_mei.aim_mode >= AIM_ONFIRE;
         bool fire = false; for (int k = 0; k < g_nfire; k++) if (g_fire[k] == func) { fire = true; break; }
         if (fire) {
+            // capture the firing weapon as our held gun (GetItemOfClass fails online; this never does)
+            if (obj && addr_readable((uintptr_t)obj) && in_lib(*(uintptr_t*)obj) && c_VRGun && is_a(obj, c_VRGun))
+                g_heldGun = obj;
             static bool dumped = false;
             if (!dumped) { dumped = true;
                 char fnm[64]; obj_name(func, fnm, sizeof fnm);
@@ -2224,23 +2252,9 @@ static void handler(void* obj, void* func, void* params) {
             g_in_pass = false;
         }
     }
-    // continuous aim (cfg 6): run on the LATE-frame ReceiveDrawHUD path (our PostRender equivalent) so
-    // our rotation is the last write before the frame replicates — the reference works online for this
-    // exact reason. Fall back to ~90Hz timer if the HUD event doesn't fire.
-    if (!g_in_pass && g_ready && g_mei.master_enabled && g_mei.aim_enabled &&
-        g_mei.aim_mode == AIM_CONTINUOUS) {
-        bool isHud = false; for (int k = 0; k < g_ndrawhud; k++) if (g_drawhud[k] == func) { isHud = true; break; }
-        static long last_aim = 0;
-        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-        long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-        if (isHud || (ms - last_aim >= 11)) {
-            last_aim = ms;
-            g_in_pass = true;
-            void* me = local_pawn();
-            if (me) do_aim(me, true, false);   // rotation only (no TP)
-            g_in_pass = false;
-        }
-    }
+    // CONTINUOUS AIM REMOVED — it ran do_aim at ~90Hz on the game thread (local_pawn + per-bot socket
+    // RPCs every frame) and lagged horribly. Silent aim now runs ONLY on the fire path above (snaps the
+    // shot to the head the instant you pull the trigger), which is cheap and doesn't hitch.
     // KILL-AURA: continuously report a headshot on EVERY valid enemy (no need to fire or aim). Throttled
     // to aura_rate. This is the strongest / most detectable feature — reflection-guarded per target.
     if (!g_in_pass && g_ready && g_mei.master_enabled && g_mei.kill_aura && fn_ReportHit && g_nbots) {

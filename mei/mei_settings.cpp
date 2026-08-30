@@ -49,6 +49,7 @@ void mei_save() {
     fprintf(f, "move_sprint %.3f\n",   s.move_sprint);
     fprintf(f, "move_ads %.3f\n",      s.move_ads);
     fprintf(f, "move_walk %.3f\n",     s.move_walk);
+    fprintf(f, "move_crouch %.3f\n",   s.move_crouch);
     fprintf(f, "godmode %d\n",         s.godmode);
     fprintf(f, "dev_tag %d\n",         s.dev_tag);
     fprintf(f, "homing_knife %d\n",    s.homing_knife);
@@ -89,7 +90,7 @@ void mei_load() {
         GI("infinite_ammo", infinite_ammo) GI("trigger_kill", trigger_kill)
         GI("kill_aura", kill_aura) GI("wallbang", wallbang) GF("aura_rate", aura_rate)
         GI("move_enabled", move_enabled) GF("move_sprint", move_sprint) GF("move_ads", move_ads)
-        GF("move_walk", move_walk)
+        GF("move_walk", move_walk) GF("move_crouch", move_crouch)
         GI("godmode", godmode) GI("dev_tag", dev_tag) GI("homing_knife", homing_knife)
         GI("name_enabled", name_enabled) GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)
         GI("ui_accent", ui_accent) GI("panel_custom", panel_custom)

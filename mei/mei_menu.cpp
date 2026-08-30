@@ -171,6 +171,7 @@ static void tab_movement(){
     Sl("Sprint",&g_mei.move_sprint,1.f,5.f,"%.1fx");
     Sl("ADS",&g_mei.move_ads,1.f,8.f,"%.1fx");
     Sl("Walk",&g_mei.move_walk,1.f,5.f,"%.1fx");
+    Sl("Crouch",&g_mei.move_crouch,1.f,5.f,"%.1fx");
     ImGui::EndDisabled();
     gb_end();
 }
