@@ -193,12 +193,11 @@ static void tab_weapon(){
             ImGui::EndChild();
         }
         bool sel_ok = (g_mei.kill_sel >= 0 && g_mei.kill_sel < n);
-        bool canKill = sel_ok && g_players[g_mei.kill_sel].loaded && g_players[g_mei.kill_sel].alive;
-        ImGui::BeginDisabled(!canKill);
+        ImGui::BeginDisabled(!sel_ok);   // only require a selection; the kill fn re-checks loaded/alive safely
         if (ImGui::Button("KILL SELECTED", ImVec2(200,46))) g_mei.act_kill_sel = true;
         ImGui::EndDisabled();
         if (sel_ok && !g_players[g_mei.kill_sel].loaded) {
-            ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0xC8,0x66,0x66,0xFF)), "too far / not loaded"); }
+            ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0xC8,0x66,0x66,0xFF)), "far — may not land"); }
     }
     gb_end();
 }
@@ -327,6 +326,8 @@ static void tab_config(){
     gb_begin("TOOLS");
     if(ImGui::Button("Refresh mods",ImVec2(180,44))) g_mei.act_refresh=true;   // re-resolve guns/chams/movement
     ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "re-hooks guns, chams & movement if they stop");
+    if(ImGui::Button("Fix pawn",ImVec2(180,44))) g_mei.act_fixpawn=true;        // re-resolve gun/movement/controller
+    ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "press after death / lobby switch — keeps chams");
     if(ImGui::Button("Dump SDK",ImVec2(150,40))) g_mei.act_dump_sdk=true; ImGui::SameLine();
     if(ImGui::Button("Dump whitelist",ImVec2(190,40))) g_mei.act_dump_whitelist=true; ImGui::SameLine();
     if(ImGui::Button("Save",ImVec2(120,40))){ g_mei.act_save=true; g_dirty=false; }

@@ -1409,6 +1409,30 @@ static void resolve_graph() {
 static void* g_world = nullptr;
 // Walk World -> GI -> LocalPlayers[0] -> PlayerController -> (Acknowledged|Controlled) Pawn.
 // Returns our pawn, or null if this world doesn't currently yield one.
+// After a lobby/round switch the engine leaves LocalPlayer->PlayerController NULL (diagnosed:
+// worlds=1 GI=1 LP=1 PC=0), which zeros local_pawn/local_controller and breaks everything pawn-based
+// (target-kill included). Find the PC another way: scan for the PlayerController whose ->Player back-
+// points to our LocalPlayer (a link the engine keeps). Cached + throttled — off the 90Hz pawn path.
+static void* g_localPC = nullptr;
+static void* resolve_local_pc(void* lp) {
+    static int32_t o_player = -2; static void* pcCls = nullptr;
+    if (!pcCls) pcCls = find_class("PlayerController");
+    if (!pcCls || !lp) return nullptr;
+    if (o_player == -2) o_player = prop_offset(pcCls, "Player");
+    if (o_player < 0) return nullptr;
+    if (g_localPC && addr_readable((uintptr_t)g_localPC) && in_lib(*(uintptr_t*)g_localPC) && is_a(g_localPC, pcCls) &&
+        *(void**)((uint8_t*)g_localPC + o_player) == lp) return g_localPC;   // cache still valid
+    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000; if (ms - last < 300) return nullptr; last = ms;
+    g_localPC = nullptr;
+    int32_t n = objects_num();
+    for (int32_t i = 0; i < n; i++) { void* o = object_at(i);
+        if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o) || !is_a(o, pcCls)) continue;
+        char nm[24]; obj_name(o, nm, sizeof nm); if (!strncmp(nm, "Default__", 9)) continue;
+        if (*(void**)((uint8_t*)o + o_player) == lp) { g_localPC = o; return o; }
+    }
+    return nullptr;
+}
 static void* pawn_from_world(void* w) {
     if (!w || !addr_readable((uintptr_t)w) || O_WORLD_GI < 0 || O_GI_LP < 0 || O_LP_PC < 0) return nullptr;
     void* gi = *(void**)((uint8_t*)w + O_WORLD_GI);
@@ -1419,6 +1443,7 @@ static void* pawn_from_world(void* w) {
     void* lp = ((void**)lpData)[0];
     if (!addr_readable((uintptr_t)lp)) return nullptr;
     void* pc = *(void**)((uint8_t*)lp + O_LP_PC);
+    if (!addr_readable((uintptr_t)pc)) pc = resolve_local_pc(lp);   // LP->PC null after travel -> find by ->Player
     if (!addr_readable((uintptr_t)pc)) return nullptr;
     void* pawn = (O_PC_ACKPAWN >= 0) ? *(void**)((uint8_t*)pc + O_PC_ACKPAWN) : nullptr;
     if (!addr_readable((uintptr_t)pawn) && O_CTRL_PAWN >= 0) pawn = *(void**)((uint8_t*)pc + O_CTRL_PAWN);
@@ -1673,6 +1698,7 @@ static void* local_controller() {
     if (!addr_readable((uintptr_t)lpData) || num < 1) return nullptr;
     void* lp = ((void**)lpData)[0]; if (!addr_readable((uintptr_t)lp)) return nullptr;
     void* pc = *(void**)((uint8_t*)lp + O_LP_PC);
+    if (!addr_readable((uintptr_t)pc)) pc = resolve_local_pc(lp);   // lobby-switch fallback (LP->PC null)
     return addr_readable((uintptr_t)pc) ? pc : nullptr;
 }
 static void menu_spawn(void* me) {
@@ -2140,7 +2166,18 @@ static void chams_pass() {
         g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) cham_restore_all(); g_fguard = 0;  // clear chams overrides
         g_xray0 = g_xray1 = g_xray_mat = nullptr;                                   // reload materials fresh
         g_myPS = nullptr; g_hc = nullptr; g_aim_target = nullptr;
+        g_localPC = nullptr;
         LOG("REFRESH: all mod caches dropped");
+    }
+    // FIX PAWN: re-resolve pawn-dependent features (gun / movement / controller) without touching chams.
+    // Press after a death or lobby switch if the kill list / gun mods / speed stop responding.
+    if (g_mei.act_fixpawn) { g_mei.act_fixpawn = false;
+        g_gunGen++; g_heldGun = nullptr; g_ammoGun = nullptr;                       // gun mods re-resolve
+        g_mc = nullptr; g_mcPawn = nullptr; g_walkComp = nullptr;                   // movement re-resolves
+        g_mSprint = g_mAds = g_mWalk = g_mCrouch = -1; g_mSprintOrig = g_mAdsOrig = -1.f; g_walkOrig = g_crouchOrig = 0.f;
+        g_myPS = nullptr; g_hc = nullptr;                                           // name/devtag re-resolve
+        g_localPC = nullptr;                                                        // lobby-switch controller re-find
+        LOG("FIXPAWN: pawn-dependent caches dropped");
     }
     bool on = g_mei.master_enabled && g_mei.chams_enabled;   // chams gate (menu-driven)
     bool hide = false;                                       // hide-test path retired
@@ -2524,8 +2561,9 @@ static void report_hit(void* target, FVec head, void* heldGun) {
     p[bh_Pen]  = 1;                                // bPenetrated
     void* gunCls = c_KillGun;                      // strong default; fall back to the gun that fired
     if (!gunCls && heldGun && addr_readable((uintptr_t)heldGun)) gunCls = obj_class(heldGun);
+    if (!gunCls) { static int wc = 0; if (wc++ < 4) LOG("report_hit: NO gun class -> skipped (server drops null-class reports)"); return; }  // never spam null-class reports
     if (c_KillBullet) *(void**)(p + bh_Bullet) = c_KillBullet;   // BulletClass
-    if (gunCls)       *(void**)(p + bh_Gun)    = gunCls;         // GunClass
+    *(void**)(p + bh_Gun) = gunCls;                              // GunClass
     *(FVec*)(p + bh_Origin) = head;                // Origin
     if (o_HeadBone >= 0) *(uint64_t*)(p + bh_Bone) = *(uint64_t*)((uint8_t*)target + o_HeadBone);  // BoneName
     static int logn = 0; if (logn++ < 8) LOG("report_hit: target=%p pc=%p gun=%p bullet=%p resolved=%d", target, pc, gunCls, c_KillBullet, bh_resolved);
@@ -2647,9 +2685,34 @@ static void players_gather() {
     }
     g_players_n = n;
 }
+// AntiTank/50Cal etc. load per-map (null at boot). Re-resolve lazily so the report carries a real
+// GunClass/BulletClass — the server drops a hit report with null classes (that's why kills did nothing).
+static void resolve_kill_classes() {
+    if (c_KillGun && c_KillBullet) return;
+    if (!c_KillGun) { const char* g[] = { "Gun_AntiTank_C","Gun_50cal_C","Gun_HuntingRifle_C","Gun_AR9_C","Gun_AK47_C","Gun_Shotgun_C" };
+        for (auto n : g) { c_KillGun = find_class(n); if (c_KillGun) break; } }
+    if (!c_KillBullet) { const char* b[] = { "Bullet_50Cal_C","Bullet_762_C","Bullet_556_C","Bullet_9mm_C","Bullet_Base_C" };
+        for (auto n : b) { c_KillBullet = find_class(n); if (c_KillBullet) break; } }
+    // CUSTOM-MAP fallback: those names don't exist on every map. Grab ANY loaded gun/bullet class from the
+    // live object array so the report always carries a real class (a null class = server drops it silently).
+    if (!c_KillGun || !c_KillBullet) {
+        int32_t n = objects_num();
+        for (int32_t i = 0; i < n && (!c_KillGun || !c_KillBullet); i++) {
+            void* o = object_at(i);
+            if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o)) continue;
+            void* c = obj_class(o); if (!addr_readable((uintptr_t)c) || !in_lib(*(uintptr_t*)c)) continue;
+            char on[40]; obj_name(o, on, sizeof on); if (!strncmp(on, "Default__", 9)) continue;
+            if (!c_KillGun && c_VRGun && is_a(o, c_VRGun)) c_KillGun = c;          // any real gun's class
+            if (!c_KillBullet) { char cn[40]; obj_name(c, cn, sizeof cn);          // any Bullet_* class
+                if (!strncmp(cn, "Bullet", 6)) c_KillBullet = c; }
+        }
+    }
+    static int lg = 0; if (lg++ < 8) LOG("killclasses (lazy): gun=%p bullet=%p", c_KillGun, c_KillBullet);
+}
 static void do_kill_selected() {
     if (!g_mei.act_kill_sel) return;
     g_mei.act_kill_sel = false;
+    resolve_kill_classes();
     int idx = g_mei.kill_sel;
     if (idx < 0 || idx >= g_players_n || !fn_ReportHit) { LOG("KILLSEL: bad idx %d (n=%d)", idx, g_players_n); return; }
     char wantName[MEI_NAME_MAX]; strncpy(wantName, g_players[idx].name, sizeof wantName); wantName[MEI_NAME_MAX-1] = 0;

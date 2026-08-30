@@ -114,6 +114,7 @@ struct MeiSettings {
     volatile bool act_save           = false;   // force persist now
     volatile bool act_replace        = false;   // re-anchor the panel in front of the head now (Reset position)
     volatile bool act_refresh        = false;   // re-resolve all mods (guns/chams/movement) if they stop working
+    volatile bool act_fixpawn        = false;   // re-resolve pawn-dependent stuff (gun/movement/controller) — keeps chams
     volatile bool act_skin           = false;   // apply player skin (SetPlayerSkin) now
     int           kill_sel           = -1;      // selected index into g_players (pick-a-target kill)
     volatile bool act_kill_sel       = false;   // one-shot: headshot the selected player now
