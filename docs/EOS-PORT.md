@@ -164,3 +164,73 @@ The Frame build is a **fully playable** Pavlov Shack on Quest 3 — launches, co
 content, auth, live public servers, stays connected. Name / pfp / mic are the
 Steam-Frame/account skin a Quest can't wear; they need a real Steam or owned-Meta
 identity, not reachable by any shim/config. That's the floor, confirmed from every angle.
+
+===============================================================================
+# SESSION 3 — player-hosted lobby kick ("Device Cannot Be authenticated")
+===============================================================================
+
+## Symptom
+Dedicated servers: fine. **Every player-hosted (listen-server) lobby** kicks ~6s after
+join with a host->client `ClientWasKicked(KickReason="Device Cannot Be authenticated")`.
+
+## Diagnosis
+The host makes the decision, in the host's process, during the EOS control-channel
+handshake — it inspects the joining player's Connect PUID. Our PUID is an **anonymous
+Device-ID** account: zero linked external accounts. Player-hosted hosts reject that
+("Device"); dedicated servers skip the check. **Client-side readback spoofing cannot beat
+this** — the identity token we send is signed by Epic and resolves to an anonymous account
+no matter what any local hook rewrites. Dropping the `ClientWasKicked` RPC does nothing:
+the host already severed the NetConnection; the RPC is only the notice (this is why the old
+anti-votekick RPC-drop was removed).
+
+Earlier "Epic login already tried" = the on-headset **Auth login flow never completed**
+(AccountPortal browser path is half-stubbed), so it fell back to Device-ID and got kicked.
+A real Epic identity was never actually put in front of a host. So the premise is untested,
+not disproven.
+
+## The fix path (staged): prove, then ship
+The shim (`eosshim.cpp`) now selects an identity strategy from a text file, no recompile:
+```
+adb shell "echo device                  > /sdcard/Android/data/com.vankrupt.pavlov/files/eosauth.txt"  # anon (current default)
+adb shell "echo portal                  > .../eosauth.txt"   # real Epic via in-headset browser (shippable)
+adb shell "echo persistent              > .../eosauth.txt"   # silent Epic, after one portal login
+adb shell "echo dev:127.0.0.1:6547:rat  > .../eosauth.txt"   # DevAuthTool over adb reverse (THE TEST)
+```
+On boot the shim reads it and runs `EOS_Auth_Login` -> `EOS_Auth_CopyIdToken` ->
+`EOS_Connect_Login(type=EPIC_ID_TOKEN)`. Every step's result code is logged
+(`adb logcat -s EOSSHIM`); any failure falls back to Device-ID so you stay online.
+
+### Decisive test (do this FIRST — ~30 min, no browser work)
+Proves whether a genuine Epic PUID passes the host check before investing in the portal.
+1. PC: download the **EOS DevAuthTool** (in the EOS SDK `Tools/` zip from dev.epicgames.com).
+2. Run it, pick a free port (e.g. 6547), log in with any **free Epic account**, and save
+   the credential under a name (e.g. `rat`).
+3. `adb reverse tcp:6547 tcp:6547`  (so the headset's 127.0.0.1:6547 reaches the PC tool).
+4. `adb shell "echo dev:127.0.0.1:6547:rat > /sdcard/Android/data/com.vankrupt.pavlov/files/eosauth.txt"`
+5. Launch Pavlov, watch `adb logcat -s EOSSHIM`. Want:
+   `EOS_Auth_Login result=0` -> `got Epic ID token` -> `EPIC Connect login result=0 ... non-anonymous`.
+6. Join a **player-hosted** lobby.
+   - **Stays connected** => identity theory CONFIRMED. Ship the portal (below).
+   - **Still kicked "Device..."** => not an account-type check; pivot (see "if it still kicks").
+
+### If the test passes: make it shippable (no PC tethered)
+- `echo portal` — finish the AccountPortal browser flow. The `CustomTabColorSchemeParams`
+  stub is already added; if `EOS_Auth_Login result` is `IncompatibleVersion`, tune the
+  `ApiVersion` consts in `start_epic_login()` (log line `EOS_Initialize ... SDK=<ver>`
+  tells the SDK version). After ONE successful portal login the SDK stores a refresh token
+  in the app data dir -> switch to `echo persistent` for silent logins thereafter.
+
+### If it still kicks with a real Epic PUID
+The check is NOT account-type. Most likely then: EOS anti-cheat (EAC) handshake, an
+ownership/entitlement check, or Meta device attestation forwarded by the host. Re-read
+logcat around the kick for an EAC/`AntiCheat`/`Sanction` line and pivot there — do NOT
+sink time into the browser flow.
+
+## Shim build (unchanged mechanics, now with the Auth path)
+```
+aarch64-linux-android29-clang -shared -fPIC -Wl,-soname,libEOSDK.so -o stub_libEOSDK.so stub.c
+aarch64-linux-android29-clang++ -std=c++17 -O2 -fPIC -fvisibility=hidden -shared \
+  -Wl,-soname,libEOSSDK.so -o libEOSSDK.so eosshim.cpp \
+  -Wl,--no-as-needed ./stub_libEOSDK.so -Wl,--as-needed -llog -ldl
+# then repack.py / zipalign / apksigner as in the Rebuild block above
+```
