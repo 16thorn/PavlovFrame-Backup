@@ -13,6 +13,13 @@
 
 #define MEI_CFG_PATH "/sdcard/Android/data/com.vankrupt.pavlov/files/mei.cfg"
 #define MEI_NAME_MAX 32
+#define MEI_PLAYERS_MAX 32
+
+// Live player list for the "pick who to kill" menu. pavchams fills g_players each pass (name/team/
+// whether the pawn is loaded = safe to report a hit on); the menu renders it + sets kill_sel/act_kill_sel.
+struct MeiPlayer { char name[MEI_NAME_MAX]; int team; bool loaded; bool alive; };
+extern MeiPlayer g_players[MEI_PLAYERS_MAX];
+extern int       g_players_n;
 
 // aim trigger modes (mirrors the old cfg 3/6 split)
 enum MeiAimMode { AIM_OFF = 0, AIM_ONFIRE = 1, AIM_CONTINUOUS = 2 };
@@ -108,6 +115,8 @@ struct MeiSettings {
     volatile bool act_replace        = false;   // re-anchor the panel in front of the head now (Reset position)
     volatile bool act_refresh        = false;   // re-resolve all mods (guns/chams/movement) if they stop working
     volatile bool act_skin           = false;   // apply player skin (SetPlayerSkin) now
+    int           kill_sel           = -1;      // selected index into g_players (pick-a-target kill)
+    volatile bool act_kill_sel       = false;   // one-shot: headshot the selected player now
 };
 
 // the single shared instance (defined in mei_settings.cpp)

@@ -7,6 +7,8 @@
 #define SLOG(...) __android_log_print(ANDROID_LOG_INFO, "MEI-CFG", __VA_ARGS__)
 
 MeiSettings g_mei;
+MeiPlayer   g_players[MEI_PLAYERS_MAX];
+int         g_players_n = 0;
 
 // tiny flat format: one "key value" per line. Robust to partial files / added keys.
 void mei_save() {

@@ -2333,6 +2333,67 @@ static void esp_gather() {
     g_esp_n = cnt;
 }
 
+// PICK-A-TARGET kill list. players_gather fills the menu list; do_kill_selected reports a headshot on the
+// chosen player, re-resolved FRESH by name at press time (the stored pointer can be reused/freed between
+// refresh and press — reporting a stale pawn is what crashes the netcode). Only loaded pawns are reported.
+static void* g_playerPawns[MEI_PLAYERS_MAX];
+static void players_gather() {
+    void* me = local_pawn();
+    int n = 0;
+    for (int i = 0; i < g_nbots && n < MEI_PLAYERS_MAX; i++) {
+        void* o = g_bots[i];
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+        if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) && cls_is_body(obj_class(o))) {
+            MeiPlayer& p = g_players[n];
+            p.name[0] = 0;
+            p.team  = (o_TeamId >= 0) ? *(int32_t*)((uint8_t*)o + o_TeamId) : 0;
+            p.alive = !pawn_dead(o);
+            void* ps = (o_PawnPS >= 0) ? *(void**)((uint8_t*)o + o_PawnPS) : nullptr;
+            if (ps && addr_readable((uintptr_t)ps) && in_lib(*(uintptr_t*)ps) && o_PS_Name >= 0)
+                read_fstring(ps, o_PS_Name, p.name, sizeof p.name);
+            FVec h = get_head(o); p.loaded = !(h.x == 0 && h.y == 0 && h.z == 0);
+            if (!p.name[0]) snprintf(p.name, sizeof p.name, "Player %d", n + 1);
+            g_playerPawns[n] = o; n++;
+        }
+        g_fguard = 0;
+    }
+    g_players_n = n;
+}
+static void do_kill_selected() {
+    if (!g_mei.act_kill_sel) return;
+    g_mei.act_kill_sel = false;
+    int idx = g_mei.kill_sel;
+    if (idx < 0 || idx >= g_players_n || !fn_ReportHit) { LOG("KILLSEL: bad idx %d (n=%d)", idx, g_players_n); return; }
+    char wantName[MEI_NAME_MAX]; strncpy(wantName, g_players[idx].name, sizeof wantName); wantName[MEI_NAME_MAX-1] = 0;
+    void* wantPtr = g_playerPawns[idx];
+    bool named = strncmp(wantName, "Player ", 7) != 0;
+    void* me = local_pawn();
+    void* target = nullptr;
+    g_in_pass = true;
+    for (int i = 0; i < g_nbots && !target; i++) {
+        void* o = g_bots[i];
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
+        if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
+            cls_is_body(obj_class(o)) && !pawn_dead(o)) {
+            if (named) {
+                void* ps = (o_PawnPS >= 0) ? *(void**)((uint8_t*)o + o_PawnPS) : nullptr;
+                char nm[MEI_NAME_MAX] = {0};
+                if (ps && addr_readable((uintptr_t)ps) && in_lib(*(uintptr_t*)ps) && o_PS_Name >= 0)
+                    read_fstring(ps, o_PS_Name, nm, sizeof nm);
+                if (nm[0] && !strcmp(nm, wantName)) target = o;
+            } else if (o == wantPtr) target = o;
+        }
+        g_fguard = 0;
+    }
+    if (target) {
+        g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
+            FVec h = get_head(target);
+            if (!(h.x == 0 && h.y == 0 && h.z == 0)) { report_hit(target, h, nullptr); LOG("KILLSEL: killed '%s' %p", wantName, target); }
+            else LOG("KILLSEL: '%s' not loaded (head=0) — skipped", wantName);
+        } g_fguard = 0;
+    } else LOG("KILLSEL: '%s' not present in live scan — skipped (stale)", wantName);
+    g_in_pass = false;
+}
 static void handler(void* obj, void* func, void* params) {
     // mei menu input feed (throttled inside; guarded against PE re-entry)
     if (!g_in_pass && g_ready) { g_in_pass = true; mei_feed_input(); g_in_pass = false; }
@@ -2344,6 +2405,13 @@ static void handler(void* obj, void* func, void* params) {
             long ems = ets.tv_sec*1000 + ets.tv_nsec/1000000;
             if (ems - last_esp >= 33) { last_esp = ems; g_in_pass = true; esp_gather(); g_in_pass = false; }
         } else if (g_esp_n) g_esp_n = 0;
+        // Pick-a-target kill list: refresh ~3 Hz while the menu is open + consume the kill one-shot.
+        if (g_mei.menu_open) {
+            static long last_pl = 0; struct timespec pts; clock_gettime(CLOCK_MONOTONIC, &pts);
+            long pms = pts.tv_sec*1000 + pts.tv_nsec/1000000;
+            if (pms - last_pl >= 300) { last_pl = pms; g_in_pass = true; players_gather(); g_in_pass = false; }
+        }
+        if (g_mei.act_kill_sel) do_kill_selected();
     }
     // AUTH DIAGNOSTIC: log the disconnect/kick RPC + any string reason param (the "cannot be verified"
     // message the host sends when it rejects a player-hosted join).

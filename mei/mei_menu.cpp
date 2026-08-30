@@ -172,6 +172,35 @@ static void tab_weapon(){
     ImGui::EndDisabled();
     Chk("Wallbang (shoot thru walls)",&g_mei.wallbang);
     gb_end();
+    gb_begin("TARGET KILL");
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "pick a player, press Kill (weaponless works). grey = too far.");
+    {
+        int n = g_players_n; if (n > MEI_PLAYERS_MAX) n = MEI_PLAYERS_MAX;
+        if (g_mei.kill_sel >= n) g_mei.kill_sel = -1;
+        if (n <= 0) ImGui::TextDisabled("(no players — join a match)");
+        else {
+            ImGui::BeginChild("plist", ImVec2(0,170), true);
+            for (int i = 0; i < n; i++) {
+                const MeiPlayer& p = g_players[i];
+                char label[72];
+                snprintf(label, sizeof label, "%s   [team %d]%s%s", p.name, p.team,
+                         p.loaded ? "" : "  (far)", p.alive ? "" : "  (dead)");
+                ImGui::PushStyleColor(ImGuiCol_Text,
+                    v4(p.loaded ? IM_COL32(0xE2,0xE2,0xEA,0xFF) : IM_COL32(0x6E,0x6E,0x78,0xFF)));
+                if (ImGui::Selectable(label, g_mei.kill_sel == i)) { g_mei.kill_sel = i; touched(); }
+                ImGui::PopStyleColor();
+            }
+            ImGui::EndChild();
+        }
+        bool sel_ok = (g_mei.kill_sel >= 0 && g_mei.kill_sel < n);
+        bool canKill = sel_ok && g_players[g_mei.kill_sel].loaded && g_players[g_mei.kill_sel].alive;
+        ImGui::BeginDisabled(!canKill);
+        if (ImGui::Button("KILL SELECTED", ImVec2(200,46))) g_mei.act_kill_sel = true;
+        ImGui::EndDisabled();
+        if (sel_ok && !g_players[g_mei.kill_sel].loaded) {
+            ImGui::SameLine(); ImGui::TextColored(v4(IM_COL32(0xC8,0x66,0x66,0xFF)), "too far / not loaded"); }
+    }
+    gb_end();
 }
 static void tab_movement(){
     gb_begin("MOVEMENT");
