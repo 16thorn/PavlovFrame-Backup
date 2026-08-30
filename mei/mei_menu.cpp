@@ -113,6 +113,7 @@ static void tab_aimbot(){
     Sl("FOV",&g_mei.aim_fov,1.f,180.f,"%.0f");
     Sl("Smoothing",&g_mei.aim_smooth,0.f,0.95f,"%.2f");
     Chk("Aim at head",&g_mei.aim_target_head);
+    Sl("Head offset",&g_mei.aim_head_z,-25.f,10.f,"%.0f cm");
     Chk("Team check",&g_mei.aim_team_check);
     Chk("Bullet teleport",&g_mei.aim_bullet_tp);
     ImGui::EndDisabled();
@@ -194,6 +195,13 @@ static void tab_config(){
             ImGui::GetWindowDrawList()->AddRect(ImVec2(a.x-2,a.y-2),ImVec2(b.x+2,b.y+2),IM_COL32(255,255,255,255),3.f,0,2.f); }
         if(i<N_ACCENT-1) ImGui::SameLine();
     }
+    ImGui::Spacing();
+    if(g_mei.reposition) ImGui::PushStyleColor(ImGuiCol_Button, v4(ACC()));
+    if(ImGui::Button(g_mei.reposition?"Exit move mode":"Move panel",ImVec2(150,36))){ g_mei.reposition=!g_mei.reposition; touched(); }
+    if(g_mei.reposition) ImGui::PopStyleColor();
+    ImGui::SameLine();
+    if(ImGui::Button("Reset position",ImVec2(160,36))){ g_mei.reposition=false; g_mei.act_replace=true; touched(); }
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "Move: point OFF the panel, hold trigger, drag. Release to drop.");
     gb_end();
     gb_begin("TOOLS");
     if(ImGui::Button("Dump SDK",ImVec2(150,40))) g_mei.act_dump_sdk=true; ImGui::SameLine();
@@ -225,6 +233,15 @@ void mei_menu_frame(int panel_w, int panel_h){
     ImGui::SetCursorPos(ImVec2(16, 11));
     ImGui::TextColored(v4(ACC()), "mei mei"); ImGui::SameLine(0,8);
     ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "[private]");
+    ImGui::SameLine(0, 20); ImGui::SetCursorPosY(8);
+    {
+        bool rep = g_mei.reposition;
+        if (rep) { ImGui::PushStyleColor(ImGuiCol_Button, v4(ACC()));
+                   ImGui::PushStyleColor(ImGuiCol_Text, v4(IM_COL32(0x12,0x12,0x16,0xFF))); }
+        if (ImGui::Button(rep ? "moving: point off-panel + hold trigger" : "move panel", ImVec2(0,28))) {
+            g_mei.reposition = !g_mei.reposition; touched(); }
+        if (rep) ImGui::PopStyleColor(2);
+    }
     { char r[48]; snprintf(r,sizeof r,"%s  %.0ffps", g_mei.master_enabled?"active":"off", io.Framerate);
       ImVec2 z=ImGui::CalcTextSize(r); ImGui::SetCursorPos(ImVec2(W-z.x-16,13));
       ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)),"%s",r); }

@@ -1031,6 +1031,7 @@ static void do_aim(void* me, bool rotate, bool tp) {
                 if (skull && fn_SockLoc) head = aim_sockloc(avatar, skull);
                 // require a real head near the gun (skip origin / far-garbage -> never aim at self)
                 if (!(head.x == 0 && head.y == 0 && head.z == 0)) {
+                    head.z += g_mei.aim_head_z;   // socket sits at the crown; drop to head centre (tunable)
                     double d = fabs(head.x - gunLoc.x) + fabs(head.y - gunLoc.y) + fabs(head.z - gunLoc.z);
                     if (d > 1.0 && d < 500000.0) {
                         FRot to = look_at(gunLoc, head);
@@ -1050,7 +1051,7 @@ static void do_aim(void* me, bool rotate, bool tp) {
     static int ac = 0; if (rotate && ac++ < 30)
         LOG("aim: nbots=%d best=%p score=%.0f", g_nbots, best, bestScore);
     if (rotate && best) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
-        FVec h = bestHead; h.z -= 5.0; aim_setrot(gun, look_at(gunLoc, h));
+        aim_setrot(gun, look_at(gunLoc, bestHead));   // bestHead already includes aim_head_z offset
     } g_fguard = 0; }
     // WALLBANG (bullet TP): teleport the gun to just behind the target head along the aim direction so
     // the server's bullet trace originates past the wall -> the shot ignores geometry. Fire tick only.
@@ -1059,7 +1060,8 @@ static void do_aim(void* me, bool rotate, bool tp) {
         const double D2R = 0.017453292519943295;
         double cp = cos(to.pitch*D2R), sp = sin(to.pitch*D2R), cy = cos(to.yaw*D2R), sy = sin(to.yaw*D2R);
         FVec fwd{ cp*cy, cp*sy, sp };
-        FVec np{ bestHead.x - fwd.x*20.0, bestHead.y - fwd.y*20.0, bestHead.z - fwd.z*20.0 };
+        const double STANDOFF = 45.0;   // sit just OFF the head (not inside it); still past the wall
+        FVec np{ bestHead.x - fwd.x*STANDOFF, bestHead.y - fwd.y*STANDOFF, bestHead.z - fwd.z*STANDOFF };
         aim_setrot(gun, to); aim_setloc(gun, np);
     } g_fguard = 0; }
 }
@@ -2071,7 +2073,7 @@ static void handler(void* obj, void* func, void* params) {
             }
             g_in_pass = true;
             void* me = local_pawn();
-            if (me) do_aim(me, aimOn, aimOn || g_mei.wallbang);  // select target (+ rotate; TP for wallbang)
+            if (me) do_aim(me, aimOn, g_mei.wallbang);  // rotate the gun toward the head; TP the shot ONLY if wallbang is on
             // trigger-kill: report a headshot on the selected target the instant you fire
             if (g_mei.trigger_kill && g_aim_target && addr_readable((uintptr_t)g_aim_target) &&
                 in_lib(*(uintptr_t*)g_aim_target)) {

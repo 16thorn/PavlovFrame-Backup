@@ -29,6 +29,7 @@ struct MeiSettings {
     bool  aim_bullet_tp    = true;    // teleport the shot to the head on fire (old do_aim TP arg)
     float aim_smooth       = 0.0f;    // 0 = instant snap; >0 = lerp fraction/frame (0..1)
     bool  aim_target_head  = true;    // aim the skull socket (vs pawn origin)
+    float aim_head_z       = -13.0f;  // cm applied to skull socket (socket = crown; negative drops to head centre)
 
     // ---- Visuals / chams ----
     bool  chams_enabled    = true;
@@ -69,10 +70,16 @@ struct MeiSettings {
     float panel_scale      = 1.3f;    // quad size multiplier
     int   ui_accent        = 0;       // theme accent index (see mei_menu.cpp)
 
+    // ---- Panel reposition ("move panel") ----
+    bool  reposition       = false;   // Move mode ON: point off-panel + hold trigger to drag it (transient, not saved)
+    bool  panel_custom     = false;   // user manually placed the panel -> skip auto front-anchor on open
+    float panel_off[3]     = {0.f, 0.f, -0.85f};  // panel position in HEAD-LOCAL frame (metres); used when panel_custom
+
     // ---- one-shot actions (menu sets true, worker consumes + clears) ----
     volatile bool act_dump_sdk       = false;
     volatile bool act_dump_whitelist = false;
     volatile bool act_save           = false;   // force persist now
+    volatile bool act_replace        = false;   // re-anchor the panel in front of the head now (Reset position)
 };
 
 // the single shared instance (defined in mei_settings.cpp)

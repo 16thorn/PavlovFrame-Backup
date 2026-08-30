@@ -39,6 +39,7 @@
 #include <cstdint>
 #include <vector>
 #include <time.h>
+#include <math.h>
 #include <android/log.h>
 
 #define XLOG(...) __android_log_print(ANDROID_LOG_INFO, "MEI-XR", __VA_ARGS__)
@@ -103,6 +104,38 @@ static V3f qrot(const XrQuaternionf& q, V3f v) {   // rotate v by quaternion q
              v.z + q.w*tz + (q.x*ty - q.y*tx) };
 }
 static XrQuaternionf qconj(const XrQuaternionf& q) { return { -q.x, -q.y, -q.z, q.w }; }
+
+// ---- vector helpers + look-at (for grab-to-move panel) ----
+static V3f   xv(const XrVector3f& v) { return { v.x, v.y, v.z }; }
+static V3f   v3sub(V3f a, V3f b)   { return { a.x-b.x, a.y-b.y, a.z-b.z }; }
+static float v3len(V3f a)          { return sqrtf(a.x*a.x + a.y*a.y + a.z*a.z); }
+static V3f   v3norm(V3f a)         { float l=v3len(a); return l<1e-6f ? V3f{0,0,-1} : V3f{a.x/l,a.y/l,a.z/l}; }
+static V3f   v3cross(V3f a, V3f b) { return { a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x }; }
+// quaternion whose local +Z (panel normal, faces the viewer) points from `from` toward `to`, +Y ~ world up
+static XrQuaternionf quat_face(V3f from, V3f to) {
+    V3f z = v3norm(v3sub(to, from));                 // panel +Z toward the head
+    V3f up = { 0, 1, 0 };
+    V3f x = v3cross(up, z); float xl = v3len(x);
+    if (xl < 1e-4f) { up = { 0, 0, 1 }; x = v3cross(up, z); xl = v3len(x); }
+    x = { x.x/xl, x.y/xl, x.z/xl };
+    V3f y = v3cross(z, x);
+    float m00=x.x,m01=y.x,m02=z.x, m10=x.y,m11=y.y,m12=z.y, m20=x.z,m21=y.z,m22=z.z;
+    float tr = m00+m11+m22; XrQuaternionf q;
+    if (tr > 0.f)                { float s=sqrtf(tr+1.f)*2.f; q.w=0.25f*s; q.x=(m21-m12)/s; q.y=(m02-m20)/s; q.z=(m10-m01)/s; }
+    else if (m00>m11 && m00>m22) { float s=sqrtf(1.f+m00-m11-m22)*2.f; q.w=(m21-m12)/s; q.x=0.25f*s; q.y=(m01+m10)/s; q.z=(m02+m20)/s; }
+    else if (m11>m22)            { float s=sqrtf(1.f+m11-m00-m22)*2.f; q.w=(m02-m20)/s; q.x=(m01+m10)/s; q.y=0.25f*s; q.z=(m12+m21)/s; }
+    else                         { float s=sqrtf(1.f+m22-m00-m11)*2.f; q.w=(m10-m01)/s; q.x=(m02+m20)/s; q.y=(m12+m21)/s; q.z=0.25f*s; }
+    return q;
+}
+
+// grab-to-move state (shared: poll_actions gates clicks while grabbing; update_aim_ray feeds the ray)
+static bool  g_trigger_raw = false;          // latest hw trigger, ungated
+static V3f   g_ctrlPosL    = {0,0,0};        // right controller aim origin in LOCAL space
+static V3f   g_ctrlFwdL    = {0,0,-1};       // right controller aim forward in LOCAL space
+static bool  g_ctrlValidL  = false;
+static bool  g_grabbing    = false;          // panel currently pinned to the controller ray
+static float g_grab_dist   = 0.6f;           // controller->panel distance captured at grab start
+
 static bool        g_actions_built = false;        // set created + bindings suggested
 static bool        g_actions_live  = false;        // getState returned active at least once
 bool mei_xr_actions_live() { return g_actions_live; }
@@ -313,27 +346,77 @@ static bool ensure_init() {
 
 static double now_s() { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec + t.tv_nsec/1e9; }
 
-// (Re)anchor the panel in front of the head, in world-locked LOCAL space, when it (re)opens.
-static void place_panel(XrTime t) {
-    if (!g_needPlace || g_localspace == XR_NULL_HANDLE || g_viewspace == XR_NULL_HANDLE) return;
-    if (!pfn_xrLocate && !xr_get("xrLocateSpace", &pfn_xrLocate)) return;
+// Locate the head (VIEW space) in world-locked LOCAL space. Returns pos + orientation.
+static bool locate_head(XrTime t, V3f* pos, XrQuaternionf* ori) {
+    if (g_localspace == XR_NULL_HANDLE || g_viewspace == XR_NULL_HANDLE) return false;
+    if (!pfn_xrLocate && !xr_get("xrLocateSpace", &pfn_xrLocate)) return false;
     XrSpaceLocation sl{XR_TYPE_SPACE_LOCATION};
-    if (XR_FAILED(pfn_xrLocate(g_viewspace, g_localspace, t, &sl))) return;
+    if (XR_FAILED(pfn_xrLocate(g_viewspace, g_localspace, t, &sl))) return false;
     if (!(sl.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) ||
-        !(sl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) return;
-    XrPosef head = sl.pose;
-    V3f fwd = qrot(head.orientation, { 0, 0, -1 });   // head look direction
-    g_panelPose.orientation = head.orientation;       // panel faces the head
-    g_panelPose.position = { head.position.x + fwd.x * g_mei.panel_dist,
-                             head.position.y + fwd.y * g_mei.panel_dist,
-                             head.position.z + fwd.z * g_mei.panel_dist };
+        !(sl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) return false;
+    if (pos) *pos = { sl.pose.position.x, sl.pose.position.y, sl.pose.position.z };
+    if (ori) *ori = sl.pose.orientation;
+    return true;
+}
+
+// (Re)anchor the panel when it (re)opens: at the saved head-relative offset if the user placed it,
+// otherwise straight in front of the head. World-locked in LOCAL space from there.
+static void place_panel(XrTime t) {
+    if (!g_needPlace) return;
+    V3f hp; XrQuaternionf hq;
+    if (!locate_head(t, &hp, &hq)) return;
+    if (g_mei.panel_custom) {                          // restore the user's placement (head-relative offset)
+        V3f off = { g_mei.panel_off[0], g_mei.panel_off[1], g_mei.panel_off[2] };
+        V3f rel = qrot(hq, off);
+        g_panelPose.position = { hp.x + rel.x, hp.y + rel.y, hp.z + rel.z };
+        g_panelPose.orientation = quat_face(xv(g_panelPose.position), hp);
+    } else {                                           // default: arm's-length dead ahead
+        V3f fwd = qrot(hq, { 0, 0, -1 });
+        g_panelPose.orientation = hq;
+        g_panelPose.position = { hp.x + fwd.x * g_mei.panel_dist,
+                                 hp.y + fwd.y * g_mei.panel_dist,
+                                 hp.z + fwd.z * g_mei.panel_dist };
+    }
     g_needPlace = false;
-    XLOG("panel anchored at local (%.2f,%.2f,%.2f)", g_panelPose.position.x, g_panelPose.position.y, g_panelPose.position.z);
+    XLOG("panel anchored at local (%.2f,%.2f,%.2f) custom=%d",
+         g_panelPose.position.x, g_panelPose.position.y, g_panelPose.position.z, g_mei.panel_custom);
+}
+
+// Grab-to-move: in reposition mode, point OFF the panel and hold the trigger to pin the panel to the
+// controller ray at the grab-moment distance; it follows your hand and faces you. Release to drop
+// (position saved as a head-relative offset so it survives reopen). Point AT the panel to click as usual.
+static void grab_update(XrTime t) {
+    if (!g_mei.reposition) { g_grabbing = false; return; }
+    if (g_trigger_raw && g_ctrlValidL) {
+        if (!g_grabbing) {
+            if (g_cursor_valid) return;                // pointing at a widget -> let it click, don't grab
+            V3f d = v3sub(xv(g_panelPose.position), g_ctrlPosL);
+            g_grab_dist = v3len(d);
+            if (g_grab_dist < 0.20f || g_grab_dist > 3.0f) g_grab_dist = 0.6f;
+            g_grabbing = true;
+        }
+        g_panelPose.position = { g_ctrlPosL.x + g_ctrlFwdL.x * g_grab_dist,
+                                 g_ctrlPosL.y + g_ctrlFwdL.y * g_grab_dist,
+                                 g_ctrlPosL.z + g_ctrlFwdL.z * g_grab_dist };
+        V3f hp;
+        if (locate_head(t, &hp, nullptr)) g_panelPose.orientation = quat_face(xv(g_panelPose.position), hp);
+    } else if (g_grabbing) {
+        g_grabbing = false;
+        V3f hp; XrQuaternionf hq;
+        if (locate_head(t, &hp, &hq)) {                // store final pos as a head-relative offset + persist
+            V3f local = qrot(qconj(hq), v3sub(xv(g_panelPose.position), hp));
+            g_mei.panel_off[0]=local.x; g_mei.panel_off[1]=local.y; g_mei.panel_off[2]=local.z;
+            g_mei.panel_custom = true;
+            mei_save();
+        }
+        XLOG("panel dropped at (%.2f,%.2f,%.2f)", g_panelPose.position.x, g_panelPose.position.y, g_panelPose.position.z);
+    }
 }
 
 // Locate the right-controller aim pose in world-locked LOCAL space, intersect it with the anchored
 // panel plane, and push the resulting cursor into the input bridge. Hand-driven (no gun needed).
 static void update_aim_ray(XrTime t) {
+    g_ctrlValidL = false;                                  // invalidated until this frame's locate succeeds
     if (!g_actions_built || g_actAim == XR_NULL_HANDLE || g_localspace == XR_NULL_HANDLE) {
         mei_input_set_cursor(0, 0, false); return; }
     if (g_aimSpace == XR_NULL_HANDLE) {              // lazily create the action space (after attach)
@@ -354,6 +437,7 @@ static void update_aim_ray(XrTime t) {
     // controller ray in LOCAL space
     XrVector3f cp = sl.pose.position;
     V3f fwdW = qrot(sl.pose.orientation, { 0, 0, -1 });   // aim points down -Z
+    g_ctrlPosL = { cp.x, cp.y, cp.z }; g_ctrlFwdL = fwdW; g_ctrlValidL = true;   // publish for grab-to-move
     // transform ray into the panel's local frame (panel at origin, front = +Z, spans ±wm/2 ±hm/2)
     XrQuaternionf inv = qconj(g_panelPose.orientation);
     V3f rel = { cp.x - g_panelPose.position.x, cp.y - g_panelPose.position.y, cp.z - g_panelPose.position.z };
@@ -378,8 +462,10 @@ static void render_frame(XrTime displayTime) {
     static bool s_prev_open = false;
     if (g_mei.menu_open && !s_prev_open) g_needPlace = true;
     s_prev_open = g_mei.menu_open;
+    if (g_mei.act_replace) { g_mei.act_replace = false; g_mei.panel_custom = false; g_needPlace = true; }  // Reset position
     place_panel(displayTime);         // world-lock: fix the panel in front of the head on (re)open
     update_aim_ray(displayTime);      // controller ray in LOCAL space -> cursor (before NewFrame)
+    grab_update(displayTime);         // reposition mode: drag the panel with the controller ray
 
     // Acquire/wait/release must stay balanced. xrWaitSwapchainImage can return XR_TIMEOUT_EXPIRED,
     // which is a POSITIVE success code (!= XR_SUCCESS) — an image that timed out is acquired but NOT
@@ -518,8 +604,10 @@ static void poll_actions() {
     if (XR_SUCCEEDED(getB(g_session, &gi, &click))) {
         if (click.isActive) {
             g_actions_live = true; g_hw_input_active = true;
-            mei_input_set_trigger(click.currentState != XR_FALSE);
+            g_trigger_raw = (click.currentState != XR_FALSE);
+            mei_input_set_trigger(g_grabbing ? false : g_trigger_raw);   // while dragging the panel, trigger moves it, not clicks
         } else if (g_hw_input_active) {
+            g_trigger_raw = false;
             mei_input_set_trigger(false);   // controller went inactive mid-press: never leave click latched
         }
     }

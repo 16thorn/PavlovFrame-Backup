@@ -21,6 +21,7 @@ void mei_save() {
     fprintf(f, "aim_bullet_tp %d\n",   s.aim_bullet_tp);
     fprintf(f, "aim_smooth %.3f\n",    s.aim_smooth);
     fprintf(f, "aim_target_head %d\n", s.aim_target_head);
+    fprintf(f, "aim_head_z %.3f\n",    s.aim_head_z);
     fprintf(f, "chams_enabled %d\n",   s.chams_enabled);
     fprintf(f, "chams_team_color %d\n",s.chams_team_color);
     fprintf(f, "chams_highlight %d\n", s.chams_highlight);
@@ -46,6 +47,8 @@ void mei_save() {
     fprintf(f, "panel_dist %.3f\n",    s.panel_dist);
     fprintf(f, "panel_scale %.3f\n",   s.panel_scale);
     fprintf(f, "ui_accent %d\n",       s.ui_accent);
+    fprintf(f, "panel_custom %d\n",    s.panel_custom);
+    fprintf(f, "panel_off %.4f %.4f %.4f\n", s.panel_off[0], s.panel_off[1], s.panel_off[2]);
     fclose(f);
     SLOG("saved");
 }
@@ -64,6 +67,7 @@ void mei_load() {
         GI("master", master_enabled) GI("aim_enabled", aim_enabled) GI("aim_mode", aim_mode)
         GF("aim_fov", aim_fov) GI("aim_team_check", aim_team_check) GI("aim_bullet_tp", aim_bullet_tp)
         GF("aim_smooth", aim_smooth) GI("aim_target_head", aim_target_head)
+        GF("aim_head_z", aim_head_z)
         GI("chams_enabled", chams_enabled) GI("chams_team_color", chams_team_color)
         GI("chams_highlight", chams_highlight)
         GI("no_recoil", no_recoil) GI("perfect_accuracy", perfect_accuracy)
@@ -74,7 +78,9 @@ void mei_load() {
         GF("move_walk", move_walk)
         GI("godmode", godmode) GI("dev_tag", dev_tag) GI("homing_knife", homing_knife)
         GI("name_enabled", name_enabled) GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)
-        GI("ui_accent", ui_accent)
+        GI("ui_accent", ui_accent) GI("panel_custom", panel_custom)
+        if (!strcmp(key, "panel_off") &&
+            sscanf(line, "%*s %f %f %f", &s.panel_off[0], &s.panel_off[1], &s.panel_off[2]) == 3) continue;
         if (!strcmp(key, "name_text") && sscanf(line, "%*s %127s", sval) == 1) {
             if (strcmp(sval, "-")) { strncpy(s.name_text, sval, MEI_NAME_MAX-1); s.name_text[MEI_NAME_MAX-1]=0; }
         }
