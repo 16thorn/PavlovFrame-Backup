@@ -834,6 +834,10 @@ static void do_norecoil(void* pawn) {
     static int32_t ofr[48], ofd[48], obd[48];                    // FireRate/FireDelay/BurstDelay (rapid)
     static int32_t olsm[48], orpb[48], orc[48], omrc[48], obic[48], omag[48];
     static int32_t ofm[48], odc[48], obl[48], ocl[48], olb[48], obta[48];   // auto-fire: FireMode + bolt/cock
+    // extra recoil drivers on VRGun that some guns actually use (base fields the old set missed)
+    static const char* REX_NAMES[6] = { "RecoilRatio", "RecoilCurveScale", "PivotRecoilMul",
+                                        "PivotRecoilLateralMul", "RecoilAngleLateralMul", "DynamicPivotRecoil" };
+    static int32_t rex[48][6];
     // ORIGINAL values captured on first sighting (unmodified gun) -> restored when a feature is OFF.
     static float o_rs[48], o_olsm[48], o_rt[48], o_rm[48], o_ra[48], o_orpb[48], o_ofr[48], o_ofd[48], o_obd[48], o_orc[48], o_omrc[48];
     static uint8_t o_ofm[48];
@@ -862,6 +866,7 @@ static void do_norecoil(void* pawn) {
         ocl[rn] = prop_offset(gc, "bChargingLocked");
         olb[rn] = prop_offset(gc, "bLockBolt");
         obta[rn]= prop_offset(gc, "bBoltLockedTillAmmo");
+        for (int e = 0; e < 6; e++) rex[rn][e] = prop_offset(gc, REX_NAMES[e]);   // extra recoil drivers
         // snapshot originals from the (still-unmodified) instance so we can restore on disable
         #define SNAPF(o,off) o[rn] = (off >= 0) ? *(float*)((uint8_t*)gun + off) : 0.f
         SNAPF(o_rs,rs[rn]); SNAPF(o_olsm,olsm[rn]); SNAPF(o_rt,rt[rn]); SNAPF(o_rm,rm[rn]);
@@ -882,7 +887,8 @@ static void do_norecoil(void* pawn) {
     if (f_acc) { wf(gun, rs[ci], 0.f); wf(gun, olsm[ci], 0.f); }
     else       { wf(gun, rs[ci], o_rs[ci]); wf(gun, olsm[ci], o_olsm[ci]); }
     // no recoil: zero the recoil floats when ON, restore when OFF
-    if (f_rec) { wf(gun, rt[ci],0.f); wf(gun, rm[ci],0.f); wf(gun, ra[ci],0.f); wf(gun, orpb[ci],0.f); }
+    if (f_rec) { wf(gun, rt[ci],0.f); wf(gun, rm[ci],0.f); wf(gun, ra[ci],0.f); wf(gun, orpb[ci],0.f);
+                 for (int e = 0; e < 6; e++) wf(gun, rex[ci][e], 0.f); }   // extra drivers some guns use
     else       { wf(gun, rt[ci],o_rt[ci]); wf(gun, rm[ci],o_rm[ci]); wf(gun, ra[ci],o_ra[ci]); wf(gun, orpb[ci],o_orpb[ci]); }
     g_ammoGun = nullptr;   // re-published below if rapid/auto is on
     {
@@ -928,10 +934,16 @@ static void do_movement(void* pawn) {
         LOG("move: class '%s' sprint@%d ads@%d walk@%d crouch@%d", mcn, g_mSprint, g_mAds, g_mWalk, g_mCrouch); }
     if (mc != g_walkComp) {   // capture ORIGINALS once per component (for restore)
         g_walkComp = mc;
-        if (g_mWalk   >= 0) { float w = *(float*)((uint8_t*)mc + g_mWalk);   g_walkOrig   = (w>1.f&&w<20000.f)?w:0.f; }
-        if (g_mCrouch >= 0) { float w = *(float*)((uint8_t*)mc + g_mCrouch); g_crouchOrig = (w>1.f&&w<20000.f)?w:0.f; }
-        if (g_mSprint >= 0) g_mSprintOrig = *(float*)((uint8_t*)mc + g_mSprint);
-        if (g_mAds >= 0)    g_mAdsOrig    = *(float*)((uint8_t*)mc + g_mAds);
+        // Only accept a BASELINE value — on respawn the component may still hold OUR cheat value
+        // (e.g. 2940 = 600*4.9); capturing that as "orig" and multiplying again compounds the speed and
+        // breaks movement after death. Pavlov baselines are ~600 walk / ~300 crouch, so reject anything
+        // above a sane ceiling and keep the last good baseline (default 600/300 if never captured).
+        if (g_mWalk   >= 0) { float w = *(float*)((uint8_t*)mc + g_mWalk);
+            if (w > 1.f && w < 1000.f) g_walkOrig = w; else if (g_walkOrig <= 0.f) g_walkOrig = 600.f; }
+        if (g_mCrouch >= 0) { float w = *(float*)((uint8_t*)mc + g_mCrouch);
+            if (w > 1.f && w < 700.f)  g_crouchOrig = w; else if (g_crouchOrig <= 0.f) g_crouchOrig = 300.f; }
+        if (g_mSprint >= 0) { float s = *(float*)((uint8_t*)mc + g_mSprint); if (s > 0.f && s < 3.f) g_mSprintOrig = s; }
+        if (g_mAds    >= 0) { float s = *(float*)((uint8_t*)mc + g_mAds);    if (s > 0.f && s < 3.f) g_mAdsOrig    = s; }
         LOG("move: orig walk=%.1f crouch=%.1f sprint=%.2f ads=%.2f", g_walkOrig, g_crouchOrig, g_mSprintOrig, g_mAdsOrig); }
     apply_speed();   // cheat speeds if enabled, else restore originals
 }
@@ -950,12 +962,24 @@ static void do_godmode(void* pawn) {
 }
 // per-class verdict cache — decode each class name ONCE, then pointer-compare (kills per-frame decodes)
 static void* g_clsC[256]; static uint8_t g_clsB[256]; static int g_clsN = 0;
+// does `cls` derive from `base` (walk the super chain)?
+static bool cls_derives(void* cls, void* base) {
+    if (!base) return false;
+    for (void* c = cls; addr_readable((uintptr_t)c); c = struct_super(c)) {
+        if (c == base) return true;
+        if (!struct_super(c)) break;
+    }
+    return false;
+}
 static bool cls_is_body(void* cls) {
     if (!addr_readable((uintptr_t)cls)) return false;
     for (int i = 0; i < g_clsN; i++) if (g_clsC[i] == cls) return g_clsB[i];
     char c[48]; obj_name(cls, c, sizeof c);
+    // name-based (custom-skin bodies) OR structural: anything deriving from the PavlovPawn base catches
+    // standard pawns in custom modes whose class name doesn't contain "Pavlov"/"Pawn" (no custom skin).
     bool isBody = (strstr(c,"Pavlov") && (strstr(c,"Pawn") || strstr(c,"Ghost"))) ||
-                  strstr(c,"Hidden") || strstr(c,"Monster") || strstr(c,"Hide") || strstr(c,"Aurora");
+                  strstr(c,"Hidden") || strstr(c,"Monster") || strstr(c,"Hide") || strstr(c,"Aurora") ||
+                  cls_derives(cls, c_PavlovPawn) || cls_derives(cls, c_PawnBase);
     bool b = isBody && !strstr(c,"Controller") && !strstr(c,"Default") && !strstr(c,"Spectator") &&
              !strstr(c,"Boot") && !strstr(c,"Proxy") && !strstr(c,"Info") && !strstr(c,"State") &&
              !strstr(c,"Component") && !strstr(c,"Manager") && !strstr(c,"GameMode");
