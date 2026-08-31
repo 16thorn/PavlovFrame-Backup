@@ -196,9 +196,10 @@ from the client. Documented limits:
   **noclip**) hard-crashes the game (`SIGSEGV` deep in the net serializer, on a later tick, so our
   fault-guard can't catch it). These are **offline-only** — keep them off in a live match.
 - **Godmode / infinite ammo** — server tracks real values → offline only.
-- **Real name change** (`ServerChangeName`) — server forces the account name back (anonymous
-  Device-ID auth = name `"null"`). The client-side in-place write is view-only, short-names-only, and
-  only for **custom maps that gate perks by a client-side name check**.
+- **Real name change** (`ServerChangeName`) — **community/dedicated servers HONOR it** (live in-match
+  rename, replicated to everyone; Player-tab button). Only **official** hosts force the anonymous account
+  name back to `"null"`. The client-side in-place write is separate: view-only, short-names-only, for
+  custom maps that gate perks by a client-side name check.
 - **Anti-votekick / admin / VIP tied to your account** — server-side, not client-reachable.
 
 We don't attempt anti-cheat bypass, ban evasion, or forced disconnect blocking.
