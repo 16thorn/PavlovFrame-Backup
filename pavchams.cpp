@@ -2249,6 +2249,24 @@ static void chams_pass() {
                         static char nlast[64] = {0};
                         if (strcmp(nm, nlast)) { strncpy(nlast, nm, sizeof nlast - 1); LOG("NAME: '%s' (@%d cnt=%d)", nm, o_pn, cnt); }
                     }
+                    // MYIDENT: log OUR local identity as the server has it — name + platform id + platform enum.
+                    { static int32_t o_plat = -2, o_platEnum = -2;
+                      if (o_plat == -2) o_plat = prop_offset(pc, "PlatformId");
+                      if (o_platEnum == -2) o_platEnum = prop_offset(pc, "PlayerPlatform");
+                      char pid[64] = "";
+                      if (o_plat >= 0) { char16_t* pd = *(char16_t**)((uint8_t*)ps + o_plat);
+                          int32_t pc2 = *(int32_t*)((uint8_t*)ps + o_plat + 8);
+                          if (pd && addr_readable((uintptr_t)pd) && pc2 > 0 && pc2 < 63)
+                              for (int i = 0; i < pc2 && pd[i]; i++) pid[i] = (char)pd[i]; }
+                      int penum = (o_platEnum >= 0) ? *(uint8_t*)((uint8_t*)ps + o_platEnum) : -1;
+                      char myname[64] = "";
+                      if (o_pn >= 0) { char16_t* nd = *(char16_t**)((uint8_t*)ps + o_pn);
+                          int32_t nc = *(int32_t*)((uint8_t*)ps + o_pn + 8);
+                          if (nd && addr_readable((uintptr_t)nd) && nc > 0 && nc < 63)
+                              for (int i = 0; i < nc && nd[i]; i++) myname[i] = (char)nd[i]; }
+                      static char last[192] = {0}; char line[192];
+                      snprintf(line, sizeof line, "name='%s' platformId='%s' platformEnum=%d (nameOff=%d platOff=%d)", myname, pid, penum, o_pn, o_plat);
+                      if (strcmp(line, last)) { strncpy(last, line, sizeof last - 1); LOG("MYIDENT %s", line); } }
                 }
             }
         } g_fguard = 0;
@@ -2590,6 +2608,19 @@ static void do_buy(const char* itemName) {
     g_ProcessEvent(pc, fn_ServerBuy, &p);
     LOG("buy: ServerBuy('%s' id=%d)", itemName, id);
 }
+// SERVER-VISIBLE RENAME: call the game's ServerChangeName(FString) RPC on our controller. Official
+// forces anonymous names back to "null"; community/dedicated servers often honor it -> dodges a
+// name-based ban. Uses the game's own RPC (not a raw replicated write, so no netcode SIGSEGV).
+static void do_change_name(const char* name) {
+    if (!fn_ChangeName || !name || !name[0]) { LOG("changename: no fn/name"); return; }
+    void* pc = local_controller();
+    if (!pc || !addr_readable((uintptr_t)pc) || !in_lib(*(uintptr_t*)pc)) { LOG("changename: no controller"); return; }
+    static char16_t w[64]; int n = 0; for (; name[n] && n < 62; n++) w[n] = (unsigned char)name[n]; w[n] = 0;
+    uint8_t buf[16]; memset(buf, 0, sizeof buf);
+    *(void**)(buf + 0) = w; *(int32_t*)(buf + 8) = n + 1; *(int32_t*)(buf + 12) = n + 1;   // FString S
+    g_ProcessEvent(pc, fn_ChangeName, buf);
+    LOG("ServerChangeName('%s') sent", name);
+}
 // ESP: project every enemy with the game's own camera into screen [0,1] + read name/health/team/role.
 static void esp_gather() {
     if (!g_ready) { g_esp_n = 0; return; }
@@ -2780,6 +2811,7 @@ static void handler(void* obj, void* func, void* params) {
     // ESP gather (~30 Hz) — project enemies for the overlay quad; consume the Buy action.
     if (!g_in_pass && g_ready && g_mei.master_enabled) {
         if (g_mei.act_buy) { g_mei.act_buy = false; g_in_pass = true; do_buy(g_mei.buy_name); g_in_pass = false; }
+        if (g_mei.act_change_name) { g_mei.act_change_name = false; g_in_pass = true; do_change_name(g_mei.name_text); g_in_pass = false; }
         if (g_mei.esp_enabled) {
             static long last_esp = 0; struct timespec ets; clock_gettime(CLOCK_MONOTONIC, &ets);
             long ems = ets.tv_sec*1000 + ets.tv_nsec/1000000;

@@ -211,6 +211,30 @@ fits **short** names (the anonymous name buffer is ~5–7 chars) and is **client
 **crashes** (the engine frees it with its own allocator) — don't; the in-place write is the safe
 path. Custom maps that gate VIP/roles by a client-side name check will honor it.
 
+### Real server-visible name — the fake Steam persona (`steamshim.cpp`) ✅
+The in-place write above is client-view only, so on the Frame build your **real** name stays `"null"`
+(the anonymous Device-ID has no Steam persona — Steam is dormant on Quest) and admins blanket-ban
+`null` as the sideloader tell. The fix: **give the game's own name pipeline a name** so it replicates
+to the server legitimately. `steamshim.cpp` ships **as `libsteam_api.so`** (real renamed
+`libsteam_ap2.so`, soname-patched; `libUnreal` `DT_NEEDED`s it — wrapped exactly like the EOS shim)
+and fakes just enough of the Steam client for `ISteamFriends::GetPersonaName` to return your name:
+
+1. `SteamInternal_SteamAPI_Init` → OK (this is the init the game actually calls — **not** `SteamAPI_Init`).
+2. `SteamInternal_ContextInit` → we run the populate callback ourselves (the real one bails when Steam
+   isn't truly up, so it never fills the interface table).
+3. `SteamInternal_FindOrCreateUserInterface` → a fake **logged-in `ISteamUser`** (`BLoggedOn=true` +
+   valid SteamID, which breaks the game's login-wait spin) and a fake **`ISteamFriends`** whose
+   `GetPersonaName` (vtable[0]) returns your name; every other interface = a null-safe stub object.
+
+Set the name in `/sdcard/Android/data/com.vankrupt.pavlov/files/**persona.txt**`, restart (read at
+Steam-init on launch). EOS Device-ID auth is untouched (the EOS shim still rewrites Steam→Device-ID),
+no crash. Rotate `persona.txt` + hit **New identity** (fresh anonymous PUID, via the EOS shim's
+`newid.txt` flag) and you're a completely different player each time — dodges `null`/name/id admin bans.
+
+> Build: compile `steamshim.cpp` → `libsteam_api.so`, soname-patch the real lib → `libsteam_ap2.so`,
+> then repack the APK swapping `lib/arm64-v8a/libsteam_api.so` (wrapper) + adding `libsteam_ap2.so`
+> (both `ZIP_STORED`), zipalign `-p 4`, re-sign. Same wrap/soname-patch pattern as the EOS shim.
+
 ---
 
 ## Build

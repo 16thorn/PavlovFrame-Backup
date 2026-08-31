@@ -116,6 +116,7 @@ struct MeiSettings {
     volatile bool act_refresh        = false;   // re-resolve all mods (guns/chams/movement) if they stop working
     volatile bool act_fixpawn        = false;   // re-resolve pawn-dependent stuff (gun/movement/controller) — keeps chams
     volatile bool act_skin           = false;   // apply player skin (SetPlayerSkin) now
+    volatile bool act_change_name    = false;   // call ServerChangeName(name_text) RPC (server-visible rename)
     int           kill_sel           = -1;      // selected index into g_players (pick-a-target kill)
     volatile bool act_kill_sel       = false;   // one-shot: headshot the selected player now
     bool          kill_all_loop      = false;   // repeating: headshot every loaded enemy each pass (aura_rate)

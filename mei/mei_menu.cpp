@@ -233,6 +233,9 @@ static void tab_player(){
     ImGui::PopItemWidth();
     if(g_kb){ ImGui::Spacing(); keyboard(g_mei.name_text,MEI_NAME_MAX); }
     ImGui::EndDisabled();
+    ImGui::Spacing();
+    if(ImGui::Button("Set SERVER name (RPC)",ImVec2(240,40))) g_mei.act_change_name=true;
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "sends ServerChangeName -> community servers may honor it (dodges name bans)");
     gb_end();
 }
 static void tab_ttt(){
