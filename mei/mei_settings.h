@@ -110,6 +110,7 @@ struct MeiSettings {
     // ---- one-shot actions (menu sets true, worker consumes + clears) ----
     volatile bool act_dump_sdk       = false;
     volatile bool act_buy            = false;   // ServerBuy(buy_name) now
+    volatile bool act_give           = false;   // ServerGive(buy_name) now — free spawn, no credits
     volatile bool act_dump_whitelist = false;
     volatile bool act_save           = false;   // force persist now
     volatile bool act_replace        = false;   // re-anchor the panel in front of the head now (Reset position)

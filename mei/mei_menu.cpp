@@ -299,6 +299,8 @@ static void tab_ttt(){
     ImGui::EndChild();
     ImGui::Text("selected: %s", g_mei.buy_name[0] ? g_mei.buy_name : "-"); ImGui::SameLine();
     if (ImGui::Button("BUY", ImVec2(120,40))) g_mei.act_buy = true;
+    ImGui::SameLine();
+    if (ImGui::Button("GIVE (free)", ImVec2(120,40))) g_mei.act_give = true;
     if (g_kb2) { ImGui::Spacing(); keyboard(filter, sizeof filter); }
     gb_end();
 }

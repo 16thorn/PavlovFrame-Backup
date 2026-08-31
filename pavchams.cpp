@@ -709,6 +709,7 @@ static int32_t bh_Target=0x00, bh_Hit=0x08, bh_Head=0x20, bh_Pen=0x21,
 static bool    bh_resolved = false;
 // ---- ESP + TTT ----
 static void*   fn_ServerBuy = nullptr;              // APavlovPlayerController::ServerBuy(FName)
+static void*   fn_ServerGive = nullptr;             // APavlovPawn::ServerGive(FName Equipment, FName Skin) — free spawn
 static int32_t o_PawnPS = -2, o_PS_Name = -2, o_PawnHC = -2, o_HC_H = -2, o_HC_MH = -2, o_PS_Role = -2;
 static void* fn_GMChangeName = nullptr; static int32_t o_AuthGM = -1;   // GameModeBase::ChangeName (long names)
 static char g_wantName[64] = {0};                   // desired name from name.txt (direct-write spoof)
@@ -979,17 +980,34 @@ static void do_movement(void* pawn) {
     if (!mc || !addr_readable((uintptr_t)mc) || !in_lib(*(uintptr_t*)mc)) {
         if (dbg++ < 12) LOG("move: NO movecomp (mc=%p pawn=%p move_enabled=%d)", mc, pawn, g_mei.move_enabled);
         return; }
-    // NOCLIP: force Flying MovementMode (5) while on; toggle actor collision on the edge (offline).
-    { static int32_t o_mm = -2, o_fly = -2; if (o_mm == -2) o_mm = prop_offset(obj_class(mc), "MovementMode");
-      if (o_fly == -2) o_fly = prop_offset(obj_class(mc), "MaxFlySpeed");
-      static bool ncPrev = false; static float flyOrig = 0.f; bool nc = g_mei.master_enabled && g_mei.noclip;
-      if (nc && o_mm >= 0) *(uint8_t*)((uint8_t*)mc + o_mm) = 5;                     // EMovementMode::MOVE_Flying
-      if (nc && o_fly >= 0) *(float*)((uint8_t*)mc + o_fly) = 2400.f * g_mei.move_walk;  // fast fly (scales w/ Walk slider)
-      if (nc != ncPrev) { ncPrev = nc;
-          if (o_fly >= 0) { if (nc) { flyOrig = *(float*)((uint8_t*)mc + o_fly); }   // capture/restore fly speed
-                            else if (flyOrig > 0.f) *(float*)((uint8_t*)mc + o_fly) = flyOrig; }
+    // NOCLIP: proper UE cheat-fly. bCheatFlying + MOVE_Flying + zero gravity = smooth flight with no
+    // ground snapping / gravity fighting (that was the jitter). Collision off = pass through walls.
+    // Offline. Capture originals on the enable EDGE (before the per-frame apply overwrites them).
+    { void* mcc = obj_class(mc);
+      static int32_t o_mm = -2, o_fly = -2, o_cheat = -2, o_grav = -2;
+      if (o_mm == -2)    o_mm    = prop_offset(mcc, "MovementMode");
+      if (o_fly == -2)   o_fly   = prop_offset(mcc, "MaxFlySpeed");
+      if (o_cheat == -2) o_cheat = prop_offset(mcc, "bCheatFlying");
+      if (o_grav == -2)  o_grav  = prop_offset(mcc, "GravityScale");
+      static bool ncPrev = false; static float flyOrig = 0.f, gravOrig = 1.f;
+      bool nc = g_mei.master_enabled && g_mei.noclip;
+      if (nc != ncPrev) {                                    // toggle edge: capture / restore
+          if (nc) { if (o_fly >= 0)  flyOrig  = *(float*)((uint8_t*)mc + o_fly);
+                    if (o_grav >= 0) gravOrig = *(float*)((uint8_t*)mc + o_grav); }
+          else {
+              if (o_cheat >= 0) *(uint8_t*)((uint8_t*)mc + o_cheat) = 0;
+              if (o_grav >= 0)  *(float*)((uint8_t*)mc + o_grav) = (gravOrig > 0.f ? gravOrig : 1.f);
+              if (o_fly >= 0 && flyOrig > 0.f) *(float*)((uint8_t*)mc + o_fly) = flyOrig;
+              if (o_mm >= 0)    *(uint8_t*)((uint8_t*)mc + o_mm) = 1;             // MOVE_Walking
+          }
           if (fn_SetCollision) { struct { uint8_t on; char p[7]; } p{ (uint8_t)(nc?0:1), {0} }; g_ProcessEvent(pawn, fn_SetCollision, &p); }
-          if (!nc && o_mm >= 0) *(uint8_t*)((uint8_t*)mc + o_mm) = 1;                // restore MOVE_Walking once
+          ncPrev = nc;
+      }
+      if (nc) {                                              // per-frame hold
+          if (o_mm >= 0)    *(uint8_t*)((uint8_t*)mc + o_mm) = 5;                 // MOVE_Flying
+          if (o_cheat >= 0) *(uint8_t*)((uint8_t*)mc + o_cheat) = 1;              // bCheatFlying → smooth
+          if (o_grav >= 0)  *(float*)((uint8_t*)mc + o_grav) = 0.f;               // kill gravity pull
+          if (o_fly >= 0)   *(float*)((uint8_t*)mc + o_fly) = 2400.f * g_mei.move_walk;
       } }
     if (g_mSprint == -1) { void* mcc = obj_class(mc);
         g_mSprint = prop_offset(mcc, "SprintSpeedMultiplier");
@@ -1253,6 +1271,8 @@ static void resolve_names() {
     c_Gun = find_class("Gun_Base_C");
     c_VRGun = find_class("VRGun");
     LOG("GetItemOfClass=%p Gun=%p VRGun=%p", fn_GetItem, c_Gun, c_VRGun);
+    fn_ServerGive = find_func(c_PavlovPawn, "ServerGive");   // ServerGive(FName Equipment@0, FName Skin@8)
+    LOG("ServerGive=%p", fn_ServerGive);
     // silent-aim funcs (Actor + component + KismetMath)
     fn_GetLoc = find_func(c_PavlovPawn, "K2_GetActorLocation");
     fn_GetRot = find_func(c_PavlovPawn, "K2_GetActorRotation");
@@ -2608,6 +2628,22 @@ static void do_buy(const char* itemName) {
     g_ProcessEvent(pc, fn_ServerBuy, &p);
     LOG("buy: ServerBuy('%s' id=%d)", itemName, id);
 }
+// FREE SPAWN: ServerGive(FName Equipment, FName Skin) on OUR OWNED pawn (via the controller's Pawn —
+// local_pawn() can grab a non-owned pawn, and sending a Server RPC on a pawn we don't net-own crashes
+// the serializer). Same equipment IDs as buy, no credits.
+static void do_give(const char* itemName) {
+    if (!fn_ServerGive || !itemName || !itemName[0]) return;
+    void* pc = local_controller();
+    if (!pc || !addr_readable((uintptr_t)pc) || !in_lib(*(uintptr_t*)pc)) { LOG("give: no controller"); return; }
+    static int32_t o_pawn = -2; if (o_pawn == -2) o_pawn = prop_offset(obj_class(pc), "Pawn");
+    void* pawn = (o_pawn >= 0) ? *(void**)((uint8_t*)pc + o_pawn) : nullptr;
+    if (!pawn || !addr_readable((uintptr_t)pawn) || !in_lib(*(uintptr_t*)pawn)) { LOG("give: no owned pawn (o_pawn=%d)", o_pawn); return; }
+    int32_t id = fname_find(itemName);
+    if (id < 0) { LOG("give: FName '%s' not found in pool", itemName); return; }
+    struct { int32_t eqId, eqNum, skId, skNum; } p{ id, 0, 0, 0 };   // FName Equipment@0, FName Skin@8 (None)
+    g_ProcessEvent(pawn, fn_ServerGive, &p);
+    LOG("give: ServerGive('%s' id=%d) on owned pawn %p", itemName, id, pawn);
+}
 // SERVER-VISIBLE RENAME: call the game's ServerChangeName(FString) RPC on our controller. Official
 // forces anonymous names back to "null"; community/dedicated servers often honor it -> dodges a
 // name-based ban. Uses the game's own RPC (not a raw replicated write, so no netcode SIGSEGV).
@@ -2811,6 +2847,7 @@ static void handler(void* obj, void* func, void* params) {
     // ESP gather (~30 Hz) — project enemies for the overlay quad; consume the Buy action.
     if (!g_in_pass && g_ready && g_mei.master_enabled) {
         if (g_mei.act_buy) { g_mei.act_buy = false; g_in_pass = true; do_buy(g_mei.buy_name); g_in_pass = false; }
+        if (g_mei.act_give) { g_mei.act_give = false; g_in_pass = true; do_give(g_mei.buy_name); g_in_pass = false; }
         if (g_mei.act_change_name) { g_mei.act_change_name = false; g_in_pass = true; do_change_name(g_mei.name_text); g_in_pass = false; }
         if (g_mei.esp_enabled) {
             static long last_esp = 0; struct timespec ets; clock_gettime(CLOCK_MONOTONIC, &ets);
