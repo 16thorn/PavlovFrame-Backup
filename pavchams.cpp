@@ -697,9 +697,40 @@ static void* fn_SockLoc = nullptr, *fn_LookAt = nullptr, *cdo_KML = nullptr;
 static int32_t o_AvatarSkin = -1, o_SkullSocket = -1;
 static void* g_fire[16]; static int g_nfire = 0;    // gun fire UFunctions (fire-path hook)
 static void* g_kick[8]; static int g_nkick = 0;     // kick RPCs to DROP (anti-votekick)
-static void* g_authfn[12]; static const char* g_authnm[12]; static int g_nauthfn = 0;   // auth-handshake RPCs to TRACE (log-only)
+static void* g_authfn[24]; static const char* g_authnm[24]; static int g_nauthfn = 0;   // auth/voice RPCs to TRACE (log-only)
 static void* fn_ChangeName = nullptr;               // ServerChangeName (name spoof for custom-map admin)
+// voice injection (soundboard TX bypass): AVoiceRouter::ServerOnVoice(FPavlovVoicePacket{TArray<u8> Data})
+// is the client-authoritative voice send — the packet Data is an Opus-encoded blob. We probe the live
+// packet cadence/size first, then build+send our own. Resolved in resolve_names.
+static void* c_VoiceRouter = nullptr; static void* fn_ServerOnVoice = nullptr;
+static void* fn_ClientOnVoiceBunch = nullptr;   // receive-side: FVoicePacketBunch{Players@0x0, Packets@0x10}
+// Voice TX proof (Phase 1): a ring of real incoming Opus frames (full Data incl. the 6-byte Pavlov
+// header). On PLAY we replay them via ServerOnVoice (seq byte rewritten) to prove the transmit path.
+#define VCAP_MAX 128
+#define VCAP_LEN 512
+static uint8_t g_vcap[VCAP_MAX][VCAP_LEN]; static int g_vcaplen[VCAP_MAX];
+static int  g_vcap_w = 0, g_vcap_n = 0;        // ring write head + count
+static bool g_vreplay = false; static int g_vreplay_i = 0; static long g_vreplay_ms = 0;
+static uint8_t g_vseq = 0;
 static void* fn_SetPlayerSkin = nullptr;            // PavlovPawn::SetPlayerSkin(FName) — player skin changer
+// ---- voice chat (Quest fix) ----------------------------------------------------------------------
+// The Frame build gates Android mic capture behind AndroidRuntimeSettings.bAndroidVoiceEnabled and
+// never lights it up on Quest (VoiceDevice ends empty). We: force the flag on the settings CDO,
+// unmute, (re)enable the lobby + net-voice, and kick CheckAndEnableVoiceCapture to re-init capture.
+static void*   cdo_ARS         = nullptr; static int32_t o_AndroidVoice = -2;   // AndroidRuntimeSettings.bAndroidVoiceEnabled
+static void*   g_gus           = nullptr; static int32_t o_MicMuted = -2, o_VoiceDev = -2;  // PavlovGameUserSettings
+static void*   c_GUS           = nullptr; static void* fn_SetMicMuted = nullptr, *fn_SetVoiceDevice = nullptr;
+static void*   fn_CheckEnVoice = nullptr;  // PavlovGameInstance::CheckAndEnableVoiceCapture()
+static void*   fn_SetVoiceChat = nullptr, *fn_IsVoiceChatEn = nullptr;   // OnlineLobby
+static void*   c_OnlineLobby   = nullptr;
+static void*   fn_ClientEnNetVoice = nullptr;   // PlayerController::ClientEnableNetworkVoice(bool)
+static void*   fn_ToggleSpeaking   = nullptr;   // PlayerController::ToggleSpeaking(bool) — start/stop broadcast
+static int32_t o_Pawn_VoiceActive  = -2;        // PavlovPawn.bVoiceActive
+static void*   cdo_PavStatics  = nullptr; static void* fn_GetVoiceLevelPeak = nullptr, *fn_ResetVoiceDev = nullptr;
+static void*   fn_GetVoiceSource = nullptr;     // PavlovGameInstance::GetVoiceSource()
+// VoiceSource — the actual capture object (GI.VoiceSource @0x348). Direct mic control.
+static void*   c_VoiceSource = nullptr; static int32_t o_GI_VoiceSrc = -2;
+static void*   fn_VS_SetCapture = nullptr, *fn_VS_IsCapturing = nullptr, *fn_VS_IsBroadcasting = nullptr, *fn_VS_ResetCap = nullptr;
 // ---- trigger-kill (ported from the PC internal: APavlovPlayerController::ServerReportBulletHit) ----
 static void* fn_ReportHit = nullptr;                // ServerReportBulletHit(FClientBulletHit)
 static void* c_KillGun = nullptr, *c_KillBullet = nullptr;   // GunClass / BulletClass for the report
@@ -1365,8 +1396,18 @@ static void resolve_names() {
                              "OnAuthTimedout", "ClientOnConnected", "ServerAuthenticateGuest" };
         g_nauthfn = 0;
         for (auto nm : an) { void* fn = cpvc0 ? find_func(cpvc0, nm) : nullptr;
-          if (fn && g_nauthfn < 12) { g_authfn[g_nauthfn] = fn; g_authnm[g_nauthfn] = nm; g_nauthfn++;
+          if (fn && g_nauthfn < 24) { g_authfn[g_nauthfn] = fn; g_authnm[g_nauthfn] = nm; g_nauthfn++;
             LOG("auth RPC '%s' = %p", nm, fn); } } }
+      // VOICE PROBE: trace the voice-router RPCs so we can SEE real packet Data sizes + cadence when
+      // people talk (that's the Opus framing we must match), and grab ServerOnVoice for injection.
+      { c_VoiceRouter = find_class("VoiceRouter");
+        const char* vn[] = { "ServerOnVoice", "ClientOnVoiceBunch", "OnEncodedVoiceData", "ReplayOnVoiceBunch_Client" };
+        for (auto nm : vn) { void* fn = c_VoiceRouter ? find_func(c_VoiceRouter, nm) : nullptr;
+          if (fn && g_nauthfn < 24) { g_authfn[g_nauthfn] = fn; g_authnm[g_nauthfn] = nm; g_nauthfn++;
+            LOG("voice RPC '%s' = %p", nm, fn); } }
+        fn_ServerOnVoice = c_VoiceRouter ? find_func(c_VoiceRouter, "ServerOnVoice") : nullptr;
+        fn_ClientOnVoiceBunch = c_VoiceRouter ? find_func(c_VoiceRouter, "ClientOnVoiceBunch") : nullptr;
+        LOG("voice: VoiceRouter=%p ServerOnVoice=%p ClientOnVoiceBunch=%p", c_VoiceRouter, fn_ServerOnVoice, fn_ClientOnVoiceBunch); }
       // trigger-kill RPC + the gun/bullet classes the PC reference uses for a guaranteed headshot
       void* cpvc = find_class("PavlovPlayerController");
       fn_ReportHit = cpvc ? find_func(cpvc, "ServerReportBulletHit") : nullptr;
@@ -1403,7 +1444,35 @@ static void resolve_names() {
       void* cgm = find_class("GameModeBase");
       fn_GMChangeName = cgm ? find_func(cgm, "ChangeName") : nullptr;       // proper rename (any length, allocates)
       void* cw2 = find_class("World"); o_AuthGM = cw2 ? prop_offset(cw2, "AuthorityGameMode") : -1;
-      LOG("ServerChangeName=%p GM.ChangeName=%p AuthGM@%d", fn_ChangeName, fn_GMChangeName, o_AuthGM); }
+      LOG("ServerChangeName=%p GM.ChangeName=%p AuthGM@%d", fn_ChangeName, fn_GMChangeName, o_AuthGM);
+      fn_ClientEnNetVoice = cpc ? find_func(cpc, "ClientEnableNetworkVoice") : nullptr;   // stock UE VoIP enable
+      fn_ToggleSpeaking   = cpc ? find_func(cpc, "ToggleSpeaking") : nullptr; }           // start/stop broadcast
+    // VOICE (Quest fix): resolve the whole voice pipeline by name.
+    { void* cars = find_class("AndroidRuntimeSettings");
+      cdo_ARS = find_object("Default__AndroidRuntimeSettings");
+      if (cars) o_AndroidVoice = prop_offset(cars, "bAndroidVoiceEnabled");
+      c_GUS = find_class("PavlovGameUserSettings");
+      if (c_GUS) { o_MicMuted = prop_offset(c_GUS, "bMicMuted"); o_VoiceDev = prop_offset(c_GUS, "VoiceDevice");
+                   fn_SetMicMuted = find_func(c_GUS, "SetMicMuted"); fn_SetVoiceDevice = find_func(c_GUS, "SetVoiceDevice"); }
+      void* cgi = find_class("PavlovGameInstance");
+      if (cgi) { fn_CheckEnVoice = find_func(cgi, "CheckAndEnableVoiceCapture"); fn_GetVoiceSource = find_func(cgi, "GetVoiceSource"); }
+      c_OnlineLobby = find_class("OnlineLobby");
+      if (c_OnlineLobby) { fn_SetVoiceChat = find_func(c_OnlineLobby, "SetVoiceChat"); fn_IsVoiceChatEn = find_func(c_OnlineLobby, "IsVoiceChatEnabled"); }
+      void* cst = find_class("PavlovStatics"); cdo_PavStatics = find_object("Default__PavlovStatics");
+      if (cst) { fn_GetVoiceLevelPeak = find_func(cst, "GetVoiceLevelPeak"); fn_ResetVoiceDev = find_func(cst, "ResetVoiceCaptureDevice"); }
+      if (cgi) o_GI_VoiceSrc = prop_offset(cgi, "VoiceSource");
+      c_VoiceSource = find_class("VoiceSource");
+      if (c_VoiceSource) { fn_VS_SetCapture = find_func(c_VoiceSource, "SetCapture");
+                           fn_VS_IsCapturing = find_func(c_VoiceSource, "IsCapturing");
+                           fn_VS_IsBroadcasting = find_func(c_VoiceSource, "IsBroadcasting");
+                           fn_VS_ResetCap = find_func(c_VoiceSource, "ResetCaptureDevice"); }
+      { void* cpp = find_class("PavlovPawn"); if (cpp) o_Pawn_VoiceActive = prop_offset(cpp, "bVoiceActive"); }
+      LOG("voice: VoiceSrc cls=%p GI.VoiceSrc@%d SetCapture=%p IsCapturing=%p IsBroadcasting=%p ResetCap=%p ToggleSpeak=%p bVoiceActive@%d",
+          c_VoiceSource, o_GI_VoiceSrc, fn_VS_SetCapture, fn_VS_IsCapturing, fn_VS_IsBroadcasting, fn_VS_ResetCap, fn_ToggleSpeaking, o_Pawn_VoiceActive);
+      LOG("voice: ARScdo=%p AndroidVoice@%d GUS=%p MicMuted@%d VoiceDev@%d SetMic=%p SetDev=%p",
+          cdo_ARS, o_AndroidVoice, c_GUS, o_MicMuted, o_VoiceDev, fn_SetMicMuted, fn_SetVoiceDevice);
+      LOG("voice: CheckEnVoice=%p GetVoiceSrc=%p Lobby=%p SetVoiceChat=%p IsVoiceEn=%p ClientEnNet=%p PeakLvl=%p ResetDev=%p",
+          fn_CheckEnVoice, fn_GetVoiceSource, c_OnlineLobby, fn_SetVoiceChat, fn_IsVoiceChatEn, fn_ClientEnNetVoice, fn_GetVoiceLevelPeak, fn_ResetVoiceDev); }
     // collect the guns' fire UFunctions on the gun classes...
     const char* fnames[9] = { "Fired", "Fire", "OnFire", "TryFire", "Shoot",
                               "FireWeapon", "PullTrigger", "BeginFire", "ServerFire" };
@@ -2895,14 +2964,281 @@ static void kill_all_loaded() {
     for (int i = 0; i < n; i++) kill_by_name(g_players[i].name);
     g_in_pass = false;
 }
+// ===========================================================================
+//  voice chat (Quest fix)
+// ===========================================================================
+// first non-Default__ live instance of a class (settings/lobby singletons)
+static void* find_singleton(void* cls) {
+    if (!cls) return nullptr;
+    int32_t n = objects_num();
+    for (int32_t i = 0; i < n; i++) { void* o = object_at(i);
+        if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o) || obj_class(o) != cls) continue;
+        char nm[16]; obj_name(o, nm, sizeof nm); if (!strncmp(nm, "Default__", 9)) continue;
+        return o; }
+    return nullptr;
+}
+static void* game_instance() {
+    void* w = find_world(); if (!w || O_WORLD_GI < 0) return nullptr;
+    void* gi = *(void**)((uint8_t*)w + O_WORLD_GI);
+    return addr_readable((uintptr_t)gi) ? gi : nullptr;
+}
+// fault-guarded PE call for the (new, untested) voice UFunctions
+static void voice_call(void* self, void* fn, void* params) {
+    if (!self || !fn || !addr_readable((uintptr_t)self) || !in_lib(*(uintptr_t*)self)) return;
+    g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) g_ProcessEvent(self, fn, params); g_fguard = 0;
+}
+// set an FString property in place is unsafe (GC frees ours); instead call the game's SetVoiceDevice
+// RPC with a transient FString frame pointing at a static UTF-16 buffer.
+static void voice_set_device(const char* url) {
+    if (!g_gus || !fn_SetVoiceDevice || !url) return;
+    static char16_t w[64]; int n = 0; for (; url[n] && n < 62; n++) w[n] = (unsigned char)url[n]; w[n] = 0;
+    uint8_t buf[16]; memset(buf, 0, sizeof buf);
+    *(void**)(buf + 0) = w; *(int32_t*)(buf + 8) = n + 1; *(int32_t*)(buf + 12) = n + 1;   // FString{ptr,Num,Max} (Num incl null)
+    voice_call(g_gus, fn_SetVoiceDevice, buf);
+    LOG("voice: SetVoiceDevice('%s')", url);
+}
+// GetVoiceLevelPeak(WorldContext)->float : mic input level. >0 while talking = capture is LIVE (TX ok).
+static float voice_peak() {
+    void* w = find_world();
+    if (!w || !fn_GetVoiceLevelPeak || !cdo_PavStatics) return -1.f;
+    struct { void* wc; float ret; } p{ w, -1.f };
+    g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; return -1.f; }
+    g_ProcessEvent(cdo_PavStatics, fn_GetVoiceLevelPeak, &p); g_fguard = 0;
+    return p.ret;
+}
+// the live VoiceSource capture object: GI.VoiceSource, falling back to GetVoiceSource() and a scan.
+static void* voice_source() {
+    void* gi = game_instance();
+    if (gi && o_GI_VoiceSrc >= 0 && addr_readable((uintptr_t)gi)) {
+        void* vs = *(void**)((uint8_t*)gi + o_GI_VoiceSrc);
+        if (vs && addr_readable((uintptr_t)vs) && in_lib(*(uintptr_t*)vs)) return vs;
+    }
+    if (gi && fn_GetVoiceSource) { struct { void* ret; } p{nullptr}; voice_call(gi, fn_GetVoiceSource, &p);
+        if (p.ret && addr_readable((uintptr_t)p.ret)) return p.ret; }
+    return find_singleton(c_VoiceSource);
+}
+// bool-returning method on the VoiceSource (ReturnValue bool @ 0); -1 if the call can't be made.
+static int voice_bool_call(void* vs, void* fn) {
+    if (!vs || !fn || !addr_readable((uintptr_t)vs) || !in_lib(*(uintptr_t*)vs)) return -1;
+    struct { uint8_t ret; } p{2};
+    g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; return -1; }
+    g_ProcessEvent(vs, fn, &p); g_fguard = 0;
+    return p.ret ? 1 : 0;
+}
+static bool  g_voiceArmed = false;   // capture init done for this enable (reset when voice toggled off)
+static float g_lastPeak   = -2.f;
+static int   g_lastCap = -2, g_lastBcast = -2;
+// Assert the voice pipeline: unmute, ensure a capture device is selected, enable net voice, init capture
+// once, and log the mic peak so we can SEE capture go live. Self-throttled ~2 Hz (safe from the handler).
+static void voice_pass() {
+    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000; if (ms - last < 500) return; last = ms;
+    if (!g_gus || !addr_readable((uintptr_t)g_gus) || obj_class(g_gus) != c_GUS) g_gus = find_singleton(c_GUS);
+    // 1) unmute (live GameUserSettings bool + setter)
+    if (g_mei.voice_unmute) {
+        if (g_gus && o_MicMuted >= 0 && addr_readable((uintptr_t)g_gus)) *(uint8_t*)((uint8_t*)g_gus + o_MicMuted) = 0;
+        if (g_gus && fn_SetMicMuted) { struct { uint8_t m, ret; } p{0,0}; voice_call(g_gus, fn_SetMicMuted, &p); }
+    }
+    void* gi = game_instance();
+    void* vs = voice_source();
+    void* pc = local_controller();
+    // ONE-TIME setup on arm: set device + init capture + open the mic. Re-reading VoiceDevice returns
+    // empty (the setter stores it in the native voice layer, not the GUS field), so DON'T re-set per pass —
+    // that re-inits capture every tick and thrashes the broadcast. Latch it instead.
+    if (!g_voiceArmed) {
+        if (g_gus && fn_SetVoiceDevice) voice_set_device("Default Device");
+        void* lobby = find_singleton(c_OnlineLobby);
+        if (lobby && fn_SetVoiceChat) { struct { uint8_t on, ret; } p{1,0}; voice_call(lobby, fn_SetVoiceChat, &p); }
+        if (pc && fn_ClientEnNetVoice) { struct { uint8_t on, ret; } p{1,0}; voice_call(pc, fn_ClientEnNetVoice, &p); }
+        if (gi && fn_CheckEnVoice) { uint8_t buf[16]; memset(buf, 0, sizeof buf); voice_call(gi, fn_CheckEnVoice, buf); }
+        if (vs && fn_VS_SetCapture) { struct { uint8_t on, ret; } p{1,0}; voice_call(vs, fn_VS_SetCapture, &p); }
+        g_voiceArmed = true;
+        LOG("voice: armed — device set, capture opened (VoiceSource=%p)", vs);
+    }
+    // BROADCAST: ToggleSpeaking() is a param-less TOGGLE — only call it to flip broadcast ON when it's
+    // currently off (never while already broadcasting, or it'd toggle us mute). This is the open-mic latch.
+    int cap = vs ? voice_bool_call(vs, fn_VS_IsCapturing) : -1;
+    int bc  = vs ? voice_bool_call(vs, fn_VS_IsBroadcasting) : -1;
+    if (bc == 0 && pc && fn_ToggleSpeaking) {
+        uint8_t buf[8]; memset(buf, 0, sizeof buf); voice_call(pc, fn_ToggleSpeaking, buf);
+        LOG("voice: ToggleSpeaking() -> start broadcast");
+    }
+    { void* me = local_pawn();
+      if (me && o_Pawn_VoiceActive >= 0 && addr_readable((uintptr_t)me) && in_lib(*(uintptr_t*)me))
+          *(uint8_t*)((uint8_t*)me + o_Pawn_VoiceActive) = 1; }
+    if (cap != g_lastCap || bc != g_lastBcast) { g_lastCap = cap; g_lastBcast = bc;
+        LOG("voice: IsCapturing=%d IsBroadcasting=%d (vs=%p)", cap, bc, vs); }
+    float pk = voice_peak();
+    if (pk >= 0.f && (g_lastPeak < 0.f || (pk - g_lastPeak > 0.02f) || (g_lastPeak - pk > 0.02f))) {
+        g_lastPeak = pk; LOG("voice: mic peak=%.3f", pk);
+    } else if (pk < 0.f && g_lastPeak != -1.f) { g_lastPeak = -1.f; LOG("voice: mic peak unavailable"); }
+}
+// One-shot: dump the live voice state + function signatures so we can see exactly what's null/empty
+// and call each fn with the right param frame. Pull with: adb logcat -s pavchams | grep VOICE
+static void do_voice_diag() {
+    LOG("=== VOICE DIAG ===");
+    LOG("gate: cdo_ARS=%p AndroidVoice@%d", cdo_ARS, o_AndroidVoice);
+    if (cdo_ARS && o_AndroidVoice >= 0 && addr_readable((uintptr_t)cdo_ARS))
+        LOG("  bAndroidVoiceEnabled=%d", *(uint8_t*)((uint8_t*)cdo_ARS + o_AndroidVoice));
+    if (!g_gus || !addr_readable((uintptr_t)g_gus) || obj_class(g_gus) != c_GUS) g_gus = find_singleton(c_GUS);
+    LOG("liveGUS=%p (class c_GUS=%p)", g_gus, c_GUS);
+    if (g_gus && o_MicMuted >= 0 && addr_readable((uintptr_t)g_gus)) LOG("  bMicMuted=%d", *(uint8_t*)((uint8_t*)g_gus + o_MicMuted));
+    if (g_gus && o_VoiceDev >= 0 && addr_readable((uintptr_t)g_gus)) { char s[160]; read_fstring(g_gus, o_VoiceDev, s, sizeof s); LOG("  VoiceDevice='%s'", s); }
+    void* lobby = find_singleton(c_OnlineLobby); LOG("liveLobby=%p", lobby);
+    void* gi = game_instance(); void* pc = local_controller(); LOG("GI=%p PC=%p", gi, pc);
+    // signatures — so the pass calls them with the correct frame
+    if (fn_CheckEnVoice)     dump_params("CheckAndEnableVoiceCapture", fn_CheckEnVoice);
+    if (fn_SetVoiceChat)     dump_params("SetVoiceChat", fn_SetVoiceChat);
+    if (fn_IsVoiceChatEn)    dump_params("IsVoiceChatEnabled", fn_IsVoiceChatEn);
+    if (fn_ClientEnNetVoice) dump_params("ClientEnableNetworkVoice", fn_ClientEnNetVoice);
+    if (fn_GetVoiceLevelPeak)dump_params("GetVoiceLevelPeak", fn_GetVoiceLevelPeak);
+    if (fn_SetVoiceDevice)   dump_params("SetVoiceDevice", fn_SetVoiceDevice);
+    if (fn_ResetVoiceDev)    dump_params("ResetVoiceCaptureDevice", fn_ResetVoiceDev);
+    void* vs = voice_source(); LOG("VoiceSource live=%p (GI.VoiceSource@%d)", vs, o_GI_VoiceSrc);
+    if (fn_VS_SetCapture)     dump_params("VoiceSource::SetCapture", fn_VS_SetCapture);
+    if (fn_VS_IsCapturing)    dump_params("VoiceSource::IsCapturing", fn_VS_IsCapturing);
+    if (fn_VS_IsBroadcasting) dump_params("VoiceSource::IsBroadcasting", fn_VS_IsBroadcasting);
+    if (fn_ToggleSpeaking)    dump_params("PlayerController::ToggleSpeaking", fn_ToggleSpeaking);
+    if (vs) LOG("VoiceSource state: IsCapturing=%d IsBroadcasting=%d", voice_bool_call(vs, fn_VS_IsCapturing), voice_bool_call(vs, fn_VS_IsBroadcasting));
+    LOG("live mic peak = %.3f (>=0 means capture is running; -1 = no capture)", voice_peak());
+    LOG("=== END VOICE DIAG ===");
+}
+// ---- soundboard bridge (audioshim / libOpenSLES) ------------------------------------------------
+// audioshim.cpp ships AS libOpenSLES.so, RTLD_GLOBAL, and exports sb_get_control()+sb_scan(). We
+// dlsym them from the global namespace and shuttle state between g_mei (menu) and its SbControl.
+// This struct MUST match audioshim.cpp's SbControl (version tag = 1) byte-for-byte.
+#define SB_MAX_CLIPS 64
+#define SB_NAME_MAX  40
+struct SbControl {
+    int32_t  version;
+    int32_t  n_clips;
+    char     names[SB_MAX_CLIPS][SB_NAME_MAX];
+    volatile int32_t play_req, stop_req, loop, mix_mic;
+    volatile float   gain;
+    volatile int32_t cur_clip, recorder_live, rec_rate, rec_chans, rec_bits;
+};
+typedef SbControl* (*fn_sb_get_control)();
+typedef int        (*fn_sb_scan)();
+static fn_sb_get_control r_sb_get = nullptr;
+static fn_sb_scan        r_sb_scan = nullptr;
+static bool              g_sb_tried = false;
+
+// audioshim.cpp is compiled into this same .so — these are its exports (declared, not dlsym'd).
+extern "C" int   sb_install();     // resolve real SL fns from the system lib + stage clips
+extern "C" void* sb_hook_fn();     // address of our slCreateEngine replacement (for the GOT patch)
+
+// voice_opus.cpp — soundboard clip -> Opus voice frames for ServerOnVoice injection.
+extern "C" int         vo_scan();
+extern "C" int         vo_count();
+extern "C" const char* vo_name(int i);
+extern "C" int         vo_load(int idx, uint8_t hdr2, float gain);   // heavy: decode+encode off the game thread
+extern "C" int         vo_frames();
+extern "C" int         vo_frame(int i, uint8_t* out, int cap);
+extern "C" int16_t*    vo_pcm();
+extern "C" int         vo_pcm_samples();
+// local monitor player (audioshim.cpp): hear the clip out your own headset while it transmits.
+extern "C" int         sb_local_play(const int16_t* pcm, int samples);
+extern "C" void        sb_local_stop();
+
+// clip playback state (encode on a worker thread; stream frames from the game thread at 20ms)
+static volatile int  g_clip_want = -1;    // menu asks to load+play this clip index
+static volatile bool g_clip_ready = false;// encode finished, frames available
+static volatile bool g_clip_play = false; // streaming now
+static int  g_clip_i = 0; static long g_clip_ms = 0;
+static uint8_t g_clip_hdr2 = 0;           // header byte [2] to stamp (learned from captured frames)
+static void* clip_encode_thread(void*) {
+    int idx = g_clip_want;
+    int nf = (idx >= 0) ? vo_load(idx, g_clip_hdr2, g_mei.sb_gain) : -1;
+    LOG("clip encode: idx=%d frames=%d gain=%.2f", idx, nf, g_mei.sb_gain);
+    if (nf > 0) {
+        if (g_mei.sb_monitor) sb_local_play(vo_pcm(), vo_pcm_samples());   // hear it locally
+        g_clip_i = 0; g_clip_ready = true; g_clip_play = true;
+    }
+    return nullptr;
+}
+
+// Fire one voice packet at the server: FPavlovVoicePacket is just { TArray<uint8> Data }, so the
+// param block is that TArray (ptr,num,max). ServerOnVoice replicates it to the lobby. Fault-guarded.
+static void* g_router = nullptr;
+static bool send_voice_frame(uint8_t* d, int len) {
+    if (!fn_ServerOnVoice || !c_VoiceRouter || len <= 0) return false;
+    if (!g_router || !addr_readable((uintptr_t)g_router) || !in_lib(*(uintptr_t*)g_router))
+        g_router = find_singleton(c_VoiceRouter);
+    if (!g_router || !addr_readable((uintptr_t)g_router)) return false;
+    struct { void* ptr; int32_t num; int32_t max; } arr;   // FPavlovVoicePacket { TArray<uint8> Data }
+    arr.ptr = d; arr.num = len; arr.max = len;
+    g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; return false; }
+    g_ProcessEvent(g_router, fn_ServerOnVoice, &arr);
+    g_fguard = 0; return true;
+}
+
+// Soundboard: Opus-encode the selected clip on a worker thread, then stream its frames through
+// ServerOnVoice at 20ms from the game thread. The genuine mic is never involved.
+static void soundboard_pass() {
+    g_mei.sb_present  = (fn_ServerOnVoice != nullptr);   // can we transmit?
+
+    // clip list (scan once, refresh mirror when it changes)
+    static bool scanned = false; if (!scanned) { scanned = true; vo_scan(); }
+    int nc = vo_count(); if (nc > MEI_SB_MAX_CLIPS) nc = MEI_SB_MAX_CLIPS;
+    if (nc != g_mei.sb_n_clips) {
+        for (int i = 0; i < nc; i++) { strncpy(g_mei.sb_names[i], vo_name(i), MEI_SB_NAME_MAX-1);
+                                       g_mei.sb_names[i][MEI_SB_NAME_MAX-1] = 0; }
+        g_mei.sb_n_clips = nc; if (g_mei.sb_sel >= nc) g_mei.sb_sel = nc ? 0 : -1;
+    }
+    // derive header byte [2] from a recently captured real frame, if we have one (else 0).
+    if (g_vcap_n > 0) { int last = (g_vcap_w - 1 + VCAP_MAX) % VCAP_MAX;
+                        if (g_vcaplen[last] > 2) g_clip_hdr2 = g_vcap[last][2]; }
+    g_mei.sb_rec_live = (g_vcap_n > 0);      // "have real header sample" indicator
+    g_mei.sb_rec_rate = g_vcap_n;
+
+    if (g_mei.sb_act_rescan) { g_mei.sb_act_rescan = false; scanned = false; }
+    if (g_mei.sb_act_stop)   { g_mei.sb_act_stop = false; g_clip_play = false; sb_local_stop(); }
+    if (g_mei.sb_act_play)   { g_mei.sb_act_play = false;
+        if (g_mei.sb_sel >= 0 && fn_ServerOnVoice) {
+            g_router = nullptr;                 // force a fresh VoiceRouter resolve (survives lobby switches)
+            g_clip_play = false; g_clip_ready = false; g_clip_want = g_mei.sb_sel;
+            pthread_t th; pthread_create(&th, nullptr, clip_encode_thread, nullptr); pthread_detach(th);
+            LOG("clip: encoding + play requested (idx=%d hdr2=0x%02x)", g_mei.sb_sel, g_clip_hdr2);
+        }
+    }
+
+    if (g_clip_play && g_clip_ready) {
+        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+        long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000;
+        if (ms - g_clip_ms >= 20) {
+            g_clip_ms = ms;
+            uint8_t f[1400]; int len = vo_frame(g_clip_i, f, sizeof f);
+            if (len > 1) { f[1] = g_vseq++; send_voice_frame(f, len); }
+            if (++g_clip_i >= vo_frames()) {              // end of clip
+                if (g_mei.sb_loop) g_clip_i = 0; else { g_clip_play = false; LOG("clip: done"); }
+            }
+        }
+    }
+    g_mei.sb_cur = g_clip_play ? g_clip_want : -1;
+}
+
 static void handler(void* obj, void* func, void* params) {
     // mei menu input feed (throttled inside; guarded against PE re-entry)
     if (!g_in_pass && g_ready) { g_in_pass = true; mei_feed_input(); g_in_pass = false; }
+    // soundboard: voice-TX replay (calls ServerOnVoice -> re-enters PE, so guard it)
+    if (!g_in_pass && g_ready) { g_in_pass = true; soundboard_pass(); g_in_pass = false; }
     // ESP gather (~30 Hz) — project enemies for the overlay quad; consume the Buy action.
     if (!g_in_pass && g_ready && g_mei.master_enabled) {
         if (g_mei.act_buy) { g_mei.act_buy = false; g_in_pass = true; do_buy(g_mei.buy_name); g_in_pass = false; }
         if (g_mei.act_give) { g_mei.act_give = false; g_in_pass = true; do_give(g_mei.buy_name); g_in_pass = false; }
         if (g_mei.act_change_name) { g_mei.act_change_name = false; g_in_pass = true; do_change_name(g_mei.name_text); g_in_pass = false; }
+        if (g_mei.act_voice_diag) { g_mei.act_voice_diag = false; g_in_pass = true; do_voice_diag(); g_in_pass = false; }
+        if (g_mei.voice_enabled)  { g_in_pass = true; voice_pass(); g_in_pass = false; }   // self-throttled ~2Hz
+        else if (g_voiceArmed) {                                                            // disable edge: stop broadcast + capture
+            g_in_pass = true;
+            void* vs = voice_source();
+            void* pcb = local_controller();
+            if (vs && fn_VS_IsBroadcasting && voice_bool_call(vs, fn_VS_IsBroadcasting) == 1 && pcb && fn_ToggleSpeaking) {
+                uint8_t b[8]; memset(b, 0, sizeof b); voice_call(pcb, fn_ToggleSpeaking, b); }   // toggle broadcast OFF
+            if (vs && fn_VS_SetCapture) { struct { uint8_t on, ret; } p{0,0}; voice_call(vs, fn_VS_SetCapture, &p); }
+            g_in_pass = false;
+            g_voiceArmed = false; g_lastPeak = -2.f; g_lastCap = -2; g_lastBcast = -2;
+        }
         if (g_mei.esp_enabled) {
             static long last_esp = 0; struct timespec ets; clock_gettime(CLOCK_MONOTONIC, &ets);
             long ems = ets.tv_sec*1000 + ets.tv_nsec/1000000;
@@ -2968,6 +3304,31 @@ static void handler(void* obj, void* func, void* params) {
             }
             break;
         }
+    }
+    // VOICE CAPTURE: on an incoming ClientOnVoiceBunch, copy each packet's full Data (6-byte header +
+    // Opus frame) into the ring. On PLAY we replay these via ServerOnVoice to prove the transmit path.
+    // Don't capture our own replayed frames (would feed back).
+    if (g_ready && func == fn_ClientOnVoiceBunch && params && !g_vreplay) {
+        static int shots = 0;
+        g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; }
+        else {
+            uint8_t* pk = *(uint8_t**)((uint8_t*)params + 0x10);   // Packets TArray ptr @0x10
+            int32_t  pn = *(int32_t*)((uint8_t*)params + 0x18);    // Packets num  @0x18
+            if (pk && addr_readable((uintptr_t)pk) && pn > 0 && pn < 64) {
+                for (int i = 0; i < pn; i++) {
+                    uint8_t* el = pk + (size_t)i * 0x10;           // FPavlovVoicePacket = {TArray Data @0}
+                    uint8_t* d  = *(uint8_t**)el;
+                    int32_t  dn = *(int32_t*)(el + 8);
+                    if (d && addr_readable((uintptr_t)d) && dn > 0 && dn <= VCAP_LEN) {
+                        memcpy(g_vcap[g_vcap_w], d, dn); g_vcaplen[g_vcap_w] = dn;
+                        g_vcap_w = (g_vcap_w + 1) % VCAP_MAX; if (g_vcap_n < VCAP_MAX) g_vcap_n++;
+                        if (shots < 6) { shots++; LOG("VOICEPKT len=%d TOC=0x%02x hdr=%02x %02x %02x %02x %02x %02x",
+                            dn, d[6<dn?6:0], d[0], d[1], d[2], d[3], d[4], d[5]); }
+                    }
+                }
+            }
+        }
+        g_fguard = 0;
     }
     // homing knife: mark the thrown knife on a throw call, then steer it per-PE toward nearest enemy
     if (g_ready && g_mei.master_enabled && g_mei.homing_knife && g_nknife) {
@@ -3186,12 +3547,84 @@ static void* xr_boot(void*) {
     return nullptr;
 }
 
+// ---- GOT patch: redirect a libUnreal import to our function --------------------------------------
+// Walk libUnreal's dynamic .rela.plt, find the JUMP_SLOT reloc for `symbol`, and overwrite its GOT
+// slot with `repl`. This is how we hook slCreateEngine without being able to replace the public
+// system lib by name. Returns true once patched.
+static bool got_hook(const char* symbol, void* repl) {
+    if (!g_base) return false;
+    auto fix = [](uintptr_t v) -> uintptr_t {          // .dynamic ptrs are link-time vaddrs -> rebase
+        return (v >= g_base && v < g_lib_hi) ? v : g_base + v;
+    };
+    const Elf64_Ehdr* eh = (const Elf64_Ehdr*)g_base;
+    if (!addr_readable(g_base) || memcmp(eh->e_ident, ELFMAG, SELFMAG)) return false;
+    const Elf64_Phdr* ph = (const Elf64_Phdr*)(g_base + eh->e_phoff);
+    const Elf64_Dyn* dyn = nullptr;
+    for (int i = 0; i < eh->e_phnum; i++)
+        if (ph[i].p_type == PT_DYNAMIC) { dyn = (const Elf64_Dyn*)fix(ph[i].p_vaddr); break; }
+    if (!dyn || !addr_readable((uintptr_t)dyn)) return false;
+
+    const Elf64_Sym*  symtab = nullptr; const char* strtab = nullptr;
+    const Elf64_Rela* jmprel = nullptr; size_t pltsz = 0;
+    const Elf64_Rela* rela   = nullptr; size_t relasz = 0;
+    for (const Elf64_Dyn* d = dyn; addr_readable((uintptr_t)d) && d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_SYMTAB:   symtab = (const Elf64_Sym*)fix(d->d_un.d_ptr); break;
+            case DT_STRTAB:   strtab = (const char*)fix(d->d_un.d_ptr);      break;
+            case DT_JMPREL:   jmprel = (const Elf64_Rela*)fix(d->d_un.d_ptr); break;
+            case DT_PLTRELSZ: pltsz  = d->d_un.d_val;                        break;
+            case DT_RELA:     rela   = (const Elf64_Rela*)fix(d->d_un.d_ptr); break;
+            case DT_RELASZ:   relasz = d->d_un.d_val;                        break;
+        }
+    }
+    if (!symtab || !strtab) { LOG("got_hook %s: no symtab/strtab", symbol); return false; }
+    LOG("got_hook %s: jmprel=%p pltsz=%zu rela=%p relasz=%zu", symbol,
+        (void*)jmprel, pltsz, (void*)rela, relasz);
+
+    // scan both .rela.plt (JUMP_SLOT) and .rela.dyn (GLOB_DAT) for the symbol's GOT slot.
+    const Elf64_Rela* tables[2] = { jmprel, rela };
+    size_t counts[2] = { pltsz / sizeof(Elf64_Rela), relasz / sizeof(Elf64_Rela) };
+    for (int t = 0; t < 2; t++) {
+        const Elf64_Rela* T = tables[t]; if (!T) continue;
+        for (size_t i = 0; i < counts[t]; i++) {
+            uint32_t si = ELF64_R_SYM(T[i].r_info);
+            if (!si) continue;
+            const char* nm = strtab + symtab[si].st_name;
+            if (!addr_readable((uintptr_t)nm) || strcmp(nm, symbol)) continue;
+            void** slot = (void**)fix(T[i].r_offset);
+            if (!addr_readable((uintptr_t)slot)) { LOG("got_hook %s: slot unreadable", symbol); return false; }
+            uintptr_t pg = (uintptr_t)slot & ~(uintptr_t)0xFFF;          // page-align, cover RELRO
+            mprotect((void*)pg, 0x2000, PROT_READ | PROT_WRITE);
+            void* old = *slot; *slot = repl;
+            LOG("GOT hook: %s slot=%p old=%p -> %p (table %d)", symbol, (void*)slot, old, repl, t);
+            return true;
+        }
+    }
+    LOG("got_hook %s: symbol not found in relocs", symbol);
+    return false;
+}
+
+// Race the game's first slCreateEngine call (audio init) the same way xr_boot races xrCreateInstance:
+// poll fast from load, and the moment libUnreal is mapped, resolve the real SL fns and patch the GOT.
+static void* sb_boot(void*) {
+    for (int i = 0; i < 8000; i++) {                 // ~40s of 5ms polls
+        if (g_base && sb_install() && got_hook("slCreateEngine", sb_hook_fn())) {
+            LOG("soundboard: slCreateEngine hooked after %d ms", i * 5);
+            return nullptr;
+        }
+        struct timespec t{0, 5 * 1000 * 1000}; nanosleep(&t, nullptr);
+    }
+    LOG("soundboard: slCreateEngine never hooked (engine may init before us)");
+    return nullptr;
+}
+
 extern "C" __attribute__((visibility("default")))
 void pavchams_start() {
     static bool once = false; if (once) return; once = true;
     LOG("libpavchams start");
     pthread_t t; pthread_create(&t, nullptr, boot, nullptr); pthread_detach(t);
     pthread_t x; pthread_create(&x, nullptr, xr_boot, nullptr); pthread_detach(x);
+    pthread_t s; pthread_create(&s, nullptr, sb_boot, nullptr); pthread_detach(s);
 }
 
 __attribute__((constructor))

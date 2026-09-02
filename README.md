@@ -33,6 +33,7 @@ the game thread from a hooked `ProcessEvent`.
 | **Anti-flash** | Zeroes the flashbang blind curve on `GlobalPlayerEffects`. | ✅ (client render) |
 | **buy anything menu** | `ServerBuy(FName)` with a categorized + searchable weapon list (exact Pavlov equipment IDs). | ✅ where buying is on |
 | **Godmode / homing knife / name changer / dev tag** | Server-authoritative or client-view-only — see [Server ceiling](#server-authoritative-ceiling). **⚠️ Name changer / dev tag / noclip crash the game ONLINE** (replicated writes) — offline only. | offline only |
+| **Soundboard** | Streams a `.wav` into voice chat as if you were talking — Opus-encoded and injected via `ServerOnVoice`, so it needs **no working mic** (the Frame build never opens one on Quest). Local monitor + gain. | ✅ (community/dedicated) |
 | **SDK dumper** | Walks all `UClass`/`ScriptStruct` → `name : super + props(+offset,type) + funcs` in `sdk_dump.txt`. | tool |
 
 ---
@@ -69,6 +70,42 @@ weapon in hand** (the report supplies its own gun class — shows as a Hunting R
 Architecture + first-pixel bring-up: **[docs/MEI-MENU.md](docs/MEI-MENU.md)** and
 **[docs/ON-DEVICE.md](docs/ON-DEVICE.md)**. The old `chams.txt` integer still works as a fallback
 (and `8`/`9` still force the one-shot dumps from adb).
+
+## Soundboard — voice-chat injection (no mic required)
+
+Play any `.wav` into the lobby's voice chat. The Frame build never opens an Android mic recorder on
+Quest (capture is gated off and can't be revived — see [Voice capture is dead on Frame](#voice-capture-is-dead-on-frame)),
+so instead of feeding a mic we inject **downstream of capture**, straight into the transmit RPC:
+
+1. **Decode + resample** the `.wav` → 48 kHz mono (`voice_opus.cpp`, tiny RIFF parser).
+2. **Opus-encode** it into 20 ms frames (bundled libopus), each wrapped in Pavlov's 6-byte voice-packet
+   header (`[0]=0x02 [1]=seq [2]=hdr [3]=0x00 [4..5]=len` — reverse-engineered off live packets).
+3. **Stream** the frames through `AVoiceRouter::ServerOnVoice(FPavlovVoicePacket)` at 20 ms cadence.
+   That RPC is **client-authoritative** (same family as `ServerReportBulletHit`), so the server relays
+   our audio to everyone — exactly as if we'd spoken. The router instance is re-resolved on every play,
+   so it survives lobby/map changes.
+
+All of this is compiled **into `libpavchams.so`** — `libOpenSLES.so` is a public Android system library
+and can't be replaced by APK name, so the earlier "ship-as-`libOpenSLES.so`" idea doesn't work; the SL
+engine we do use (for the local monitor) is reached by GOT-hooking `slCreateEngine` from inside the mod
+and pulling the real functions from the system lib.
+
+**Use it:** drop `.wav` files into `.../files/soundboard/` (any rate, mono or stereo — auto-converted),
+open the **Sound** tab, pick a clip, **PLAY**.
+- **Monitor** — plays the clip out your own headset too (own OpenSL player) so you can set volume solo.
+- **Gain** — bakes into the encode; set it, then PLAY again. ~5–6× cuts through other voices.
+- **Loop** — repeat the clip until STOP.
+
+```sh
+adb shell mkdir -p /sdcard/Android/data/com.vankrupt.pavlov/files/soundboard
+adb push clip.wav /sdcard/Android/data/com.vankrupt.pavlov/files/soundboard/
+```
+
+### Voice capture is dead on Frame
+The game creates its OpenSL *engine* but never a *recorder*: mic capture is gated off on the Frame port
+and `RECORD_AUDIO` + `CheckAndEnableVoiceCapture` don't revive it (the device enumerates empty). The
+**receive** path is fully alive (we decode others' voice), which is why transmit-side injection works —
+we skip the missing mic entirely. libopus is fetched + built by `build.sh` into `third_party/libopus.a`.
 
 ## Config (legacy fallback)
 
@@ -305,6 +342,8 @@ patchelf on `libUnreal`. The EOS shim also provides anonymous Device-ID online a
 - `mei/` — the **2016 client** VR ImGui menu: `mei_settings` (state + `mei.cfg`), `mei_menu`
   (tabs/UI), `mei_input` (controller-ray cursor), `mei_xr` (OpenXR quad-layer + Vulkan backend).
 - `eosshim.cpp`, `stub.c`, `minisrc/` — the EOS interposer / loader source.
+- `voice_opus.cpp` — soundboard: `.wav` → Opus voice frames for `ServerOnVoice` injection.
+- `audioshim.cpp` — OpenSL glue (GOT-hooks `slCreateEngine`; drives the local monitor player).
 - `repack.py` — APK repacker.
 - `build.sh` — one-shot build/sign/install.
 - `docs/EOS-PORT.md` — how the Quest port + EOS Device-ID auth works.

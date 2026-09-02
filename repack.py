@@ -15,6 +15,14 @@ real_b = open(B + "libEOSDK.so",  "rb").read()   # -> lib/arm64-v8a/libEOSDK.so
 steam_wrap_b = open(B + "libsteam_api.so", "rb").read()   # persona wrapper -> lib/arm64-v8a/libsteam_api.so
 steam_real_b = open(B + "libsteam_ap2.so", "rb").read()   # real Steam renamed -> lib/arm64-v8a/libsteam_ap2.so
 
+# soundboard shim (optional): our libOpenSLES.so wrapper + the real platform lib renamed libOpenSLE2.so.
+def _opt(p):
+    try:  return open(B + p, "rb").read()
+    except FileNotFoundError: return None
+audio_wrap_b = _opt("libOpenSLES.so")   # audioshim wrapper -> lib/arm64-v8a/libOpenSLES.so
+audio_real_b = _opt("libOpenSLE2.so")   # real platform lib renamed -> lib/arm64-v8a/libOpenSLE2.so
+audio_swapped = False
+
 zin  = zipfile.ZipFile(src, "r")
 zout = zipfile.ZipFile(out, "w")
 for zi in zin.infolist():
@@ -28,6 +36,15 @@ for zi in zin.infolist():
         ni.compress_type = zipfile.ZIP_DEFLATED
         ni.external_attr = zi.external_attr
         zout.writestr(ni, wrap_b)
+        continue
+    if name == "lib/arm64-v8a/libOpenSLES.so" and audio_wrap_b is not None:
+        # swap the platform OpenSLES for OUR soundboard wrapper (mic-inject). libUnreal DT_NEEDEDs
+        # libOpenSLES.so; the wrapper dlopen()s libOpenSLE2.so (real, renamed + soname-patched, added below).
+        ni = zipfile.ZipInfo("lib/arm64-v8a/libOpenSLES.so")
+        ni.compress_type = zipfile.ZIP_DEFLATED
+        ni.external_attr = zi.external_attr
+        zout.writestr(ni, audio_wrap_b)
+        audio_swapped = True
         continue
     if name == "lib/arm64-v8a/libsteam_api.so":
         # swap the real Steam lib for OUR persona wrapper (fake ISteamFriends::GetPersonaName).
@@ -71,6 +88,17 @@ si = zipfile.ZipInfo("lib/arm64-v8a/libsteam_ap2.so")
 si.compress_type = zipfile.ZIP_DEFLATED
 zout.writestr(si, steam_real_b)
 
+# soundboard: add the real platform lib under its patched soname, and add our wrapper if the base
+# APK didn't already carry lib/arm64-v8a/libOpenSLES.so (system libs often aren't bundled).
+if audio_real_b is not None:
+    ai = zipfile.ZipInfo("lib/arm64-v8a/libOpenSLE2.so")
+    ai.compress_type = zipfile.ZIP_DEFLATED
+    zout.writestr(ai, audio_real_b)
+if audio_wrap_b is not None and not audio_swapped:
+    aw = zipfile.ZipInfo("lib/arm64-v8a/libOpenSLES.so")
+    aw.compress_type = zipfile.ZIP_DEFLATED
+    zout.writestr(aw, audio_wrap_b)
+
 # add the chams lib; libEOSSDK.so's constructor dlopen()s it (no patchelf on libUnreal)
 chams_b = open(B + "libpavchams.so", "rb").read()
 ci = zipfile.ZipInfo("lib/arm64-v8a/libpavchams.so")
@@ -88,5 +116,6 @@ zin.close(); zout.close()
 
 z = zipfile.ZipFile(out)
 print("EOS libs:", [n for n in z.namelist() if "EOS" in n and n.startswith("lib/arm64")])
+print("audio libs:", [n for n in z.namelist() if "OpenSLE" in n and n.startswith("lib/arm64")])
 print("residual v1 sig:", any(n.upper().endswith((".RSA", ".SF")) for n in z.namelist()))
 print("output:", out, os.path.getsize(out), "bytes")

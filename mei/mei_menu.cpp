@@ -250,6 +250,15 @@ static void tab_player(){
     if(ImGui::Button("Set SERVER name (RPC)",ImVec2(240,40))) g_mei.act_change_name=true;
     ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "sends ServerChangeName -> community servers may honor it (dodges name bans)");
     gb_end();
+    gb_begin("VOICE CHAT (QUEST FIX)");
+    Chk("Enable voice",&g_mei.voice_enabled);
+    ImGui::BeginDisabled(!g_mei.voice_enabled);
+    Chk("Unmute mic",&g_mei.voice_unmute);
+    ImGui::EndDisabled();
+    ImGui::Spacing();
+    if(ImGui::Button("Dump voice state (log)",ImVec2(240,40))) g_mei.act_voice_diag=true;
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "forces Android mic capture + net voice on. dump feeds the log for tuning.");
+    gb_end();
 }
 static void tab_ttt(){
     gb_begin("YOU");
@@ -317,6 +326,39 @@ static void tab_ttt(){
     if (g_kb2) { ImGui::Spacing(); keyboard(filter, sizeof filter); }
     gb_end();
 }
+static void tab_soundboard(){
+    gb_begin("VOICE TX  (ServerOnVoice)");
+    if (!g_mei.sb_present)
+        ImGui::TextColored(v4(IM_COL32(0xFF,0x6B,0x6B,0xFF)), "ServerOnVoice not resolved (join a match)");
+    else
+        ImGui::TextColored(v4(ACC()), "transmit path ready");
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)),
+        g_mei.sb_rec_live ? "header sample: locked from live voice" : "header: default (hear someone talk to refine)");
+    gb_end();
+
+    gb_begin("CLIPS");
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "drop .wav into files/soundboard/  (any rate, mono/stereo)");
+    ImGui::BeginChild("sb_list", ImVec2(0,190), true);
+    if (g_mei.sb_n_clips == 0) ImGui::TextDisabled("(no clips)");
+    for (int i = 0; i < g_mei.sb_n_clips && i < MEI_SB_MAX_CLIPS; i++) {
+        ImGui::PushID(i);
+        char label[MEI_SB_NAME_MAX + 8];
+        snprintf(label, sizeof label, "%s%s", (i == g_mei.sb_cur ? "> " : "  "), g_mei.sb_names[i]);
+        if (ImGui::Selectable(label, g_mei.sb_sel == i)) { g_mei.sb_sel = i; touched(); }
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+    if (ImGui::Button(g_mei.sb_cur >= 0 ? "SENDING..." : "PLAY", ImVec2(150,44)) && g_mei.sb_sel >= 0) g_mei.sb_act_play = true;
+    ImGui::SameLine();
+    if (ImGui::Button("STOP", ImVec2(120,44))) g_mei.sb_act_stop = true;
+    ImGui::SameLine();
+    if (ImGui::Button("Rescan", ImVec2(120,44))) g_mei.sb_act_rescan = true;
+    Chk("Loop", &g_mei.sb_loop);
+    Chk("Monitor (hear it yourself)", &g_mei.sb_monitor);
+    Sl("Gain", &g_mei.sb_gain, 0.5f, 8.0f, "%.1fx");
+    ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "gain applies on next PLAY (bakes into the encode)");
+    gb_end();
+}
 static void tab_config(){
     gb_begin("GENERAL");
     Chk("Master enable",&g_mei.master_enabled);
@@ -357,8 +399,8 @@ static void tab_config(){
 
 // ---- frame -------------------------------------------------------------------
 static int g_tab=0;
-static const char* TABS[]={"Aimbot","Visuals","Weapon","Movement","Player","TTT","Config"};
-static const int N_TABS=7;
+static const char* TABS[]={"Aimbot","Visuals","Weapon","Movement","Player","TTT","Sound","Config"};
+static const int N_TABS=8;
 
 void mei_menu_frame(int panel_w, int panel_h){
     float W=(float)panel_w, H=(float)panel_h;
@@ -412,7 +454,7 @@ void mei_menu_frame(int panel_w, int panel_h){
     switch(g_tab){
         case 0: tab_aimbot(); break;   case 1: tab_visuals(); break;  case 2: tab_weapon(); break;
         case 3: tab_movement(); break; case 4: tab_player(); break;   case 5: tab_ttt(); break;
-        case 6: tab_config(); break;
+        case 6: tab_soundboard(); break; case 7: tab_config(); break;
     }
     ImGui::Dummy(ImVec2(0,12));
     ImGui::PopItemWidth(); ImGui::Unindent(14.f);

@@ -16,6 +16,9 @@ OPENXR_TAG="release-1.1.36"     # Khronos OpenXR-SDK (headers only)
 # --------------------
 
 CLANG="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android29-clang++.cmd"
+CC="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android29-clang.cmd"
+AR="$NDK/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+OPUS_TAG="v1.5.2"
 echo "using NDK: $NDK"
 echo "using build-tools: $BUILDTOOLS"
 
@@ -34,17 +37,42 @@ if [ ! -f third_party/stb/stb_image.h ]; then
   mkdir -p third_party/stb
   curl -sL -o third_party/stb/stb_image.h https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
 fi
+# libopus — soundboard voice encoder (compiled to a static lib, linked into libpavchams)
+if [ ! -d third_party/opus ]; then
+  echo "[0/5] cloning libopus $OPUS_TAG"
+  git clone --depth 1 --branch "$OPUS_TAG" https://github.com/xiph/opus third_party/opus
+fi
+OPUS=third_party/opus
+if [ ! -f third_party/libopus.a ]; then
+  echo "[0/5] building libopus.a (generic C, no arch intrinsics)"
+  OPUS_INC="-I$OPUS/include -I$OPUS/celt -I$OPUS/silk -I$OPUS/silk/float -I$OPUS/src"
+  OPUS_DEF="-DOPUS_BUILD -DVAR_ARRAYS -DHAVE_STDINT_H -DUSE_ALLOCA"
+  rm -rf third_party/opus_obj && mkdir -p third_party/opus_obj
+  # gather core sources; skip arch dirs, fixed-point (we build float), demos + tests.
+  OPUS_SRCS=$(ls "$OPUS"/src/*.c "$OPUS"/celt/*.c "$OPUS"/silk/*.c "$OPUS"/silk/float/*.c 2>/dev/null \
+    | grep -viE "_demo|opus_compare|repacketizer_demo|trivial_example|mlp_train|/tests/")
+  oi=0
+  for f in $OPUS_SRCS; do
+    "$CC" -O2 -fPIC -std=c11 $OPUS_DEF $OPUS_INC -c "$f" -o "third_party/opus_obj/o$oi.o" || { echo "opus compile failed: $f"; exit 1; }
+    oi=$((oi+1))
+  done
+  "$AR" rcs third_party/libopus.a third_party/opus_obj/*.o
+  echo "[0/5] libopus.a built ($oi objects)"
+fi
 
 IMGUI=third_party/imgui
 OPENXR_INC=third_party/OpenXR-SDK/include
 
-INCLUDES="-I. -Imei -I$IMGUI -I$IMGUI/backends -I$OPENXR_INC"
+INCLUDES="-I. -Imei -I$IMGUI -I$IMGUI/backends -I$OPENXR_INC -I$OPUS/include"
 # -static-libstdc++ bundles libc++ INTO libpavchams.so so the injected lib has no libc++_shared.so
 # runtime dependency (nothing extra to ship in the APK).
-CXXFLAGS="-std=c++17 -O2 -fPIC -fvisibility=hidden -static-libstdc++ -DXR_USE_GRAPHICS_API_VULKAN=1 $INCLUDES"
+# EXTRA_CXXFLAGS lets you tack on extra compile flags without editing this file.
+CXXFLAGS="-std=c++17 -O2 -fPIC -fvisibility=hidden -static-libstdc++ -DXR_USE_GRAPHICS_API_VULKAN=1 $INCLUDES ${EXTRA_CXXFLAGS:-}"
 
 SRCS=(
   pavchams.cpp
+  audioshim.cpp
+  voice_opus.cpp
   mei/mei_settings.cpp
   mei/mei_menu.cpp
   mei/mei_input.cpp
@@ -56,8 +84,13 @@ SRCS=(
   "$IMGUI/backends/imgui_impl_vulkan.cpp"
 )
 
-echo "[1/5] compiling libpavchams.so (mod + mei menu + imgui)"
-"$CLANG" $CXXFLAGS -shared -o libpavchams.so "${SRCS[@]}" -llog -lvulkan -ldl
+# audioshim.cpp (the soundboard) is compiled INTO libpavchams.so — libOpenSLES.so is a public system
+# lib so it can't be replaced by APK name; pavchams GOT-hooks slCreateEngine from inside instead.
+echo "[1/5] compiling libpavchams.so (mod + soundboard + mei menu + imgui)"
+"$CLANG" $CXXFLAGS -shared -o libpavchams.so "${SRCS[@]}" third_party/libopus.a -llog -lvulkan -ldl -lm
+
+# remove any stale standalone soundboard libs from the old name-swap approach so repack won't bundle them.
+rm -f libOpenSLES.so libOpenSLE2.so
 
 echo "[2/5] repacking APK (repack.py)"
 python repack.py

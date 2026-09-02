@@ -15,6 +15,10 @@
 #define MEI_NAME_MAX 32
 #define MEI_PLAYERS_MAX 32
 
+// soundboard mirror sizes — must match audioshim.cpp SB_MAX_CLIPS / SB_NAME_MAX.
+#define MEI_SB_MAX_CLIPS 64
+#define MEI_SB_NAME_MAX  40
+
 // Live player list for the "pick who to kill" menu. pavchams fills g_players each pass (name/team/
 // whether the pawn is loaded = safe to report a hit on); the menu renders it + sets kill_sel/act_kill_sel.
 struct MeiPlayer { char name[MEI_NAME_MAX]; int team; bool loaded; bool alive; };
@@ -91,7 +95,31 @@ struct MeiSettings {
     bool  homing_knife     = false;
     bool  name_enabled     = false;
     char  name_text[MEI_NAME_MAX] = {0};   // client-side PlayerNamePrivate (short!)
+
+    // ---- Voice (Quest fix) ----
+    bool  voice_enabled    = false;   // force-enable the Android voice pipeline (mic capture + net voice)
+    bool  voice_unmute     = true;    // also clear bMicMuted / SetMicMuted(false)
     char  skin_name[MEI_NAME_MAX] = {0};   // player skin FName for SetPlayerSkin
+
+    // ---- Soundboard (audioshim -> libOpenSLES mic-inject bridge) ----
+    // The menu edits these; pavchams mirrors the shim's SbControl into the read-only fields each pass
+    // and pushes play/stop/rescan back into it. Persisted: loop / mix / gain.
+    bool  sb_loop          = false;   // loop the active clip
+    bool  sb_mix_mic       = false;   // 1 = layer clip over real mic; 0 = replace mic with clip
+    bool  sb_monitor       = true;    // also play the clip out your own headset (local monitor)
+    float sb_gain          = 3.0f;    // clip gain (linear) — loud enough to carry over other voices
+    int   sb_sel           = -1;      // selected clip index into sb_names
+    // read-only mirror (pavchams writes; menu reads)
+    bool  sb_present       = false;   // audioshim resolved in-process
+    bool  sb_rec_live      = false;   // game opened an SL recorder (voice capture wrapped)
+    int   sb_rec_rate      = 0, sb_rec_chans = 0, sb_rec_bits = 0;
+    int   sb_n_clips       = 0;
+    int   sb_cur           = -1;      // clip index currently playing, or -1
+    char  sb_names[MEI_SB_MAX_CLIPS][MEI_SB_NAME_MAX] = {{0}};
+    // one-shot actions (menu sets; pavchams consumes)
+    volatile bool sb_act_play   = false;  // start sb_sel
+    volatile bool sb_act_stop   = false;  // stop playback
+    volatile bool sb_act_rescan = false;  // re-scan the soundboard dir
 
     // ---- Menu / panel ----
     bool  menu_open        = false;   // is the panel currently shown
@@ -120,6 +148,7 @@ struct MeiSettings {
     volatile bool act_fixpawn        = false;   // re-resolve pawn-dependent stuff (gun/movement/controller) — keeps chams
     volatile bool act_skin           = false;   // apply player skin (SetPlayerSkin) now
     volatile bool act_change_name    = false;   // call ServerChangeName(name_text) RPC (server-visible rename)
+    volatile bool act_voice_diag     = false;   // one-shot: dump live voice state + fn signatures to logcat
     int           kill_sel           = -1;      // selected index into g_players (pick-a-target kill)
     volatile bool act_kill_sel       = false;   // one-shot: headshot the selected player now
     bool          kill_all_loop      = false;   // repeating: headshot every loaded enemy each pass (aura_rate)

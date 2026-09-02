@@ -64,6 +64,12 @@ void mei_save() {
     fprintf(f, "force_vote %d\n",      s.force_vote);
     fprintf(f, "homing_knife %d\n",    s.homing_knife);
     fprintf(f, "name_enabled %d\n",    s.name_enabled);
+    fprintf(f, "voice_enabled %d\n",   s.voice_enabled);
+    fprintf(f, "voice_unmute %d\n",    s.voice_unmute);
+    fprintf(f, "sb_loop %d\n",         s.sb_loop);
+    fprintf(f, "sb_mix_mic %d\n",      s.sb_mix_mic);
+    fprintf(f, "sb_monitor %d\n",      s.sb_monitor);
+    fprintf(f, "sb_gain %.3f\n",       s.sb_gain);
     fprintf(f, "name_text %s\n",       s.name_text[0] ? s.name_text : "-");
     fprintf(f, "skin_name %s\n",       s.skin_name[0] ? s.skin_name : "-");
     fprintf(f, "panel_dist %.3f\n",    s.panel_dist);
@@ -106,7 +112,9 @@ void mei_load() {
         GF("move_sprint", move_sprint) GF("move_ads", move_ads)
         GF("move_walk", move_walk) GF("move_crouch", move_crouch) GF("fly_speed", fly_speed)
         GI("godmode", godmode) GI("dev_tag", dev_tag) GI("force_vote", force_vote) GI("homing_knife", homing_knife)
-        GI("name_enabled", name_enabled) GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)
+        GI("name_enabled", name_enabled) GI("voice_enabled", voice_enabled) GI("voice_unmute", voice_unmute)
+        GI("sb_loop", sb_loop) GI("sb_mix_mic", sb_mix_mic) GI("sb_monitor", sb_monitor) GF("sb_gain", sb_gain)
+        GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)
         GI("ui_accent", ui_accent) GI("panel_custom", panel_custom)
         if (!strcmp(key, "panel_off") &&
             sscanf(line, "%*s %f %f %f", &s.panel_off[0], &s.panel_off[1], &s.panel_off[2]) == 3) continue;
