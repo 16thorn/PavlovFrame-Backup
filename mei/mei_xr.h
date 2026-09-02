@@ -11,3 +11,7 @@ bool mei_xr_ready();
 // True once our injected controller actions are reading real state (trigger/stick). While false,
 // pavchams keeps the up-gesture fallback for opening the menu.
 bool mei_xr_actions_live();
+
+// Right thumbstick Y, deadzoned (-1..1). Positive = up. Drives noclip vertical movement.
+// 0 when the stick is centered or our action isn't live.
+float mei_xr_lift();

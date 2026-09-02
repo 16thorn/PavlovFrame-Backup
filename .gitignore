@@ -40,3 +40,13 @@ sdk_dump*.txt
 .DS_Store
 Thumbs.db
 *.swp
+
+# session build artifacts / copyrighted blobs (do not commit)
+libsteam_api.so
+libsteam_ap2.so
+libpavchams.ours.so
+steam_api64.dll
+steam_appid.txt
+steam_ticket.txt
+dlls.txt
+pfp_test.*

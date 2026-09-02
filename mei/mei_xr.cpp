@@ -99,6 +99,7 @@ static PFN_xrAcquireSwapchainImage  pfn_xrAcquire = nullptr;
 static PFN_xrWaitSwapchainImage     pfn_xrWait    = nullptr;
 static PFN_xrReleaseSwapchainImage  pfn_xrRelease = nullptr;
 static PFN_xrGetActionStateBoolean  pfn_xrGetBool = nullptr;
+static PFN_xrGetActionStateFloat    pfn_xrGetFloat = nullptr;
 static PFN_xrLocateSpace            pfn_xrLocate  = nullptr;
 
 // ---- our injected input action set (real controller buttons) ----
@@ -106,6 +107,9 @@ static XrActionSet g_actionSet = XR_NULL_HANDLE;
 static XrAction    g_actClick  = XR_NULL_HANDLE;   // right trigger   -> click
 static XrAction    g_actToggle = XR_NULL_HANDLE;   // left stick press-> open/close
 static XrAction    g_actAim    = XR_NULL_HANDLE;   // right aim pose  -> cursor ray
+static XrAction    g_actLift   = XR_NULL_HANDLE;   // right stick Y   -> noclip up/down
+static float       g_lift      = 0.f;              // deadzoned right-stick Y (-1..1), read by pavchams noclip
+float mei_xr_lift() { return g_lift; }
 static XrSpace     g_aimSpace  = XR_NULL_HANDLE;   // action space for the aim pose
 static XrSpace     g_localspace = XR_NULL_HANDLE;  // world-anchored (LOCAL) reference space
 static XrPosef     g_panelPose  = { {0,0,0,1}, {0,0,0} };  // panel pose in LOCAL space (world-locked)
@@ -721,22 +725,32 @@ static void ensure_actions_created(XrInstance inst) {
     strncpy(ap.actionName, "menu_aim", sizeof ap.actionName - 1);
     strncpy(ap.localizedActionName, "Aim", sizeof ap.localizedActionName - 1);
     mkAct(g_actionSet, &ap, &g_actAim);
+    XrActionCreateInfo al{XR_TYPE_ACTION_CREATE_INFO}; al.actionType = XR_ACTION_TYPE_FLOAT_INPUT;
+    strncpy(al.actionName, "noclip_lift", sizeof al.actionName - 1);
+    strncpy(al.localizedActionName, "Lift", sizeof al.localizedActionName - 1);
+    mkAct(g_actionSet, &al, &g_actLift);
 
     xr_get("xrGetActionStateBoolean", &pfn_xrGetBool);   // cache the per-frame poll PFN
+    xr_get("xrGetActionStateFloat",   &pfn_xrGetFloat);  // right-stick Y for noclip vertical
     g_actions_built = (g_actionSet != XR_NULL_HANDLE && g_actClick != XR_NULL_HANDLE);
     XLOG("actions created (set=%p click=%p toggle=%p aim=%p)",
          (void*)g_actionSet, (void*)g_actClick, (void*)g_actToggle, (void*)g_actAim);
 }
 // map a profile string -> the source paths we bind our click/toggle/aim to on that controller.
-static void profile_paths(const char* prof, const char** click, const char** toggle, const char** aim) {
+static void profile_paths(const char* prof, const char** click, const char** toggle, const char** aim, const char** lift) {
     *click = "/user/hand/right/input/trigger/value";   // touch / touch_plus / touch_pro / index / vive / wmr
     *toggle = "/user/hand/left/input/thumbstick/click";
     *aim   = "/user/hand/right/input/aim/pose";         // aim pose exists on every interaction profile
+    *lift  = "/user/hand/right/input/thumbstick/y";     // noclip up/down (touch/touch_plus/touch_pro/index)
     if (strstr(prof, "khr/simple")) {                  // simple controller has no trigger value/stick
         *click = "/user/hand/right/input/select/click";
         *toggle = "/user/hand/left/input/menu/click";
-    } else if (strstr(prof, "vive_controller") || strstr(prof, "microsoft/motion")) {
-        *toggle = "/user/hand/left/input/trackpad/click";   // vive/wmr have no stick click -> trackpad
+        *lift  = nullptr;
+    } else if (strstr(prof, "vive_controller")) {
+        *toggle = "/user/hand/left/input/trackpad/click";   // vive has no stick click -> trackpad
+        *lift  = "/user/hand/right/input/trackpad/y";
+    } else if (strstr(prof, "microsoft/motion")) {
+        *toggle = "/user/hand/left/input/trackpad/click";   // wmr: stick click -> trackpad; stick Y exists
     }
 }
 
@@ -767,6 +781,15 @@ static void poll_actions() {
             XLOG("menu %s (L3 stick-press)", g_mei.menu_open ? "OPEN" : "closed");
         }
         prev = (tog.currentState != XR_FALSE);
+    }
+    // right-stick Y -> noclip vertical. Deadzone kills stick drift; hold 0 when inactive.
+    if (pfn_xrGetFloat && g_actLift != XR_NULL_HANDLE) {
+        XrActionStateFloat lf{XR_TYPE_ACTION_STATE_FLOAT}; gi.action = g_actLift;
+        if (XR_SUCCEEDED(pfn_xrGetFloat(g_session, &gi, &lf)) && lf.isActive) {
+            g_actions_live = true;
+            float v = lf.currentState;
+            g_lift = (v > 0.15f || v < -0.15f) ? v : 0.f;
+        } else g_lift = 0.f;
     }
 }
 
@@ -895,8 +918,10 @@ static XrResult XRAPI_PTR hk_xrSuggest(XrInstance inst, const XrInteractionProfi
 
     char profstr[128] = "?"; uint32_t plen = 0; PFN_xrPathToString p2s;
     if (xr_get("xrPathToString", &p2s)) p2s(inst, info->interactionProfile, sizeof profstr, &plen, profstr);
-    const char* cp; const char* tp; const char* ap; profile_paths(profstr, &cp, &tp, &ap);
+    const char* cp; const char* tp; const char* ap; const char* lp;
+    profile_paths(profstr, &cp, &tp, &ap, &lp);
     XrPath cpath = xr_path(cp), tpath = xr_path(tp), apath = xr_path(ap);
+    XrPath lpath = lp ? xr_path(lp) : XR_NULL_PATH;
 
     static XrActionSuggestedBinding merged[512];
     uint32_t n = info->countSuggestedBindings;
@@ -906,6 +931,7 @@ static XrResult XRAPI_PTR hk_xrSuggest(XrInstance inst, const XrInteractionProfi
     if (cpath != XR_NULL_PATH) merged[m++] = { g_actClick,  cpath };
     if (tpath != XR_NULL_PATH) merged[m++] = { g_actToggle, tpath };
     if (apath != XR_NULL_PATH) merged[m++] = { g_actAim,    apath };
+    if (lpath != XR_NULL_PATH) merged[m++] = { g_actLift,   lpath };
 
     XrInteractionProfileSuggestedBinding mod = *info;
     mod.suggestedBindings = merged; mod.countSuggestedBindings = m;

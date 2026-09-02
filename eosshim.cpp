@@ -10,6 +10,7 @@
 
 #include <dlfcn.h>
 #include <android/log.h>
+#include <cstdio>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -27,7 +28,8 @@ typedef int32_t EOS_EResult;
 typedef int32_t EOS_EExternalCredentialType;
 
 enum { EOS_ECT_DEVICEID_ACCESS_TOKEN = 10 };
-enum { EOS_CONNECT_USERLOGININFO_API_001 = 1, EOS_CONNECT_CREATEDEVICEID_API_001 = 1 };
+enum { EOS_CONNECT_USERLOGININFO_API_001 = 1, EOS_CONNECT_CREATEDEVICEID_API_001 = 1,
+       EOS_CONNECT_DELETEDEVICEID_API_001 = 1 };
 
 typedef struct {
     int32_t                     ApiVersion;
@@ -63,17 +65,29 @@ typedef struct {
     void*       ClientData;
 } EOS_Connect_CreateDeviceIdCallbackInfo;
 
+typedef struct {
+    int32_t ApiVersion;
+} EOS_Connect_DeleteDeviceIdOptions;
+
+typedef struct {
+    EOS_EResult ResultCode;
+    void*       ClientData;
+} EOS_Connect_DeleteDeviceIdCallbackInfo;
+
 typedef void (*EOS_Connect_OnLoginCallback)(const EOS_Connect_LoginCallbackInfo*);
 typedef void (*EOS_Connect_OnCreateDeviceIdCallback)(const EOS_Connect_CreateDeviceIdCallbackInfo*);
+typedef void (*EOS_Connect_OnDeleteDeviceIdCallback)(const EOS_Connect_DeleteDeviceIdCallbackInfo*);
 
 typedef void (*PFN_Login)(EOS_HConnect, const EOS_Connect_LoginOptions*, void*, EOS_Connect_OnLoginCallback);
 typedef void (*PFN_CreateDeviceId)(EOS_HConnect, const EOS_Connect_CreateDeviceIdOptions*, void*, EOS_Connect_OnCreateDeviceIdCallback);
+typedef void (*PFN_DeleteDeviceId)(EOS_HConnect, const EOS_Connect_DeleteDeviceIdOptions*, void*, EOS_Connect_OnDeleteDeviceIdCallback);
 
 } // extern "C"
 
 static void*              g_real              = nullptr;
 static PFN_Login          real_Login          = nullptr;
 static PFN_CreateDeviceId real_CreateDeviceId = nullptr;
+static PFN_DeleteDeviceId real_DeleteDeviceId = nullptr;
 
 static void* real_handle() {
     if (g_real) return g_real;
@@ -89,7 +103,9 @@ static void resolve_real() {
     if (!h) return;
     real_Login          = (PFN_Login)dlsym(h, "EOS_Connect_Login");
     real_CreateDeviceId = (PFN_CreateDeviceId)dlsym(h, "EOS_Connect_CreateDeviceId");
-    LOG("resolved real Login=%p CreateDeviceId=%p", (void*)real_Login, (void*)real_CreateDeviceId);
+    real_DeleteDeviceId = (PFN_DeleteDeviceId)dlsym(h, "EOS_Connect_DeleteDeviceId");
+    LOG("resolved real Login=%p CreateDeviceId=%p DeleteDeviceId=%p",
+        (void*)real_Login, (void*)real_CreateDeviceId, (void*)real_DeleteDeviceId);
 }
 
 // ---- diagnostics: prove routing + find the real login path ------------------
@@ -140,15 +156,39 @@ static void autologin_createid_cb(const EOS_Connect_CreateDeviceIdCallbackInfo* 
     o.ApiVersion = 2; o.Credentials = &creds; o.UserLoginInfo = &ui;
     real_Login(g_connect, &o, nullptr, autologin_login_cb);
 }
+#define NEWID_PATH "/sdcard/Android/data/com.vankrupt.pavlov/files/newid.txt"
+
+static void do_createid() {
+    if (!real_CreateDeviceId || !g_connect) return;
+    EOS_Connect_CreateDeviceIdOptions cdo;
+    cdo.ApiVersion = EOS_CONNECT_CREATEDEVICEID_API_001; cdo.DeviceModel = "Meta Quest 3";
+    real_CreateDeviceId(g_connect, &cdo, nullptr, autologin_createid_cb);
+}
+// after wiping the old device id, mint a brand new one -> fresh PUID (community-server unban).
+static void newid_delete_cb(const EOS_Connect_DeleteDeviceIdCallbackInfo* d) {
+    LOG("NEWID DeleteDeviceId result=%d -> minting fresh device id/PUID", d ? (int)d->ResultCode : -1);
+    do_createid();
+}
 static void start_autologin() {
     if (g_autologin_started || !g_connect) return;
     g_autologin_started = true;
     resolve_real();
     if (!real_CreateDeviceId) return;
     LOG("starting autonomous DeviceID login on connect=%p", (void*)g_connect);
-    EOS_Connect_CreateDeviceIdOptions cdo;
-    cdo.ApiVersion = EOS_CONNECT_CREATEDEVICEID_API_001; cdo.DeviceModel = "Meta Quest 3";
-    real_CreateDeviceId(g_connect, &cdo, nullptr, autologin_createid_cb);
+    // NEW IDENTITY: if newid.txt exists, delete the stored device id first so CreateDeviceId mints a
+    // brand-new one = a fresh anonymous PUID the server has never seen (dodges PUID/name bans). One-shot:
+    // remove the flag so we don't rotate every launch. Pair with a fresh persona.txt for a full new player.
+    FILE* nf = fopen(NEWID_PATH, "r");
+    if (nf) { fclose(nf); remove(NEWID_PATH);
+        if (real_DeleteDeviceId) {
+            LOG("NEWID flag present -> wiping device id for a fresh PUID");
+            EOS_Connect_DeleteDeviceIdOptions ddo; ddo.ApiVersion = EOS_CONNECT_DELETEDEVICEID_API_001;
+            real_DeleteDeviceId(g_connect, &ddo, nullptr, newid_delete_cb);
+            return;
+        }
+        LOG("NEWID flag present but DeleteDeviceId unresolved -> normal login");
+    }
+    do_createid();
 }
 
 typedef void* (*PFN_PlatformCreate)(const void*);

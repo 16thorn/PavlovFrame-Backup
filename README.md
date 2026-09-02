@@ -229,12 +229,35 @@ and fakes just enough of the Steam client for `ISteamFriends::GetPersonaName` to
 
 Set the name in `/sdcard/Android/data/com.vankrupt.pavlov/files/**persona.txt**`, restart (read at
 Steam-init on launch). EOS Device-ID auth is untouched (the EOS shim still rewrites Steam→Device-ID),
-no crash. Rotate `persona.txt` + hit **New identity** (fresh anonymous PUID, via the EOS shim's
-`newid.txt` flag) and you're a completely different player each time — dodges `null`/name/id admin bans.
+no crash.
 
-> Build: compile `steamshim.cpp` → `libsteam_api.so`, soname-patch the real lib → `libsteam_ap2.so`,
-> then repack the APK swapping `lib/arm64-v8a/libsteam_api.so` (wrapper) + adding `libsteam_ap2.so`
-> (both `ZIP_STORED`), zipalign `-p 4`, re-sign. Same wrap/soname-patch pattern as the EOS shim.
+**New identity (fresh PUID) — community-server unban.** Community bans target the EOS ProductUserId.
+Device-ID login reuses the stored device id → same PUID every launch → the ban sticks. The EOS shim
+(`eosshim.cpp`) adds `EOS_Connect_DeleteDeviceId`, gated by a one-shot flag: `touch .../files/newid.txt`
+→ next launch wipes the device id so `CreateDeviceId` mints a **brand-new PUID** the server has never
+seen (flag auto-deletes). Rotate `persona.txt` + `newid.txt` together = a completely different player
+each time — dodges `null`/name/id/PUID admin bans.
+
+### Profile picture — fake avatar (`steamshim.cpp`) ✅
+Same Steam pipeline as the name. The avatar is served through three more faked vtable slots, discovered
+live for **SteamFriends018 / SteamUtils010** by instrumenting every slot and reading `adb logcat`:
+- `ISteamFriends::GetMediumFriendAvatar` = **vtable[34]** → returns a non-zero image handle.
+- `ISteamUtils::GetImageSize` = **vtable[5]** → 64×64.
+- `ISteamUtils::GetImageRGBA` = **vtable[6]** → our 64×64 RGBA (Medium avatar = 64×64 = 16384 bytes).
+
+Drop **`pfp.png`** (or `.jpg`/`.bmp`) in `.../files/`; the shim decodes it with stb_image and
+nearest-neighbour-resamples to 64×64. Restart to apply. Gives the anonymous sideload a real face.
+
+> **Animated (GIF) pfp — NOT possible here.** The shim can decode a GIF's frames and drive the Steam
+> callback system (`SteamAPI_RegisterCallback`/`RunCallbacks`, firing `AvatarImageLoaded_t` [id **334**
+> = `k_iSteamFriendsCallbacks(300)+34`] with a rotating handle each frame). But **Pavlov fetches the
+> avatar exactly once** — `GetMediumFriendAvatar`/`GetImageRGBA` are each called a single time at spawn,
+> the texture is cached, and no callback or scoreboard-open makes it re-fetch (confirmed via file-log
+> instrumentation). Animation would need an engine-side texture swap (pavchams hook), not the Steam API.
+
+> Build: compile `steamshim.cpp` → `libsteam_api.so` (`-Ithird_party/stb`), soname-patch the real lib →
+> `libsteam_ap2.so`, then `repack.py` swaps `lib/arm64-v8a/libsteam_api.so` (wrapper) + adds
+> `libsteam_ap2.so` **automatically** (no manual step). Same wrap/soname-patch pattern as the EOS shim.
 
 ---
 

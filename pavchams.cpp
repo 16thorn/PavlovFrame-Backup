@@ -689,6 +689,8 @@ static void* fn_SetHidden = nullptr;// AActor::SetActorHiddenInGame (anti-smoke)
 static void* fn_GetItem = nullptr;  // PavlovPawn::GetItemOfClass
 static void* c_Gun = nullptr;       // Gun_Base_C
 static void* c_VRGun = nullptr;     // VRGun
+static void* c_VRMagazine = nullptr;   // VRMagazine (ancestry match for infinite-ammo sweep)
+static void* fn_AddMoveInput = nullptr; // APawn::AddMovementInput (smooth noclip vertical)
 // silent-aim reflection
 static void* fn_GetLoc = nullptr, *fn_GetRot = nullptr, *fn_SetRot = nullptr, *fn_SetLoc = nullptr;
 static void* fn_SockLoc = nullptr, *fn_LookAt = nullptr, *cdo_KML = nullptr;
@@ -980,9 +982,10 @@ static void do_movement(void* pawn) {
     if (!mc || !addr_readable((uintptr_t)mc) || !in_lib(*(uintptr_t*)mc)) {
         if (dbg++ < 12) LOG("move: NO movecomp (mc=%p pawn=%p move_enabled=%d)", mc, pawn, g_mei.move_enabled);
         return; }
-    // NOCLIP: proper UE cheat-fly. bCheatFlying + MOVE_Flying + zero gravity = smooth flight with no
-    // ground snapping / gravity fighting (that was the jitter). Collision off = pass through walls.
-    // Offline. Capture originals on the enable EDGE (before the per-frame apply overwrites them).
+    // NOCLIP: proper UE cheat-fly (smooth + online-safe per commit f1a210e). bCheatFlying + MOVE_Flying +
+    // zero gravity = smooth 3D flight via the stick with no ground snapping / gravity fighting. Collision
+    // off = pass through walls. PLUS friend's explicit RIGHT-STICK up/down for manual vertical control on
+    // top of the flight. Capture originals on the enable EDGE (before the per-frame apply overwrites them).
     { void* mcc = obj_class(mc);
       static int32_t o_mm = -2, o_fly = -2, o_cheat = -2, o_grav = -2;
       if (o_mm == -2)    o_mm    = prop_offset(mcc, "MovementMode");
@@ -1003,11 +1006,15 @@ static void do_movement(void* pawn) {
           if (fn_SetCollision) { struct { uint8_t on; char p[7]; } p{ (uint8_t)(nc?0:1), {0} }; g_ProcessEvent(pawn, fn_SetCollision, &p); }
           ncPrev = nc;
       }
-      if (nc) {                                              // per-frame hold
+      if (nc) {                                              // per-frame hold (idempotent same-value writes)
           if (o_mm >= 0)    *(uint8_t*)((uint8_t*)mc + o_mm) = 5;                 // MOVE_Flying
           if (o_cheat >= 0) *(uint8_t*)((uint8_t*)mc + o_cheat) = 1;              // bCheatFlying → smooth
           if (o_grav >= 0)  *(float*)((uint8_t*)mc + o_grav) = 0.f;               // kill gravity pull
-          if (o_fly >= 0)   *(float*)((uint8_t*)mc + o_fly) = 2400.f * g_mei.move_walk;
+          if (o_fly >= 0)   *(float*)((uint8_t*)mc + o_fly) = 800.f * g_mei.fly_speed;  // decoupled from walk mult
+          // vertical is handled by Pavlov's OWN flying locomotion (fly where you aim/move) — do NOT inject
+          // our own AddMovementInput/SetActorLocation here: do_movement runs per-ProcessEvent (dozens of
+          // times/frame), so any per-call movement input accumulates and jitters. The mode writes above
+          // are idempotent (same value) so they're safe to repeat; movement stays the native path.
       } }
     if (g_mSprint == -1) { void* mcc = obj_class(mc);
         g_mSprint = prop_offset(mcc, "SprintSpeedMultiplier");
@@ -1043,6 +1050,49 @@ static void do_godmode(void* pawn) {
         if (g_hcDmg >= 0) dmgOrig = *(float*)((uint8_t*)hc + g_hcDmg); }
     if (g_mei.master_enabled && g_mei.godmode) { g_hc = hc; keep_god(); }
     else { g_hc = nullptr; if (g_hcDmg >= 0) *(float*)((uint8_t*)hc + g_hcDmg) = (dmgOrig >= 0.f ? dmgOrig : 1.f); }
+}
+// INFINITE AMMO (friend's "force every magazine BP to 10k"): instead of topping up only the held gun,
+// sweep GObjects and pin MaxBullets + Bullets high on EVERY *Magazine* object — this hits both class
+// default objects (so new mags spawn at 10k) and every live instance. Per-class cache of the magazine
+// verdict + Bullets/MaxBullets offsets (no FName decode per object). Sanity-check the current value so
+// a half-initialised magazine during spawn is skipped (that was the old crash). Fault-guarded by caller.
+// Server-authoritative online -> best on offline/custom/community; official servers may re-cap.
+#define INF_AMMO 9999
+static void* g_magClsC[512]; static int8_t g_magClsB[512];
+static int32_t g_magClsBul[512], g_magClsMax[512]; static int g_magClsN = 0;
+static bool cls_mag_offsets(void* cls, int32_t* bulOff, int32_t* maxOff) {
+    if (!addr_readable((uintptr_t)cls)) return false;
+    for (int i = 0; i < g_magClsN; i++) if (g_magClsC[i] == cls) {
+        *bulOff = g_magClsBul[i]; *maxOff = g_magClsMax[i]; return g_magClsB[i]; }
+    // ANCESTRY match: any subclass of VRMagazine (per-gun mag BPs, stripper clips, etc.) — a plain
+    // name-contains-"Magazine" check missed the guns whose mag class is named differently.
+    bool b = false;
+    if (c_VRMagazine) { for (void* k = cls; addr_readable((uintptr_t)k); k = struct_super(k)) {
+        if (k == c_VRMagazine) { b = true; break; } if (!struct_super(k)) break; } }
+    if (!b) { char c[64]; obj_name(cls, c, sizeof c); b = strstr(c, "Magazine") != nullptr; }  // fallback
+    int32_t bo = -1, mo = -1;
+    if (b) { bo = prop_offset(cls, "Bullets"); mo = prop_offset(cls, "MaxBullets");
+             b = (bo >= 0 && mo >= 0); }             // only treat as usable if both fields resolve
+    if (g_magClsN < 512) { g_magClsC[g_magClsN] = cls; g_magClsB[g_magClsN] = b;
+        g_magClsBul[g_magClsN] = bo; g_magClsMax[g_magClsN] = mo; g_magClsN++; }
+    *bulOff = bo; *maxOff = mo; return b;
+}
+static void do_infammo() {
+    if (!(g_mei.master_enabled && g_mei.infinite_ammo)) return;
+    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    if (ms - last < 200) return; last = ms;          // ~5Hz full sweep
+    int32_t n = objects_num();
+    for (int i = 0; i < n; i++) { void* o = object_at(i);
+        if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o)) continue;
+        int32_t bo, mo; if (!cls_mag_offsets(obj_class(o), &bo, &mo)) continue;
+        int32_t* mx = (int32_t*)((uint8_t*)o + mo);
+        int32_t* cur = (int32_t*)((uint8_t*)o + bo);
+        if (!addr_readable((uintptr_t)mx) || !addr_readable((uintptr_t)cur)) continue;
+        if (*mx <= 0 || *mx > 1000000) continue;      // garbage / half-init -> skip (old crash guard)
+        if (*mx  != INF_AMMO) *mx  = INF_AMMO;
+        if (*cur != INF_AMMO) *cur = INF_AMMO;        // keep it topped so it never counts to reload
+    }
 }
 // ANTI-FLASH / SMOKE: GlobalPlayerEffects drives the flash/smoke blind via an opacity curve sampled at
 // `Time`. Pin Time past the curve's end so the blind opacity reads ~0 -> screen stays clear.
@@ -1278,6 +1328,9 @@ static void resolve_names() {
     fn_GetRot = find_func(c_PavlovPawn, "K2_GetActorRotation");
     fn_SetRot = find_func(c_PavlovPawn, "K2_SetActorRotation");
     fn_SetLoc = find_func(c_PavlovPawn, "K2_SetActorLocation");   // bullet TP (server traces from replicated pos)
+    fn_AddMoveInput = find_func(c_PavlovPawn, "AddMovementInput"); // smooth noclip vertical (flying integrator)
+    c_VRMagazine = find_class("VRMagazine");                       // infinite-ammo ancestry match
+    LOG("AddMovementInput=%p VRMagazine=%p", fn_AddMoveInput, c_VRMagazine);
     fn_SockLoc = c_Mesh ? find_func(c_Mesh, "GetSocketLocation") : nullptr;
     void* kml = find_class("KismetMathLibrary");
     fn_LookAt = kml ? find_func(kml, "FindLookAtRotation") : nullptr;
@@ -2307,6 +2360,7 @@ static void chams_pass() {
     if ((wantMove || ranMove) && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_movement(me); g_fguard = 0; }
     ranMove = wantMove;
     g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_antiflash(); g_fguard = 0;   // anti-flash/smoke
+    g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_infammo();  g_fguard = 0;   // infinite ammo (all-magazine sweep)
     // ESP restore: the moment chams turns OFF, put every overridden mesh back to its original material
     // (else the x-ray stays until respawn). One-shot: cham_restore_all clears the cache.
     if (!on) { if (g_nCham > 0) cham_restore_all(); return; }

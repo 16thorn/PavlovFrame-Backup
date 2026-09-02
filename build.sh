@@ -29,6 +29,11 @@ if [ ! -d third_party/OpenXR-SDK ]; then
   echo "[0/5] cloning OpenXR-SDK $OPENXR_TAG (headers)"
   git clone --depth 1 --branch "$OPENXR_TAG" https://github.com/KhronosGroup/OpenXR-SDK third_party/OpenXR-SDK
 fi
+if [ ! -f third_party/stb/stb_image.h ]; then
+  echo "[0/5] fetching stb_image.h (steam-shim pfp decode)"
+  mkdir -p third_party/stb
+  curl -sL -o third_party/stb/stb_image.h https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
+fi
 
 IMGUI=third_party/imgui
 OPENXR_INC=third_party/OpenXR-SDK/include

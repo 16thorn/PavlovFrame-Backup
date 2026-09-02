@@ -81,6 +81,8 @@ struct MeiSettings {
     float move_ads         = 5.0f;    // old hardcoded 5.0 (fast while aiming)
     float move_walk        = 2.0f;    // multiplier on original walk (old 2.0x)
     float move_crouch      = 2.0f;    // multiplier on original crouch walk speed
+    float fly_speed        = 3.0f;    // noclip flight speed multiplier (DECOUPLED from walk so 20x walk
+                                      // doesn't make flying uncontrollable). fly MaxFlySpeed = 800 * this.
 
     // ---- Player ----
     bool  godmode          = false;   // offline only (server-auth)

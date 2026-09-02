@@ -12,6 +12,8 @@ out = B + "Pavlov-EOS-unsigned.apk"
 
 wrap_b = open(B + "libEOSSDK.so", "rb").read()   # -> lib/arm64-v8a/libEOSSDK.so
 real_b = open(B + "libEOSDK.so",  "rb").read()   # -> lib/arm64-v8a/libEOSDK.so
+steam_wrap_b = open(B + "libsteam_api.so", "rb").read()   # persona wrapper -> lib/arm64-v8a/libsteam_api.so
+steam_real_b = open(B + "libsteam_ap2.so", "rb").read()   # real Steam renamed -> lib/arm64-v8a/libsteam_ap2.so
 
 zin  = zipfile.ZipFile(src, "r")
 zout = zipfile.ZipFile(out, "w")
@@ -26,6 +28,14 @@ for zi in zin.infolist():
         ni.compress_type = zipfile.ZIP_DEFLATED
         ni.external_attr = zi.external_attr
         zout.writestr(ni, wrap_b)
+        continue
+    if name == "lib/arm64-v8a/libsteam_api.so":
+        # swap the real Steam lib for OUR persona wrapper (fake ISteamFriends::GetPersonaName).
+        # libUnreal DT_NEEDEDs libsteam_api.so; the wrapper DT_NEEDEDs libsteam_ap2.so (real, added below).
+        ni = zipfile.ZipInfo("lib/arm64-v8a/libsteam_api.so")
+        ni.compress_type = zipfile.ZIP_DEFLATED
+        ni.external_attr = zi.external_attr
+        zout.writestr(ni, steam_wrap_b)
         continue
     if name == "AndroidManifest.xml":
         ni = zipfile.ZipInfo("AndroidManifest.xml")
@@ -55,6 +65,11 @@ for zi in zin.infolist():
 ri = zipfile.ZipInfo("lib/arm64-v8a/libEOSDK.so")
 ri.compress_type = zipfile.ZIP_DEFLATED
 zout.writestr(ri, real_b)
+
+# add the real Steam lib under its patched soname; the persona wrapper (libsteam_api.so) DT_NEEDEDs it.
+si = zipfile.ZipInfo("lib/arm64-v8a/libsteam_ap2.so")
+si.compress_type = zipfile.ZIP_DEFLATED
+zout.writestr(si, steam_real_b)
 
 # add the chams lib; libEOSSDK.so's constructor dlopen()s it (no patchelf on libUnreal)
 chams_b = open(B + "libpavchams.so", "rb").read()

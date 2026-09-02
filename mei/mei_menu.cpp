@@ -85,17 +85,27 @@ static bool g_kb=false, g_kb2=false, g_shift=false;
 static void kb_append(char* b,int cap,char ch){ int n=(int)strlen(b); if(n<cap-1){b[n]=ch;b[n+1]=0;touched();} }
 static void keyboard(char* buf,int cap){
     const char* rows[4]={"1234567890","QWERTYUIOP","ASDFGHJKL","ZXCVBNM"};
+    const char* digsym ="!@#$%^&*()";     // shift on the number row -> standard US symbols
+    const char* symrow ="@_-.!#$%&+";      // dedicated symbol row (literal, shift-independent)
     for(int r=0;r<4;r++){
         if(r==2) ImGui::Indent(26.f); if(r==3) ImGui::Indent(52.f);
-        for(const char* p=rows[r]; *p; p++){
-            char ch=*p; if(!g_shift && ch>='A'&&ch<='Z') ch+=32;
-            char lab[2]={ch,0};
+        for(int i=0; rows[r][i]; i++){
+            char ch=rows[r][i];
+            if(r==0 && g_shift) ch=digsym[i];              // 1->! 2->@ ... on shift
+            else if(!g_shift && ch>='A'&&ch<='Z') ch+=32;  // letters lowercase unless shift
+            char lab[8]; snprintf(lab,sizeof lab,"%c##k%d_%d",ch,r,i);   // unique id (avoid dup-char clash)
             if(ImGui::Button(lab, ImVec2(52,46))) kb_append(buf,cap,ch);
             ImGui::SameLine();
         }
         if(r==2) ImGui::Unindent(26.f); if(r==3) ImGui::Unindent(52.f);
         ImGui::NewLine();
     }
+    for(int i=0; symrow[i]; i++){                          // symbols row (always available: @ _ - . etc)
+        char lab[8]; snprintf(lab,sizeof lab,"%c##sym%d",symrow[i],i);
+        if(ImGui::Button(lab, ImVec2(52,46))) kb_append(buf,cap,symrow[i]);
+        ImGui::SameLine();
+    }
+    ImGui::NewLine();
     if(ImGui::Button(g_shift?"SHIFT":"shift",ImVec2(82,46))) g_shift=!g_shift; ImGui::SameLine();
     if(ImGui::Button("space",ImVec2(220,46))) kb_append(buf,cap,' '); ImGui::SameLine();
     if(ImGui::Button("back",ImVec2(82,46))){ int n=(int)strlen(buf); if(n>0){buf[n-1]=0;touched();} } ImGui::SameLine();
@@ -208,12 +218,15 @@ static void tab_movement(){
     gb_begin("MOVEMENT");
     Chk("Enabled",&g_mei.move_enabled);
     ImGui::BeginDisabled(!g_mei.move_enabled);
-    Sl("Sprint",&g_mei.move_sprint,1.f,5.f,"%.1fx");
-    Sl("ADS",&g_mei.move_ads,1.f,8.f,"%.1fx");
-    Sl("Walk",&g_mei.move_walk,1.f,5.f,"%.1fx");
-    Sl("Crouch",&g_mei.move_crouch,1.f,5.f,"%.1fx");
+    Sl("Sprint",&g_mei.move_sprint,1.f,20.f,"%.1fx");
+    Sl("ADS",&g_mei.move_ads,1.f,20.f,"%.1fx");
+    Sl("Walk",&g_mei.move_walk,1.f,20.f,"%.1fx");
+    Sl("Crouch",&g_mei.move_crouch,1.f,20.f,"%.1fx");
     ImGui::EndDisabled();
     Chk("Noclip (fly + no collision)",&g_mei.noclip);
+    ImGui::BeginDisabled(!g_mei.noclip);
+    Sl("Fly speed",&g_mei.fly_speed,1.f,15.f,"%.1fx");
+    ImGui::EndDisabled();
     gb_end();
 }
 static void tab_player(){
