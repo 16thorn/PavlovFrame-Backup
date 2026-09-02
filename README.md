@@ -350,5 +350,6 @@ PRs welcome. Keep it single-file-friendly and comment the offsets/mechanisms you
 ---
 
 ## Credits
+- Standalone Pavlov Shack lib by 16thorn, repo, bamber
 - EOS Device-ID auth + Quest port: see `docs/EOS-PORT.md`.
 - Chams / silent-aim technique adapted from a [friend](https://github.com/xixray)
