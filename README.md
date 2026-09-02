@@ -302,7 +302,7 @@ patchelf on `libUnreal`. The EOS shim also provides anonymous Device-ID online a
 
 **In the repo (our source):**
 - `pavchams.cpp` — the mod (all features + engine self-resolution).
-- `mei/` — the **mei mei [private]** VR ImGui menu: `mei_settings` (state + `mei.cfg`), `mei_menu`
+- `mei/` — the **2016 client** VR ImGui menu: `mei_settings` (state + `mei.cfg`), `mei_menu`
   (tabs/UI), `mei_input` (controller-ray cursor), `mei_xr` (OpenXR quad-layer + Vulkan backend).
 - `eosshim.cpp`, `stub.c`, `minisrc/` — the EOS interposer / loader source.
 - `repack.py` — APK repacker.
@@ -351,4 +351,4 @@ PRs welcome. Keep it single-file-friendly and comment the offsets/mechanisms you
 
 ## Credits
 - EOS Device-ID auth + Quest port: see `docs/EOS-PORT.md`.
-- Chams / silent-aim technique adapted from a community PC-VR PostRender reference.
+- Chams / silent-aim technique adapted from a [friend](https://github.com/xixray)
