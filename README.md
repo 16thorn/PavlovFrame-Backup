@@ -28,10 +28,10 @@ the game thread from a hooked `ProcessEvent`.
 | **Kill All** | On-fire: headshots every *loaded* enemy on the bullet. Detectable — use sparingly. | ✅ (loaded enemies) |
 | **Target kill** *(pick-a-player)* | Live player list by name in the Weapon tab — pick one, **KILL SELECTED**. Re-resolves the target fresh by name each press (crash-safe). White = loaded/killable, grey = too far. | ✅ (loaded enemies) |
 | **No-recoil + perfect accuracy** | Zeroes recoil/spread floats on the held gun. | ✅ |
-| **Rapid / auto fire, no-reload, infinite ammo** | Fire-rate config + `FireMode` = Automatic; reload/ammo tweaks. | offline; server may cap |
+| **Rapid / auto fire, infinite ammo** | Fire-rate config + `FireMode` = Automatic; reload/ammo tweaks. |
 | **Movement** | Boosts `MaxWalkSpeed` / sprint / ADS / **crouch** on `PavlovMovementComponent`; optional **noclip** (fly + collision off, offline). | client-predicted |
 | **Anti-flash** | Zeroes the flashbang blind curve on `GlobalPlayerEffects`. | ✅ (client render) |
-| **TTT buy menu** | `ServerBuy(FName)` with a categorized + searchable weapon list (exact Pavlov equipment IDs). | ✅ where buying is on |
+| **buy anything menu** | `ServerBuy(FName)` with a categorized + searchable weapon list (exact Pavlov equipment IDs). | ✅ where buying is on |
 | **Godmode / homing knife / name changer / dev tag** | Server-authoritative or client-view-only — see [Server ceiling](#server-authoritative-ceiling). **⚠️ Name changer / dev tag / noclip crash the game ONLINE** (replicated writes) — offline only. | offline only |
 | **SDK dumper** | Walks all `UClass`/`ScriptStruct` → `name : super + props(+offset,type) + funcs` in `sdk_dump.txt`. | tool |
 
