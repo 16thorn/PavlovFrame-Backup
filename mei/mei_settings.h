@@ -21,7 +21,8 @@
 
 // Live player list for the "pick who to kill" menu. pavchams fills g_players each pass (name/team/
 // whether the pawn is loaded = safe to report a hit on); the menu renders it + sets kill_sel/act_kill_sel.
-struct MeiPlayer { char name[MEI_NAME_MAX]; int team; bool loaded; bool alive; };
+struct MeiPlayer { char name[MEI_NAME_MAX]; int team; bool loaded; bool alive;
+                   char platform[48]; int ping; bool dev; };   // intel: Steam/platform id, ping(ms), dev flag
 extern MeiPlayer g_players[MEI_PLAYERS_MAX];
 extern int       g_players_n;
 
@@ -126,6 +127,9 @@ struct MeiSettings {
     float panel_dist       = 0.85f;   // metres in front of the head (comfortable arm's-length)
     float panel_scale      = 1.3f;    // quad size multiplier
     int   ui_accent        = 0;       // theme accent index (see mei_menu.cpp)
+    bool  ui_dark          = true;    // dark (true) / light (false) mode
+    char  username[MEI_NAME_MAX] = {0};   // client display name (header / greeting / user card)
+    volatile bool licensed = false;   // runtime: valid key present (NOT saved) — gates all mods
 
     // ---- Panel reposition ("move panel") ----
     bool  reposition       = false;   // Move mode ON: point off-panel + hold trigger to drag it (transient, not saved)

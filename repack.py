@@ -7,7 +7,8 @@
 import zipfile, os
 
 B   = os.path.dirname(os.path.abspath(__file__)) + "/"
-src = r"C:/Users/lodge/Documents/pavlov-quest/Pavlov-Shim-signed.apk"
+# base APK to repack. Bring your own dump; override the location via env if it's not next to this script.
+src = os.environ.get("PAVLOV_SRC_APK", B + "Pavlov-Shim-signed.apk")
 out = B + "Pavlov-EOS-unsigned.apk"
 
 wrap_b = open(B + "libEOSSDK.so", "rb").read()   # -> lib/arm64-v8a/libEOSSDK.so

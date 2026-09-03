@@ -75,6 +75,8 @@ void mei_save() {
     fprintf(f, "panel_dist %.3f\n",    s.panel_dist);
     fprintf(f, "panel_scale %.3f\n",   s.panel_scale);
     fprintf(f, "ui_accent %d\n",       s.ui_accent);
+    fprintf(f, "ui_dark %d\n",         s.ui_dark);
+    fprintf(f, "username %s\n",        s.username[0] ? s.username : "-");
     fprintf(f, "panel_custom %d\n",    s.panel_custom);
     fprintf(f, "panel_off %.4f %.4f %.4f\n", s.panel_off[0], s.panel_off[1], s.panel_off[2]);
     fclose(f);
@@ -115,7 +117,7 @@ void mei_load() {
         GI("name_enabled", name_enabled) GI("voice_enabled", voice_enabled) GI("voice_unmute", voice_unmute)
         GI("sb_loop", sb_loop) GI("sb_mix_mic", sb_mix_mic) GI("sb_monitor", sb_monitor) GF("sb_gain", sb_gain)
         GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)
-        GI("ui_accent", ui_accent) GI("panel_custom", panel_custom)
+        GI("ui_accent", ui_accent) GI("ui_dark", ui_dark) GI("panel_custom", panel_custom)
         if (!strcmp(key, "panel_off") &&
             sscanf(line, "%*s %f %f %f", &s.panel_off[0], &s.panel_off[1], &s.panel_off[2]) == 3) continue;
         if (!strcmp(key, "name_text") && sscanf(line, "%*s %127s", sval) == 1) {
@@ -123,6 +125,9 @@ void mei_load() {
         }
         if (!strcmp(key, "skin_name") && sscanf(line, "%*s %127s", sval) == 1) {
             if (strcmp(sval, "-")) { strncpy(s.skin_name, sval, MEI_NAME_MAX-1); s.skin_name[MEI_NAME_MAX-1]=0; }
+        }
+        if (!strcmp(key, "username") && sscanf(line, "%*s %127s", sval) == 1) {
+            if (strcmp(sval, "-")) { strncpy(s.username, sval, MEI_NAME_MAX-1); s.username[MEI_NAME_MAX-1]=0; }
         }
         #undef GI
         #undef GF

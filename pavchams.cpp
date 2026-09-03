@@ -33,6 +33,7 @@
 #include <cstdlib>
 
 #include "mei/mei_settings.h"   // granular feature state (menu <-> core)
+#include "mei/mei_key.h"        // license gate (HWID-bound weekly/monthly/lifetime)
 #include "mei/mei_input.h"      // controller-ray -> ImGui cursor bridge
 #include "mei/mei_xr.h"         // OpenXR/Vulkan menu injection
 #include "mei/mei_esp.h"        // shared ESP entry buffer (we project, mei_xr draws)
@@ -1870,7 +1871,7 @@ static void menu_spawn(void* me) {
     void* tc = g_textcomp ? g_textcomp : actor;
     if (fn_SetWorldSize) { struct { float s; } p{ 48.f }; g_ProcessEvent(tc, fn_SetWorldSize, &p); }
     if (fn_SetColor)     { struct { uint32_t c; } p{ 0xFF00FF00u }; g_ProcessEvent(tc, fn_SetColor, &p); } // green
-    set_text(tc, "ratman4080");
+    set_text(tc, "2016");
 }
 // keep the text 150u in front of the camera, facing you, each tick
 static void menu_tick() {
@@ -1909,7 +1910,7 @@ static void menu_tick() {
     switch (g_cfg) { case 2: mode="CHAMS+NORECOIL"; break; case 3: mode="+SILENT AIM"; break;
         case 4: mode="FULL (rapid/ammo/speed)"; break; case 6: mode="ONLINE AIMBOT"; break;
         case 5: mode="HIDE DBG"; break; case 9: mode="SDK DUMP"; break; }
-    char buf[96]; snprintf(buf, sizeof buf, "ratman4080\nmode %d: %s", g_cfg, mode);
+    char buf[96]; snprintf(buf, sizeof buf, "2016\nmode %d: %s", g_cfg, mode);
     set_text(g_textcomp, buf);
 }
 
@@ -3220,8 +3221,13 @@ static void soundboard_pass() {
 static void handler(void* obj, void* func, void* params) {
     // mei menu input feed (throttled inside; guarded against PE re-entry)
     if (!g_in_pass && g_ready) { g_in_pass = true; mei_feed_input(); g_in_pass = false; }
-    // soundboard: voice-TX replay (calls ServerOnVoice -> re-enters PE, so guard it)
-    if (!g_in_pass && g_ready) { g_in_pass = true; soundboard_pass(); g_in_pass = false; }
+    // LICENSE GATE: re-check the key every ~8s; no valid key -> force master OFF so nothing arms.
+    { static long lastlic = 0; struct timespec lt; clock_gettime(CLOCK_MONOTONIC, &lt);
+      long lms = lt.tv_sec*1000 + lt.tv_nsec/1000000;
+      if (lms - lastlic >= 8000) { lastlic = lms; g_mei.licensed = mei_key_check(); } }
+    if (!g_mei.licensed) g_mei.master_enabled = false;
+    // soundboard: voice-TX replay (calls ServerOnVoice -> re-enters PE, so guard it) — licensed only.
+    if (!g_in_pass && g_ready && g_mei.licensed) { g_in_pass = true; soundboard_pass(); g_in_pass = false; }
     // ESP gather (~30 Hz) — project enemies for the overlay quad; consume the Buy action.
     if (!g_in_pass && g_ready && g_mei.master_enabled) {
         if (g_mei.act_buy) { g_mei.act_buy = false; g_in_pass = true; do_buy(g_mei.buy_name); g_in_pass = false; }
@@ -3482,6 +3488,7 @@ static void* boot(void*) {
     install_fault();
     log_auth_libs();            // one-time: what verification libs are in the process?
     mei_load();                 // pull saved feature state (mei.cfg) before anything gates on it
+    mei_key_check(); g_mei.licensed = mei_key_licensed();   // license gate: no key = mods stay locked
     scan_maps();
     if (!g_base) { LOG("libUnreal not mapped yet"); return nullptr; }
     LOG("libUnreal base=%p text=[%p,%p]", (void*)g_base, (void*)g_text_lo, (void*)g_text_hi);

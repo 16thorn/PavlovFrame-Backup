@@ -34,7 +34,21 @@ mei.cfg
 
 # ---- runtime dumps / large artifacts ----
 sdk_dump*.txt
+SDK.hpp
+SDK/
+Metadata.json
+Objects.txt
+Offsets.hpp
 *.log
+
+# ---- per-device runtime / license state (never commit) ----
+key.dat
+persona.txt
+keyserver.txt
+keyserver/keys.json
+libOpenSLES_real.so
+libOpenSLE2.so
+libOpenSLES.so
 
 # ---- OS / editor ----
 .DS_Store

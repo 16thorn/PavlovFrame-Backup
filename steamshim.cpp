@@ -16,6 +16,7 @@
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO,"STEAMSHIM",__VA_ARGS__)
 #define FILES_DIR "/sdcard/Android/data/com.vankrupt.pavlov/files/"
 #define PERSONA_PATH FILES_DIR "persona.txt"
+#define STEAMID_PATH FILES_DIR "steamid.txt"
 #define STATUS_PATH  FILES_DIR "steamshim_status.txt"
 // file logging — logcat drops the earliest lines (constructor runs before logd connects), so mirror
 // diagnostics to a file we can read back. `reset` truncates; otherwise append.
@@ -35,7 +36,8 @@ static void slog(bool reset, const char* fmt, ...){
 #define VT_IMG_SIZE   5
 #define VT_IMG_RGBA   6
 
-static char  g_persona[64] = "ratman4080";
+static char     g_persona[64] = "player";   // default only; override via files/persona.txt
+static uint64_t g_steamid = 0x0110000100000001ULL;   // spoofed SteamID64 (override via steamid.txt)
 static void* g_friends_vtbl[256];
 static void* g_friends_obj[2];   // [0] = vtable ptr (C++ object layout)
 static void* g_stub_vtbl[256];   // generic fake interface (all methods stubbed)
@@ -53,6 +55,11 @@ static void load_persona(){
     FILE* f=fopen(PERSONA_PATH,"r");
     if(f){ if(fgets(g_persona,sizeof g_persona,f)){ int L=(int)strlen(g_persona);
         while(L>0&&(g_persona[L-1]=='\n'||g_persona[L-1]=='\r'||g_persona[L-1]==' ')) g_persona[--L]=0; } fclose(f); }
+    // steamid.txt: a SteamID64 as decimal (76561…) or hex (0x…). Read at Steam-init on launch.
+    FILE* s=fopen(STEAMID_PATH,"r");
+    if(s){ char b[32]={0}; if(fgets(b,sizeof b,s)){ char* p=b; while(*p==' ')p++;
+        uint64_t v = (p[0]=='0'&&(p[1]=='x'||p[1]=='X')) ? strtoull(p+2,nullptr,16) : strtoull(p,nullptr,10);
+        if(v) g_steamid=v; } fclose(s); }
 }
 // nearest-neighbour resample one w*h RGBA source frame into the 64x64 dst slot.
 static void nn_resize(const uint8_t* src, int w, int h, uint8_t* dst){
@@ -107,7 +114,7 @@ static void*       fake_stub(void*){ return nullptr; }               // generic 
 // stops waiting on Steam login and proceeds to the name).
 static int      fake_GetHSteamUser(void*){ return 1; }
 static bool     fake_BLoggedOn(void*){ return true; }
-static uint64_t fake_GetSteamID(void*){ return 0x0110000100000001ULL; } // valid individual SteamID
+static uint64_t fake_GetSteamID(void*){ return g_steamid; } // spoofed SteamID64 (steamid.txt)
 static void* g_user_vtbl[256];
 static void* g_user_obj[2];
 static void* g_utils_vtbl[256];
@@ -154,8 +161,8 @@ static void cb_run(void* cb, void* param){   // CCallbackBase::Run(void*) = vtab
 static void fire_avatar_changed(){
     // fire BOTH: persona-change (avatar bit) makes the game re-query the handle, then avatar-loaded with
     // the NEW handle makes it re-fetch the pixels. m_iImage must be the new handle for the cache to miss.
-    if(g_cb_persona){ PersonaStateChange_t p{0x0110000100000001ULL,0x0400}; cb_run(g_cb_persona,&p); } // k_EPersonaChangeAvatar
-    if(g_cb_avatar){ AvatarImageLoaded_t p{0x0110000100000001ULL,g_handle,AVATAR_DIM,AVATAR_DIM}; cb_run(g_cb_avatar,&p); }
+    if(g_cb_persona){ PersonaStateChange_t p{g_steamid,0x0400}; cb_run(g_cb_persona,&p); } // k_EPersonaChangeAvatar
+    if(g_cb_avatar){ AvatarImageLoaded_t p{g_steamid,g_handle,AVATAR_DIM,AVATAR_DIM}; cb_run(g_cb_avatar,&p); }
 }
 
 __attribute__((constructor)) static void on_load(){

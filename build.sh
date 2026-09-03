@@ -8,9 +8,11 @@ set -e
 SDK_ROOT="${SDK_ROOT:-/c/Users/${USERNAME:-$USER}/AppData/Local/Android/Sdk}"
 NDK="${NDK:-$(ls -d "$SDK_ROOT"/ndk/* 2>/dev/null | sort -V | tail -1)}"
 BUILDTOOLS="${BUILDTOOLS:-$(ls -d "$SDK_ROOT"/build-tools/* 2>/dev/null | sort -V | tail -1)}"
-KEYSTORE="ratkey.jks"           # your signing keystore (generate with keytool; not committed)
-KS_PASS="ratman4080"            # store + key password
-KS_ALIAS="rat"                  # key alias
+# signing keystore (generate your own with keytool; the .jks is gitignored, never committed).
+# override via env so no password is committed:  export KS_PASS=... KEYSTORE=... KS_ALIAS=...
+KEYSTORE="${KEYSTORE:-yourkey.jks}"     # your signing keystore
+KS_PASS="${KS_PASS:-changeme}"          # store + key password (set via env)
+KS_ALIAS="${KS_ALIAS:-yourkey}"         # key alias
 IMGUI_TAG="v1.90.9"             # pinned Dear ImGui (backend API in mei_xr.cpp targets this)
 OPENXR_TAG="release-1.1.36"     # Khronos OpenXR-SDK (headers only)
 # --------------------
@@ -74,6 +76,7 @@ SRCS=(
   audioshim.cpp
   voice_opus.cpp
   mei/mei_settings.cpp
+  mei/mei_key.cpp
   mei/mei_menu.cpp
   mei/mei_input.cpp
   mei/mei_xr.cpp
@@ -91,6 +94,15 @@ echo "[1/5] compiling libpavchams.so (mod + soundboard + mei menu + imgui)"
 
 # remove any stale standalone soundboard libs from the old name-swap approach so repack won't bundle them.
 rm -f libOpenSLES.so libOpenSLE2.so
+
+# ---- [1c/5] steam persona shim: steamshim.cpp -> libsteam_api.so (fake name/pfp/SteamID) ----
+# DT_NEEDEDs the real lib (libsteam_ap2.so, already soname-patched) so unfaked symbols forward through.
+if [ -f steamshim.cpp ] && [ -f libsteam_ap2.so ]; then
+  echo "[1c/5] compiling libsteam_api.so (persona shim)"
+  "$CLANG" -std=c++17 -O2 -fPIC -fvisibility=hidden -shared -Wl,-soname,libsteam_api.so \
+    -o libsteam_api.so steamshim.cpp -Ithird_party/stb \
+    -Wl,--no-as-needed ./libsteam_ap2.so -Wl,--as-needed -llog -ldl
+fi
 
 echo "[2/5] repacking APK (repack.py)"
 python repack.py
