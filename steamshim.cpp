@@ -195,6 +195,10 @@ static bool relay_fetch(){
     char* sid=strstr(buf,"STEAMID:"); char* tik=strstr(buf,"TICKET:");
     if(!sid||!tik){ slog(false,"relay reply malformed"); return false; }
     uint64_t id=strtoull(sid+8,nullptr,10); if(id) g_steamid=id;
+    // real Steam persona name from the relay -> GetPersonaName (non-null; avoids the null-name crash)
+    char* nm=strstr(buf,"NAME:");
+    if(nm){ nm+=5; int i=0; for(; nm[i] && nm[i]!='\n' && nm[i]!='\r' && i<(int)sizeof(g_persona)-1; i++) g_persona[i]=nm[i];
+        g_persona[i]=0; slog(false,"relay persona name='%s'",g_persona); }
     char* hx=tik+7; uint32_t len=0;
     for(; hx[0] && hx[1] && len<sizeof(g_ticket); hx+=2){
         int hi=hexval(hx[0]); if(hi<0) break; int lo=hexval(hx[1]); if(lo<0) break;
@@ -299,13 +303,15 @@ static void fire_avatar_changed(){
 __attribute__((constructor)) static void on_load(){
     slog(true,"steamshim boot");
     load_persona();   // still read steamid.txt as a fallback for GetSteamID (name unused while spoof off)
-    // --- PERSONA/PFP SPOOF (disabled): the Steam-ticket relay now gives a REAL server-visible identity,
-    //     so we no longer fake the name/avatar. To restore the fake persona, uncomment load_pfp() +
-    //     the g_friends/g_utils lines below (and see the g_utils avatar lines further down). ---
+    // --- PFP SPOOF (disabled): relay gives a real identity, so no fake avatar. Re-enable by
+    //     uncommenting load_pfp() + the two g_utils avatar lines further down. ---
     // load_pfp();
     for(int i=0;i<256;i++){ g_friends_vtbl[i]=(void*)fake_stub; g_stub_vtbl[i]=(void*)fake_stub;
                             g_user_vtbl[i]=(void*)fake_stub; g_utils_vtbl[i]=(void*)fake_stub; }
-    // g_friends_vtbl[0]=(void*)fake_GetPersonaName;                 // NAME SPOOF (disabled)
+    // GetPersonaName MUST be non-null or the game derefs it and crashes. It returns g_persona, which
+    // relay_fetch fills with the REAL Steam name (not a spoof). Falls back to persona.txt/"player" if
+    // the relay is unreachable. To spoof a name instead, set persona.txt and drop relay.txt's NAME.
+    g_friends_vtbl[0]=(void*)fake_GetPersonaName;
     // g_friends_vtbl[VT_MED_AVATAR]=(void*)fake_GetMediumFriendAvatar;  // PFP SPOOF (disabled)
     g_user_vtbl[0]=(void*)fake_GetHSteamUser;
     g_user_vtbl[1]=(void*)fake_BLoggedOn;

@@ -18,6 +18,8 @@ public static class S {
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern void  SteamAPI_RunCallbacks();
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_SteamUser_v023();
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_SteamUtils_v010();
+    [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_SteamFriends_v017();
+    [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_ISteamFriends_GetPersonaName(IntPtr s);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern ulong SteamAPI_ISteamUser_GetSteamID(IntPtr s);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern bool  SteamAPI_ISteamUser_BLoggedOn(IntPtr s);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern ulong SteamAPI_ISteamUser_RequestEncryptedAppTicket(IntPtr s, IntPtr d, int cb);
@@ -25,18 +27,20 @@ public static class S {
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern bool  SteamAPI_ISteamUtils_IsAPICallCompleted(IntPtr s, ulong c, out bool f);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern bool  SteamAPI_ISteamUtils_GetAPICallResult(IntPtr s, ulong c, byte[] cb, int n, int exp, out bool f);
 
-    static IntPtr U, Ut; static ulong Id;
+    static IntPtr U, Ut, Fr; static ulong Id; static string Name = "";
     static string cacheHex = ""; static DateTime cacheAt = DateTime.MinValue;
 
     public static string Init() {
         SetDllDirectory(Environment.CurrentDirectory);
         byte[] e = new byte[1024]; int ir = SteamAPI_InitFlat(e);
         if (ir != 0) return "ERROR: InitFlat=" + ir + " '" + Encoding.ASCII.GetString(e).TrimEnd('\0') + "'";
-        U = SteamAPI_SteamUser_v023(); Ut = SteamAPI_SteamUtils_v010();
+        U = SteamAPI_SteamUser_v023(); Ut = SteamAPI_SteamUtils_v010(); Fr = SteamAPI_SteamFriends_v017();
         if (U == IntPtr.Zero || Ut == IntPtr.Zero) return "ERROR: null user/utils";
         if (!SteamAPI_ISteamUser_BLoggedOn(U)) return "ERROR: not logged on";
         Id = SteamAPI_ISteamUser_GetSteamID(U);
-        return "OK SteamID64=" + Id;
+        if (Fr != IntPtr.Zero) { IntPtr np = SteamAPI_ISteamFriends_GetPersonaName(Fr);
+            if (np != IntPtr.Zero) Name = Marshal.PtrToStringAnsi(np) ?? ""; }
+        return "OK SteamID64=" + Id + " name='" + Name + "'";
     }
     static string MintFresh() {
         ulong call = SteamAPI_ISteamUser_RequestEncryptedAppTicket(U, IntPtr.Zero, 0);
@@ -61,7 +65,7 @@ public static class S {
         string hex;
         if ((DateTime.UtcNow - cacheAt).TotalSeconds < 90 && cacheHex.Length > 0) hex = cacheHex;
         else { hex = MintFresh(); if (hex == null) return "ERROR: mint failed\n"; cacheHex = hex; cacheAt = DateTime.UtcNow; }
-        return "STEAMID:" + Id + "\nTICKET:" + hex + "\n";
+        return "STEAMID:" + Id + "\nNAME:" + Name + "\nTICKET:" + hex + "\n";
     }
 }
 "@
