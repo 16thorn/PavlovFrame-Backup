@@ -18,6 +18,7 @@
 
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
+#include <aaudio/AAudio.h>
 #include <dlfcn.h>
 #include <dirent.h>
 #include <pthread.h>
@@ -464,54 +465,48 @@ SB_EXPORT int sb_install() {
 SB_EXPORT void* sb_hook_fn() { return (void*)&sb_slCreateEngine; }
 
 // ============================================================================
-//  local monitor player — hear the clip out your own headset while it transmits
+//  local monitor — AAudio output stream (SAFE: separate API, the audio server mixes it alongside the
+//  game). A 2nd OpenSL engine corrupted the game's audio; AAudio does not touch the game's engine.
 // ============================================================================
-// A dedicated OpenSL player (our own engine, separate from the game's) fed one big PCM buffer. Lets
-// you set the soundboard volume solo without a second listener.
-static SLObjectItf g_lpEng = nullptr; static SLEngineItf   g_lpEngItf = nullptr;
-static SLObjectItf g_lpMix = nullptr; static SLObjectItf   g_lpPlayer = nullptr;
-static SLPlayItf   g_lpPlay = nullptr; static SLAndroidSimpleBufferQueueItf g_lpBq = nullptr;
-static int16_t*    g_lpBuf = nullptr;
-
-SB_EXPORT void sb_local_stop() {
-    if (g_lpPlay) (*g_lpPlay)->SetPlayState(g_lpPlay, SL_PLAYSTATE_STOPPED);
-    if (g_lpBq)   (*g_lpBq)->Clear(g_lpBq);
-    if (g_lpPlayer) { (*g_lpPlayer)->Destroy(g_lpPlayer); g_lpPlayer = nullptr; g_lpPlay = nullptr; g_lpBq = nullptr; }
-    free(g_lpBuf); g_lpBuf = nullptr;
-}
-
-// Play `samples` of 48kHz mono s16 out the local speaker. Copies the buffer (caller keeps ownership).
-SB_EXPORT int sb_local_play(const int16_t* pcm, int samples) {
-    if (!pcm || samples <= 0) return 0;
-    if (!r_createEngine) sb_install();
-    if (!r_createEngine || !g_iid_engine || !g_iid_outmix || !g_iid_play || !g_iid_bq) return 0;
-    sb_local_stop();
-
-    if (!g_lpEng) {                         // one-time: our own engine + output mix
-        if (r_createEngine(&g_lpEng, 0, nullptr, 0, nullptr, nullptr) != SL_RESULT_SUCCESS) { g_lpEng=nullptr; return 0; }
-        (*g_lpEng)->Realize(g_lpEng, SL_BOOLEAN_FALSE);
-        if ((*g_lpEng)->GetInterface(g_lpEng, g_iid_engine, &g_lpEngItf) != SL_RESULT_SUCCESS) return 0;
-        if ((*g_lpEngItf)->CreateOutputMix(g_lpEngItf, &g_lpMix, 0, nullptr, nullptr) != SL_RESULT_SUCCESS) return 0;
-        (*g_lpMix)->Realize(g_lpMix, SL_BOOLEAN_FALSE);
+// Each play spawns a short-lived thread that opens a stream, writes the whole clip PCM, then closes.
+// A generation counter cancels the previous playback (stop or a new play bumps it).
+static volatile int g_aagen = 0;
+struct AAJob { int16_t* pcm; int n; int gen; };
+static void* aa_thread(void* arg){
+    AAJob* j = (AAJob*)arg;
+    AAudioStreamBuilder* b = nullptr;
+    if (AAudio_createStreamBuilder(&b) != AAUDIO_OK || !b) { free(j->pcm); free(j); return nullptr; }
+    AAudioStreamBuilder_setDirection(b, AAUDIO_DIRECTION_OUTPUT);
+    AAudioStreamBuilder_setSampleRate(b, 48000);
+    AAudioStreamBuilder_setChannelCount(b, 1);
+    AAudioStreamBuilder_setFormat(b, AAUDIO_FORMAT_PCM_I16);
+    AAudioStreamBuilder_setPerformanceMode(b, AAUDIO_PERFORMANCE_MODE_NONE);
+    AAudioStream* s = nullptr;
+    aaudio_result_t r = AAudioStreamBuilder_openStream(b, &s);
+    AAudioStreamBuilder_delete(b);
+    if (r != AAUDIO_OK || !s) { free(j->pcm); free(j); return nullptr; }
+    AAudioStream_requestStart(s);
+    int off = 0;
+    while (j->gen == g_aagen && off < j->n) {
+        int chunk = j->n - off; if (chunk > 1920) chunk = 1920;             // 40 ms @ 48k
+        aaudio_result_t w = AAudioStream_write(s, j->pcm + off, chunk, 200LL*1000000LL);
+        if (w < 0) break; off += w;
     }
-    SLDataLocator_AndroidSimpleBufferQueue locbq = { SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 1 };
-    SLDataFormat_PCM fmt = { SL_DATAFORMAT_PCM, 1, SL_SAMPLINGRATE_48,
-                             SL_PCMSAMPLEFORMAT_FIXED_16, SL_PCMSAMPLEFORMAT_FIXED_16,
-                             SL_SPEAKER_FRONT_CENTER, SL_BYTEORDER_LITTLEENDIAN };
-    SLDataSource src = { &locbq, &fmt };
-    SLDataLocator_OutputMix locmix = { SL_DATALOCATOR_OUTPUTMIX, g_lpMix };
-    SLDataSink sink = { &locmix, nullptr };
-    const SLInterfaceID ids[1] = { g_iid_bq }; const SLboolean req[1] = { SL_BOOLEAN_TRUE };
-    if ((*g_lpEngItf)->CreateAudioPlayer(g_lpEngItf, &g_lpPlayer, &src, &sink, 1, ids, req) != SL_RESULT_SUCCESS)
-        { g_lpPlayer = nullptr; return 0; }
-    (*g_lpPlayer)->Realize(g_lpPlayer, SL_BOOLEAN_FALSE);
-    (*g_lpPlayer)->GetInterface(g_lpPlayer, g_iid_play, &g_lpPlay);
-    (*g_lpPlayer)->GetInterface(g_lpPlayer, g_iid_bq,   &g_lpBq);
+    AAudioStream_requestStop(s);
+    AAudioStream_close(s);
+    free(j->pcm); free(j);
+    return nullptr;
+}
+SB_EXPORT void sb_local_stop(){ g_aagen++; }   // invalidate any running playback thread
 
-    g_lpBuf = (int16_t*)malloc((size_t)samples * 2);
-    if (!g_lpBuf) return 0;
-    memcpy(g_lpBuf, pcm, (size_t)samples * 2);
-    (*g_lpBq)->Enqueue(g_lpBq, g_lpBuf, (SLuint32)samples * 2);
-    (*g_lpPlay)->SetPlayState(g_lpPlay, SL_PLAYSTATE_PLAYING);
+// Play `samples` of 48kHz mono s16 locally (copies the buffer; caller keeps ownership).
+SB_EXPORT int sb_local_play(const int16_t* pcm, int samples){
+    if (!pcm || samples <= 0) return 0;
+    int gen = ++g_aagen;                        // cancel any prior playback
+    AAJob* j = (AAJob*)malloc(sizeof(AAJob)); if (!j) return 0;
+    j->pcm = (int16_t*)malloc((size_t)samples*2); if (!j->pcm) { free(j); return 0; }
+    memcpy(j->pcm, pcm, (size_t)samples*2); j->n = samples; j->gen = gen;
+    pthread_t th; if (pthread_create(&th, nullptr, aa_thread, j) != 0) { free(j->pcm); free(j); return 0; }
+    pthread_detach(th);
     return 1;
 }

@@ -33,7 +33,6 @@
 #include <cstdlib>
 
 #include "mei/mei_settings.h"   // granular feature state (menu <-> core)
-#include "mei/mei_key.h"        // license gate (HWID-bound weekly/monthly/lifetime)
 #include "mei/mei_input.h"      // controller-ray -> ImGui cursor bridge
 #include "mei/mei_xr.h"         // OpenXR/Vulkan menu injection
 #include "mei/mei_esp.h"        // shared ESP entry buffer (we project, mei_xr draws)
@@ -700,6 +699,8 @@ static void* g_fire[16]; static int g_nfire = 0;    // gun fire UFunctions (fire
 static void* g_kick[8]; static int g_nkick = 0;     // kick RPCs to DROP (anti-votekick)
 static void* g_authfn[24]; static const char* g_authnm[24]; static int g_nauthfn = 0;   // auth/voice RPCs to TRACE (log-only)
 static void* fn_ChangeName = nullptr;               // ServerChangeName (name spoof for custom-map admin)
+static void* c_PavGameMode = nullptr;               // APavlovGameMode (host-only instance)
+static void* fn_ForceEndMatch = nullptr, *fn_FinalizeMapRot = nullptr;   // restart match / next map (host)
 // voice injection (soundboard TX bypass): AVoiceRouter::ServerOnVoice(FPavlovVoicePacket{TArray<u8> Data})
 // is the client-authoritative voice send — the packet Data is an Opus-encoded blob. We probe the live
 // packet cadence/size first, then build+send our own. Resolved in resolve_names.
@@ -743,6 +744,7 @@ static int32_t bh_Target=0x00, bh_Hit=0x08, bh_Head=0x20, bh_Pen=0x21,
 static bool    bh_resolved = false;
 // ---- ESP + TTT ----
 static void*   fn_ServerBuy = nullptr;              // APavlovPlayerController::ServerBuy(FName)
+static void*   fn_ExecuteRcon = nullptr;            // APavlovPlayerController::ExecuteRconCommand(FRconCommand) — dedicated-server admin RPC
 static void*   fn_ServerGive = nullptr;             // APavlovPawn::ServerGive(FName Equipment, FName Skin) — free spawn
 static int32_t o_PawnPS = -2, o_PS_Name = -2, o_PawnHC = -2, o_HC_H = -2, o_HC_MH = -2, o_PS_Role = -2;
 static void* fn_GMChangeName = nullptr; static int32_t o_AuthGM = -1;   // GameModeBase::ChangeName (long names)
@@ -1278,28 +1280,35 @@ static void do_aim(void* me, bool rotate, bool tp) {
             if (pawn_dead(o)) skip = true;                 // never aim at corpses
             char cn[40]; obj_name(obj_class(o), cn, sizeof cn);
             if (strstr(cn, "Ghost")) skip = true;
-            void* avatar = (o_Avatar >= 0) ? rd_obj(o, o_Avatar) : nullptr;
-            if (!skip && avatar && addr_readable((uintptr_t)avatar) && in_lib(*(uintptr_t*)avatar)) {
-                // accurate head = skull socket on the avatar mesh (via AvatarSkin->SkullSocket FName)
-                uint64_t skull = 0;
-                if (o_AvatarSkin >= 0) { void* skin = rd_obj(o, o_AvatarSkin);
-                    if (skin && addr_readable((uintptr_t)skin)) {
-                        if (o_SkullSocket < 0) o_SkullSocket = prop_offset(obj_class(skin), "SkullSocket");
-                        if (o_SkullSocket >= 0) skull = *(uint64_t*)((uint8_t*)skin + o_SkullSocket); } }
-                FVec head{};
-                if (skull && fn_SockLoc) head = aim_sockloc(avatar, skull);
-                // require a real head near the gun (skip origin / far-garbage -> never aim at self)
-                if (!(head.x == 0 && head.y == 0 && head.z == 0)) {
-                    head.z += g_mei.aim_head_z;   // socket sits at the crown; drop to head centre (tunable)
-                    double d = fabs(head.x - gunLoc.x) + fabs(head.y - gunLoc.y) + fabs(head.z - gunLoc.z);
-                    if (d > 1.0 && d < 500000.0) {
-                        FRot to = look_at(gunLoc, head);
-                        double dp = fabs(angnorm(to.pitch - gunRot.pitch));
-                        double dy = fabs(angnorm(to.yaw - gunRot.yaw));
-                        double cone = g_mei.aim_fov * 0.5; if (cone < 1.0) cone = 1.0;
-                        if (dp <= cone && dy <= cone) { double sc = dp + dy;
-                            if (sc < bestScore) { bestScore = sc; best = o; bestHead = head; } }
-                    }
+            // head: prefer the skull socket on the avatar mesh; if that can't resolve (custom-mode pawns
+            // often have no reachable avatar/socket), fall back to actor origin + head height. Without this
+            // the aimbot finds ZERO targets in custom modes. Euclidean range cap (~300m) keeps it to
+            // STREAMED pawns so trigger-kill never reports on a far un-streamed pawn (that crashes netcode).
+            FVec head{}; bool haveHead = false;
+            if (!skip) {
+                void* avatar = (o_Avatar >= 0) ? rd_obj(o, o_Avatar) : nullptr;
+                if (avatar && addr_readable((uintptr_t)avatar) && in_lib(*(uintptr_t*)avatar)) {
+                    uint64_t skull = 0;
+                    if (o_AvatarSkin >= 0) { void* skin = rd_obj(o, o_AvatarSkin);
+                        if (skin && addr_readable((uintptr_t)skin)) {
+                            if (o_SkullSocket < 0) o_SkullSocket = prop_offset(obj_class(skin), "SkullSocket");
+                            if (o_SkullSocket >= 0) skull = *(uint64_t*)((uint8_t*)skin + o_SkullSocket); } }
+                    if (skull && fn_SockLoc) { FVec s = aim_sockloc(avatar, skull);
+                        if (!(s.x==0 && s.y==0 && s.z==0)) { head = s; head.z += g_mei.aim_head_z; haveHead = true; } }
+                }
+                if (!haveHead) { FVec f = aim_getloc(o);
+                    if (!(f.x==0 && f.y==0 && f.z==0)) { head = FVec{ f.x, f.y, f.z + 150.0 }; haveHead = true; } }
+            }
+            if (haveHead) {
+                double ex=head.x-gunLoc.x, ey=head.y-gunLoc.y, ez=head.z-gunLoc.z;
+                double d = sqrt(ex*ex + ey*ey + ez*ez);
+                if (d > 1.0 && d < 30000.0) {
+                    FRot to = look_at(gunLoc, head);
+                    double dp = fabs(angnorm(to.pitch - gunRot.pitch));
+                    double dy = fabs(angnorm(to.yaw - gunRot.yaw));
+                    double cone = g_mei.aim_fov * 0.5; if (cone < 1.0) cone = 1.0;
+                    if (dp <= cone && dy <= cone) { double sc = dp + dy;
+                        if (sc < bestScore) { bestScore = sc; best = o; bestHead = head; } }
                 }
             }
         }
@@ -1389,6 +1398,11 @@ static void resolve_names() {
       for (int k = 0; k < 3 && cpc; k++) { void* fn = find_func(cpc, kn[k]);
           if (fn) { g_kick[g_nkick++] = fn; LOG("kick RPC '%s' = %p", kn[k], fn); } }
       fn_ChangeName = cpc ? find_func(cpc, "ServerChangeName") : nullptr;   // name spoof (custom-map admin)
+      // server control (host-only GameMode): restart match / rotate map
+      c_PavGameMode = find_class("PavlovGameMode");
+      fn_ForceEndMatch  = c_PavGameMode ? find_func(c_PavGameMode, "ForceEndMatch") : nullptr;
+      fn_FinalizeMapRot = c_PavGameMode ? find_func(c_PavGameMode, "FinalizeMapRotation") : nullptr;
+      LOG("server ctrl: GameMode=%p ForceEndMatch=%p FinalizeMapRotation=%p", c_PavGameMode, fn_ForceEndMatch, fn_FinalizeMapRot);
       // AUTH TRACE: resolve the join-handshake RPCs so the handler can log the LIVE sequence + params
       // (which gate fires, what the host demands, what our client actually sends).
       { void* cpvc0 = find_class("PavlovPlayerController");
@@ -1431,6 +1445,8 @@ static void resolve_names() {
           fn_ReportHit, c_KillGun, c_KillBullet, o_HeadBone, bhs, bh_Target, bh_Hit, bh_Head, bh_Gun, bh_Bullet, bh_Origin, bh_Bone);
       // ESP + TTT plumbing: buy RPC, per-pawn PlayerState/HealthComponent, name, health, role field
       fn_ServerBuy = cpvc ? find_func(cpvc, "ServerBuy") : nullptr;
+      fn_ExecuteRcon = cpvc ? find_func(cpvc, "ExecuteRconCommand") : nullptr;
+      LOG("server ctrl (rcon): ExecuteRconCommand=%p on PavlovPlayerController", fn_ExecuteRcon);
       o_PawnPS = c_PavlovPawn ? prop_offset(c_PavlovPawn, "PlayerState") : -1;
       o_PawnHC = c_PavlovPawn ? prop_offset(c_PavlovPawn, "HealthComponent") : -1;
       { void* cps = find_class("PlayerState"); o_PS_Name = cps ? prop_offset(cps, "PlayerNamePrivate") : -1; }
@@ -2741,6 +2757,32 @@ static void read_fstring(void* obj, int32_t off, char* out, int cap) {
     int n = 0; for (int i = 0; i < cnt && n < cap-1 && d[i]; i++) { char c = (char)d[i]; if (c >= 32 && c < 127) out[n++] = c; }
     out[n] = 0;
 }
+// FText is a wrapper (TSharedRef<ITextData>) not a raw FString. params+off holds the ITextData*;
+// the display FString lives somewhere inside it (layout is version/history-subclass specific), so
+// scan the object for the first plausible {char16* ptr, int32 len} pair and render it. Best-effort
+// diagnostic — guarded by addr_readable, so a miss just yields "".
+static void read_ftext(void* obj, int32_t off, char* out, int cap) {
+    out[0] = 0; if (off < 0 || !obj) return;
+    uint8_t* td = *(uint8_t**)((uint8_t*)obj + off);   // ITextData*
+    if (!td || !addr_readable((uintptr_t)td)) return;
+    for (int lvl = 0; lvl < 2; lvl++) {                // try the object, then one pointer hop in
+        for (int32_t o = 0; o <= 0x60; o += 8) {
+            char16_t* d = *(char16_t**)(td + o);
+            int32_t cnt = *(int32_t*)(td + o + 8);
+            if (!d || !addr_readable((uintptr_t)d) || cnt <= 0 || cnt > 400) continue;
+            char c0 = (char)d[0];
+            if (c0 < 32 || c0 >= 127) continue;        // must start printable-ascii
+            int n = 0; for (int i = 0; i < cnt && n < cap-1 && d[i]; i++) {
+                char c = (char)d[i]; if (c >= 32 && c < 127) out[n++] = c; }
+            out[n] = 0;
+            if (n >= 3) return;                          // got a real reason string
+            out[0] = 0;
+        }
+        uint8_t* nxt = *(uint8_t**)(td + 0x10);          // hop through a likely inner ptr
+        if (!nxt || !addr_readable((uintptr_t)nxt)) break;
+        td = nxt;
+    }
+}
 // TTT ServerBuy(FName): resolve the item's FName id and call the RPC on the local controller.
 static void do_buy(const char* itemName) {
     if (!fn_ServerBuy || !itemName || !itemName[0]) return;
@@ -2781,6 +2823,33 @@ static void do_change_name(const char* name) {
     g_ProcessEvent(pc, fn_ChangeName, buf);
     LOG("ServerChangeName('%s') sent", name);
 }
+// SERVER CONTROL (DEDICATED-SERVER capable): ExecuteRconCommand(FRconCommand) is a client->server RPC on
+// OUR OWN PlayerController (flags 0x84220cc0 = NetMulticast? no — BlueprintAuthorityOnly server exec). The
+// server runs it and validates that we're an admin/moderator (or the server has no RCON pin). This works on
+// a dedicated community server we merely joined — unlike the host-only GameMode path below.
+//   FRconCommand { ERconCommands RconCommand @0x0 (1 byte); FString ActOn @0x8; FString Option @0x18 }  size 0x28
+// For map rotation / round restart we send empty ActOn/Option. SwitchMap uses ActOn=<mapId>, Option=<mode>.
+static void do_rcon(uint8_t cmd, const char* actOn, const char* option, const char* what) {
+    if (!fn_ExecuteRcon) { LOG("rcon: ExecuteRconCommand unresolved for '%s'", what); return; }
+    void* pc = local_controller();
+    if (!pc || !addr_readable((uintptr_t)pc) || !in_lib(*(uintptr_t*)pc)) { LOG("rcon: no controller for '%s'", what); return; }
+    // build UTF-16 buffers for the two FStrings (kept alive for the ProcessEvent call)
+    static char16_t wa[128], wo[128];
+    int na = 0; if (actOn)  { for (; actOn[na]  && na < 126; na++) wa[na] = (unsigned char)actOn[na];  } wa[na] = 0;
+    int no = 0; if (option) { for (; option[no] && no < 126; no++) wo[no] = (unsigned char)option[no]; } wo[no] = 0;
+    uint8_t p[0x28]; memset(p, 0, sizeof p);
+    p[0] = cmd;                                             // ERconCommands @0x0
+    if (na) { *(void**)(p + 0x8) = wa; *(int32_t*)(p + 0x10) = na + 1; *(int32_t*)(p + 0x14) = na + 1; }  // ActOn FString
+    if (no) { *(void**)(p + 0x18) = wo; *(int32_t*)(p + 0x20) = no + 1; *(int32_t*)(p + 0x24) = no + 1; } // Option FString
+    g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) g_ProcessEvent(pc, fn_ExecuteRcon, p); g_fguard = 0;
+    LOG("rcon: %s (cmd=%d actOn='%s' opt='%s') sent on PC %p", what, cmd, actOn?actOn:"", option?option:"", pc);
+}
+// (removed: the host-only GameMode path — do_rcon above replaces it and works on dedicated servers.)
+#if 0
+static void do_server_action(void* fn, const char* what) {
+    (void)fn; (void)what;
+}
+#endif
 // ESP: project every enemy with the game's own camera into screen [0,1] + read name/health/team/role.
 static void esp_gather() {
     if (!g_ready) { g_esp_n = 0; return; }
@@ -3152,7 +3221,7 @@ static void* clip_encode_thread(void*) {
     int nf = (idx >= 0) ? vo_load(idx, g_clip_hdr2, g_mei.sb_gain) : -1;
     LOG("clip encode: idx=%d frames=%d gain=%.2f", idx, nf, g_mei.sb_gain);
     if (nf > 0) {
-        if (g_mei.sb_monitor) sb_local_play(vo_pcm(), vo_pcm_samples());   // hear it locally
+        if (g_mei.sb_monitor) sb_local_play(vo_pcm(), vo_pcm_samples());   // hear it locally (AAudio — safe)
         g_clip_i = 0; g_clip_ready = true; g_clip_play = true;
     }
     return nullptr;
@@ -3209,9 +3278,11 @@ static void soundboard_pass() {
         if (ms - g_clip_ms >= 20) {
             g_clip_ms = ms;
             uint8_t f[1400]; int len = vo_frame(g_clip_i, f, sizeof f);
-            if (len > 1) { f[1] = g_vseq++; send_voice_frame(f, len); }
+            // broadcast is OPT-IN: ServerOnVoice can deferred-crash the netcode in some lobbies/modes.
+            // Local monitor (AAudio) always plays; only transmit when the user turns Broadcast on.
+            if (len > 1 && g_mei.sb_transmit) { f[1] = g_vseq++; send_voice_frame(f, len); }
             if (++g_clip_i >= vo_frames()) {              // end of clip
-                if (g_mei.sb_loop) g_clip_i = 0; else { g_clip_play = false; LOG("clip: done"); }
+                if (g_mei.sb_loop) g_clip_i = 0; else { g_clip_play = false; sb_local_stop(); LOG("clip: done"); }
             }
         }
     }
@@ -3221,18 +3292,17 @@ static void soundboard_pass() {
 static void handler(void* obj, void* func, void* params) {
     // mei menu input feed (throttled inside; guarded against PE re-entry)
     if (!g_in_pass && g_ready) { g_in_pass = true; mei_feed_input(); g_in_pass = false; }
-    // LICENSE GATE: re-check the key every ~8s; no valid key -> force master OFF so nothing arms.
-    { static long lastlic = 0; struct timespec lt; clock_gettime(CLOCK_MONOTONIC, &lt);
-      long lms = lt.tv_sec*1000 + lt.tv_nsec/1000000;
-      if (lms - lastlic >= 8000) { lastlic = lms; g_mei.licensed = mei_key_check(); } }
-    if (!g_mei.licensed) g_mei.master_enabled = false;
-    // soundboard: voice-TX replay (calls ServerOnVoice -> re-enters PE, so guard it) — licensed only.
-    if (!g_in_pass && g_ready && g_mei.licensed) { g_in_pass = true; soundboard_pass(); g_in_pass = false; }
+    // soundboard: voice-TX replay (calls ServerOnVoice -> re-enters PE, so guard it).
+    if (!g_in_pass && g_ready) { g_in_pass = true; soundboard_pass(); g_in_pass = false; }
     // ESP gather (~30 Hz) — project enemies for the overlay quad; consume the Buy action.
     if (!g_in_pass && g_ready && g_mei.master_enabled) {
         if (g_mei.act_buy) { g_mei.act_buy = false; g_in_pass = true; do_buy(g_mei.buy_name); g_in_pass = false; }
         if (g_mei.act_give) { g_mei.act_give = false; g_in_pass = true; do_give(g_mei.buy_name); g_in_pass = false; }
         if (g_mei.act_change_name) { g_mei.act_change_name = false; g_in_pass = true; do_change_name(g_mei.name_text); g_in_pass = false; }
+        // Dedicated-server admin RPC (ExecuteRconCommand): ResetSND(31)=restart current match/round,
+        // RotateMap(11)=rotate to next map in the server's rotation. Server validates we're admin.
+        if (g_mei.act_restart_match) { g_mei.act_restart_match = false; g_in_pass = true; do_rcon(31, nullptr, nullptr, "ResetSND (restart match)"); g_in_pass = false; }
+        if (g_mei.act_next_map)      { g_mei.act_next_map = false; g_in_pass = true; do_rcon(11, nullptr, nullptr, "RotateMap (next map)"); g_in_pass = false; }
         if (g_mei.act_voice_diag) { g_mei.act_voice_diag = false; g_in_pass = true; do_voice_diag(); g_in_pass = false; }
         if (g_mei.voice_enabled)  { g_in_pass = true; voice_pass(); g_in_pass = false; }   // self-throttled ~2Hz
         else if (g_voiceArmed) {                                                            // disable edge: stop broadcast + capture
@@ -3279,6 +3349,8 @@ static void handler(void* obj, void* func, void* params) {
                 if (addr_readable((uintptr_t)pc)) { int32_t ni = *(int32_t*)pc; fname_to_str(ni, pcn, sizeof pcn); }
                 if (params && strstr(pcn, "Str")) { char rs[160]; read_fstring(params, po, rs, sizeof rs);
                     LOG("  reason %s='%s'", pn, rs); }
+                else if (params && strstr(pcn, "Text")) { char rs[200]; read_ftext(params, po, rs, sizeof rs);
+                    LOG("  reason(FText) %s='%s'", pn, rs); }
                 else LOG("  param %s : %s @ %d", pn, pcn, po);
                 if (!*(void**)((uint8_t*)p + FFIELD_NEXT_OFF)) break;
             }
@@ -3488,7 +3560,6 @@ static void* boot(void*) {
     install_fault();
     log_auth_libs();            // one-time: what verification libs are in the process?
     mei_load();                 // pull saved feature state (mei.cfg) before anything gates on it
-    mei_key_check(); g_mei.licensed = mei_key_licensed();   // license gate: no key = mods stay locked
     scan_maps();
     if (!g_base) { LOG("libUnreal not mapped yet"); return nullptr; }
     LOG("libUnreal base=%p text=[%p,%p]", (void*)g_base, (void*)g_text_lo, (void*)g_text_hi);
@@ -3614,14 +3685,14 @@ static bool got_hook(const char* symbol, void* repl) {
 // Race the game's first slCreateEngine call (audio init) the same way xr_boot races xrCreateInstance:
 // poll fast from load, and the moment libUnreal is mapped, resolve the real SL fns and patch the GOT.
 static void* sb_boot(void*) {
-    for (int i = 0; i < 8000; i++) {                 // ~40s of 5ms polls
-        if (g_base && sb_install() && got_hook("slCreateEngine", sb_hook_fn())) {
-            LOG("soundboard: slCreateEngine hooked after %d ms", i * 5);
-            return nullptr;
-        }
+    // Resolve the real SL functions (for the local-monitor player only). We DO NOT GOT-hook / vtable-wrap
+    // the game's own audio engine — the clip transmits via ServerOnVoice, so wrapping the engine buys us
+    // nothing and its stale vtable crashed the game when it tore audio down after a clip finished.
+    for (int i = 0; i < 8000; i++) {
+        if (g_base && sb_install()) { LOG("soundboard: SL resolved after %d ms", i * 5); return nullptr; }
         struct timespec t{0, 5 * 1000 * 1000}; nanosleep(&t, nullptr);
     }
-    LOG("soundboard: slCreateEngine never hooked (engine may init before us)");
+    (void)sb_hook_fn; (void)&got_hook;   // retained but unused now
     return nullptr;
 }
 

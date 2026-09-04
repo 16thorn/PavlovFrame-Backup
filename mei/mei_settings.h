@@ -107,7 +107,8 @@ struct MeiSettings {
     // and pushes play/stop/rescan back into it. Persisted: loop / mix / gain.
     bool  sb_loop          = false;   // loop the active clip
     bool  sb_mix_mic       = false;   // 1 = layer clip over real mic; 0 = replace mic with clip
-    bool  sb_monitor       = true;    // also play the clip out your own headset (local monitor)
+    bool  sb_monitor       = true;    // play the clip out your own headset (local AAudio monitor — safe)
+    bool  sb_transmit      = false;   // ALSO broadcast to the lobby via ServerOnVoice (can crash some modes)
     float sb_gain          = 3.0f;    // clip gain (linear) — loud enough to carry over other voices
     int   sb_sel           = -1;      // selected clip index into sb_names
     // read-only mirror (pavchams writes; menu reads)
@@ -129,7 +130,6 @@ struct MeiSettings {
     int   ui_accent        = 0;       // theme accent index (see mei_menu.cpp)
     bool  ui_dark          = true;    // dark (true) / light (false) mode
     char  username[MEI_NAME_MAX] = {0};   // client display name (header / greeting / user card)
-    volatile bool licensed = false;   // runtime: valid key present (NOT saved) — gates all mods
 
     // ---- Panel reposition ("move panel") ----
     bool  reposition       = false;   // Move mode ON: point off-panel + hold trigger to drag it (transient, not saved)
@@ -152,6 +152,8 @@ struct MeiSettings {
     volatile bool act_fixpawn        = false;   // re-resolve pawn-dependent stuff (gun/movement/controller) — keeps chams
     volatile bool act_skin           = false;   // apply player skin (SetPlayerSkin) now
     volatile bool act_change_name    = false;   // call ServerChangeName(name_text) RPC (server-visible rename)
+    volatile bool act_restart_match  = false;   // GameMode ForceEndMatch (host only) — restart the round
+    volatile bool act_next_map       = false;   // GameMode FinalizeMapRotation (host only) — rotate to next map
     volatile bool act_voice_diag     = false;   // one-shot: dump live voice state + fn signatures to logcat
     int           kill_sel           = -1;      // selected index into g_players (pick-a-target kill)
     volatile bool act_kill_sel       = false;   // one-shot: headshot the selected player now

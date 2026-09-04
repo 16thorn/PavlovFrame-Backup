@@ -157,6 +157,10 @@ static void autologin_createid_cb(const EOS_Connect_CreateDeviceIdCallbackInfo* 
     real_Login(g_connect, &o, nullptr, autologin_login_cb);
 }
 #define NEWID_PATH "/sdcard/Android/data/com.vankrupt.pavlov/files/newid.txt"
+// Steam-relay test: touch files/steamlogin.txt to SUPPRESS our Device-ID autologin so the game's
+// own Steam credential path runs (and we let real Steam creds pass through to EOS_Connect_Login).
+#define STEAMLOGIN_PATH "/sdcard/Android/data/com.vankrupt.pavlov/files/steamlogin.txt"
+static bool steamlogin_mode() { FILE* f = fopen(STEAMLOGIN_PATH, "r"); if (f) { fclose(f); return true; } return false; }
 
 static void do_createid() {
     if (!real_CreateDeviceId || !g_connect) return;
@@ -171,6 +175,11 @@ static void newid_delete_cb(const EOS_Connect_DeleteDeviceIdCallbackInfo* d) {
 }
 static void start_autologin() {
     if (g_autologin_started || !g_connect) return;
+    if (steamlogin_mode()) {   // let the game drive its own Steam login; don't force Device-ID
+        static bool once = false;
+        if (!once) { once = true; LOG("steamlogin.txt present -> SUPPRESSING Device-ID autologin (game's Steam path runs)"); }
+        return;
+    }
     g_autologin_started = true;
     resolve_real();
     if (!real_CreateDeviceId) return;
@@ -435,6 +444,100 @@ void EOS_Auth_Login(void* Handle, const void* Options, void* ClientData, void* C
     if (f) f(Handle, Options, ClientData, Cb);
 }
 
+// ===========================================================================
+// AUTH-GATE TRACE (log-only). Settles AUTH-ARCH.md's never-run live trace:
+//   1. does the EOS AntiCheat *client* interface even exist on Quest/arm64?
+//   2. does the AC protocol actually run against us (in/out message traffic)?
+//   3. is our EOS Connect IdToken minted (identity leg) — and does VerifyIdToken
+//      ever run on this process?
+// All wrappers just forward + log; the AC-message callback wrap reads only the
+// stable {ClientData@0, MessageData@8, SizeBytes@16} callback-info header.
+// Rebuild: recompile steamshim/eosshim -> libEOSSDK.so, then repack.py.
+// ===========================================================================
+
+// --- interface presence: null here => Gate B (EOS AC) is a no-op on this platform
+extern "C" __attribute__((visibility("default")))
+void* EOS_Platform_GetAntiCheatClientInterface(void* Platform) {
+    void* h = real_handle();
+    typedef void* (*F)(void*);
+    F f = h ? (F)dlsym(h, "EOS_Platform_GetAntiCheatClientInterface") : nullptr;
+    void* r = f ? f(Platform) : nullptr;
+    LOG("AC GetAntiCheatClientInterface -> %p (%s) [null=AC client absent on arm64]",
+        r, r ? "PRESENT" : "NULL");
+    return r;
+}
+extern "C" __attribute__((visibility("default")))
+void* EOS_Platform_GetAntiCheatServerInterface(void* Platform) {
+    void* h = real_handle();
+    typedef void* (*F)(void*);
+    F f = h ? (F)dlsym(h, "EOS_Platform_GetAntiCheatServerInterface") : nullptr;
+    void* r = f ? f(Platform) : nullptr;
+    LOG("AC GetAntiCheatServerInterface -> %p (%s)", r, r ? "PRESENT" : "NULL");
+    return r;
+}
+
+// --- inbound AC traffic: >0 calls => the AC protocol is live against us
+extern "C" __attribute__((visibility("default")))
+int32_t EOS_AntiCheatClient_ReceiveMessageFromServer(void* Handle, const void* Options) {
+    void* h = real_handle();
+    typedef int32_t (*F)(void*, const void*);
+    F f = h ? (F)dlsym(h, "EOS_AntiCheatClient_ReceiveMessageFromServer") : nullptr;
+    int32_t r = f ? f(Handle, Options) : 1;
+    static int cnt = 0;
+    if (cnt < 30) { LOG("AC <-server ReceiveMessage #%d result=%d", cnt, r); cnt++; }
+    return r;
+}
+// presence probes: if the game ever calls these, full AC session provisioning IS armed
+extern "C" __attribute__((visibility("default")))
+int32_t EOS_AntiCheatClient_BeginSession(void* Handle, const void* Options) {
+    void* h = real_handle();
+    typedef int32_t (*F)(void*, const void*);
+    F f = h ? (F)dlsym(h, "EOS_AntiCheatClient_BeginSession") : nullptr;
+    LOG("AC BeginSession CALLED (full session provisioning armed)");
+    return f ? f(Handle, Options) : 1;
+}
+
+// --- outbound AC traffic: the client's own callback wants (ClientData) restored.
+static void* g_ac_msg_cb = nullptr;   // game's OnMessageToServer callback
+static void* g_ac_msg_cd = nullptr;   // game's ClientData
+static void ac_msg_to_server_cb(const void* Info) {
+    // OnMessageToServerCallbackInfo: {void* ClientData@0; const void* MessageData@8; uint32 Size@16}
+    uint32_t sz = Info ? *(const uint32_t*)((const char*)Info + 16) : 0;
+    static int cnt = 0;
+    if (cnt < 30) { LOG("AC ->server MessageToServer #%d size=%u bytes", cnt, sz); cnt++; }
+    *(void**)((char*)Info + 0) = g_ac_msg_cd;   // restore game's ClientData
+    if (g_ac_msg_cb) ((void(*)(const void*))g_ac_msg_cb)(Info);
+}
+extern "C" __attribute__((visibility("default")))
+uint64_t EOS_AntiCheatClient_AddNotifyMessageToServer(void* Handle, const void* Options,
+                                                      void* ClientData, void* Cb) {
+    g_ac_msg_cb = Cb; g_ac_msg_cd = ClientData;
+    LOG("AC AddNotifyMessageToServer registered (game cb=%p) -> wrapping to trace outbound", Cb);
+    void* h = real_handle();
+    typedef uint64_t (*F)(void*, const void*, void*, void*);
+    F f = h ? (F)dlsym(h, "EOS_AntiCheatClient_AddNotifyMessageToServer") : nullptr;
+    return f ? f(Handle, Options, ClientData, (void*)ac_msg_to_server_cb) : 0;
+}
+
+// --- identity token: minted for our join? (VerifyIdToken runs on the HOST, logged if seen)
+extern "C" __attribute__((visibility("default")))
+int32_t EOS_Connect_CopyIdToken(void* Handle, const void* Options, void** OutToken) {
+    void* h = real_handle();
+    typedef int32_t (*F)(void*, const void*, void**);
+    F f = h ? (F)dlsym(h, "EOS_Connect_CopyIdToken") : nullptr;
+    int32_t r = f ? f(Handle, Options, OutToken) : 1;
+    LOG("Connect_CopyIdToken result=%d (0=Success -> join IdToken minted)", r);
+    return r;
+}
+extern "C" __attribute__((visibility("default")))
+void EOS_Connect_VerifyIdToken(void* Handle, const void* Options, void* ClientData, void* Cb) {
+    LOG("Connect_VerifyIdToken CALLED on THIS process (host-side identity check ran here)");
+    void* h = real_handle();
+    typedef void (*F)(void*, const void*, void*, void*);
+    F f = h ? (F)dlsym(h, "EOS_Connect_VerifyIdToken") : nullptr;
+    if (f) f(Handle, Options, ClientData, Cb);
+}
+
 // Heap trampoline: carries the caller's original callback + client-data through our
 // create-device-id -> login chain, and owns copies of the rewritten option structs so
 // they stay valid across the async ticks.
@@ -479,6 +582,19 @@ void EOS_Connect_Login(EOS_HConnect Handle,
     }
 
     int32_t inType = Options->Credentials ? Options->Credentials->Type : -1;
+    // Trace the Steam ticket the game produces (token is a hex string for Steam creds).
+    const char* tok = Options->Credentials ? Options->Credentials->Token : nullptr;
+    int toklen = tok ? (int)strlen(tok) : -1;
+    LOG("EOS_Connect_Login type=%d tokenlen=%d tok='%.48s'", inType, toklen, tok ? tok : "(null)");
+
+    // STEAM-RELAY MODE: if steamlogin.txt is present, do NOT rewrite Steam -> pass the real ticket
+    // straight to EOS so we can see whether a genuine Steam identity clears the device gate.
+    if (steamlogin_mode()) {
+        LOG("steamlogin.txt present -> PASSTHROUGH real credentials (type=%d, no Device-ID rewrite)", inType);
+        real_Login(Handle, Options, ClientData, CompletionDelegate);
+        return;
+    }
+
     // Only rewrite Steam credentials (STEAM_APP_TICKET=1, STEAM_SESSION_TICKET=18) — those can't
     // work on a headset with no Steam client. Epic (0) and everything else pass through untouched
     // so a real Epic-account Connect login keeps its proper identity.

@@ -34,14 +34,17 @@ the game thread from a hooked `ProcessEvent`.
 | **buy anything menu** | `ServerBuy(FName)` with a categorized + searchable weapon list (exact Pavlov equipment IDs). | ✅ where buying is on |
 | **Godmode / homing knife / name changer / dev tag** | Server-authoritative or client-view-only — see [Server ceiling](#server-authoritative-ceiling). **⚠️ Name changer / dev tag / noclip crash the game ONLINE** (replicated writes) — offline only. | offline only |
 | **Soundboard** | Streams a `.wav` into voice chat as if you were talking — Opus-encoded and injected via `ServerOnVoice`, so it needs **no working mic** (the Frame build never opens one on Quest). Local monitor + gain. | ✅ (community/dedicated) |
+| **Server control (RCON)** | Config tab → **Restart match** / **Next map** — sends `ExecuteRconCommand` (`ResetSND` / `RotateMap`) as a client→server admin RPC on your own controller. | ✅ **where you're admin** |
 | **SDK dumper** | Walks all `UClass`/`ScriptStruct` → `name : super + props(+offset,type) + funcs` in `sdk_dump.txt`. | tool |
 
 ---
 
-## mei mei [private] — in-headset menu
+## 2016 client — in-headset menu
 
-Primary control is now an in-VR **Dear ImGui** panel, **mei mei [private]**, rendered as an OpenXR
-quad layer and driven by your controller. No more adb for day-to-day toggling.
+Primary control is an in-VR **Dear ImGui** panel, **2016 client**, rendered as an OpenXR
+quad layer and driven by your controller. No more adb for day-to-day toggling. Top nav is
+**Home / Modules / Account**; the Account page edits your client username + `persona.txt` (Steam
+name) in-headset. No key/license — mods arm freely.
 
 - **Open/close:** press in the **left thumbstick (L3)**.
 - **Cursor:** aim the controller at the panel. **Click:** the **right trigger**.
@@ -238,8 +241,13 @@ from the client. Documented limits:
   name back to `"null"`. The client-side in-place write is separate: view-only, short-names-only, for
   custom maps that gate perks by a client-side name check.
 - **Anti-votekick / admin / VIP tied to your account** — server-side, not client-reachable.
+- **Server control (RCON)** — `ExecuteRconCommand` is a real client→server RPC (works on **dedicated**
+  servers, unlike the host-only `GameMode` path), but the server re-validates admin against its own
+  moderator list, keyed to your authenticated net ID. So **Restart match / Next map only take effect on
+  servers where you're actually admin** (or that leave RCON open). There is **no client-side spoof** for
+  admin — that's the point of a server RPC, and we don't fake it.
 
-We don't attempt anti-cheat bypass, ban evasion, or forced disconnect blocking.
+We don't attempt anti-cheat bypass, ban evasion, forced disconnect blocking, or crashing other players.
 
 ### Name changer detail
 The server-side name is locked to the account (`"null"` on anonymous auth). The mod instead

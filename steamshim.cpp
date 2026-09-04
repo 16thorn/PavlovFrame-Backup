@@ -11,6 +11,10 @@
 #include <cstdlib>
 #include <cstdarg>
 #include <time.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO,"STEAMSHIM",__VA_ARGS__)
@@ -115,6 +119,133 @@ static void*       fake_stub(void*){ return nullptr; }               // generic 
 static int      fake_GetHSteamUser(void*){ return 1; }
 static bool     fake_BLoggedOn(void*){ return true; }
 static uint64_t fake_GetSteamID(void*){ return g_steamid; } // spoofed SteamID64 (steamid.txt)
+
+// ---- ISteamUser vtable discovery: log which index the game calls for the auth ticket ----
+// GetAuthSessionTicket(void* buf, int cbMax, uint32* pcbTicket [, SteamNetworkingIdentity*]) -> HAuthTicket
+// GetAuthTicketForWebApi(const char* pIdentity) -> HAuthTicket
+// We don't know the index on this SDK, so instrument slots 3..63 with logging thunks that report the
+// index + first two args (a ticket call passes a writable buffer ptr + a size). Return 0 (no ticket) —
+// safe for every getter. The log tells us the real GetAuthSessionTicket slot + call shape.
+static uint64_t user_thunk_log(int idx, void* a, void* b){
+    static int n[64] = {0};
+    if (idx>=0 && idx<64 && n[idx] < 4) {
+        slog(false, "ISteamUser vt[%d] CALLED arg0=%p arg1=%p", idx, a, b);
+        LOG("ISteamUser vt[%d] CALLED arg0=%p arg1=%p", idx, a, b);
+        n[idx]++;
+    }
+    return 0;
+}
+#define UTHUNK(i) static uint64_t uthunk_##i(void* self, void* a, void* b, void*, void*){ (void)self; return user_thunk_log(i, a, b); }
+UTHUNK(3)  UTHUNK(4)  UTHUNK(5)  UTHUNK(6)  UTHUNK(7)  UTHUNK(8)  UTHUNK(9)  UTHUNK(10)
+UTHUNK(11) UTHUNK(12) UTHUNK(13) UTHUNK(14) UTHUNK(15) UTHUNK(16) UTHUNK(17) UTHUNK(18)
+UTHUNK(19) UTHUNK(20) UTHUNK(21) UTHUNK(22) UTHUNK(23) UTHUNK(24) UTHUNK(25) UTHUNK(26)
+UTHUNK(27) UTHUNK(28) UTHUNK(29) UTHUNK(30) UTHUNK(31) UTHUNK(32) UTHUNK(33) UTHUNK(34)
+UTHUNK(35) UTHUNK(36) UTHUNK(37) UTHUNK(38) UTHUNK(39) UTHUNK(40) UTHUNK(41) UTHUNK(42)
+UTHUNK(43) UTHUNK(44) UTHUNK(45) UTHUNK(46) UTHUNK(47) UTHUNK(48) UTHUNK(49) UTHUNK(50)
+UTHUNK(51) UTHUNK(52) UTHUNK(53) UTHUNK(54) UTHUNK(55) UTHUNK(56) UTHUNK(57) UTHUNK(58)
+UTHUNK(59) UTHUNK(60) UTHUNK(61) UTHUNK(62) UTHUNK(63)
+static void* g_uthunks[64] = {
+    0,0,0,
+    (void*)uthunk_3,(void*)uthunk_4,(void*)uthunk_5,(void*)uthunk_6,(void*)uthunk_7,(void*)uthunk_8,
+    (void*)uthunk_9,(void*)uthunk_10,(void*)uthunk_11,(void*)uthunk_12,(void*)uthunk_13,(void*)uthunk_14,
+    (void*)uthunk_15,(void*)uthunk_16,(void*)uthunk_17,(void*)uthunk_18,(void*)uthunk_19,(void*)uthunk_20,
+    (void*)uthunk_21,(void*)uthunk_22,(void*)uthunk_23,(void*)uthunk_24,(void*)uthunk_25,(void*)uthunk_26,
+    (void*)uthunk_27,(void*)uthunk_28,(void*)uthunk_29,(void*)uthunk_30,(void*)uthunk_31,(void*)uthunk_32,
+    (void*)uthunk_33,(void*)uthunk_34,(void*)uthunk_35,(void*)uthunk_36,(void*)uthunk_37,(void*)uthunk_38,
+    (void*)uthunk_39,(void*)uthunk_40,(void*)uthunk_41,(void*)uthunk_42,(void*)uthunk_43,(void*)uthunk_44,
+    (void*)uthunk_45,(void*)uthunk_46,(void*)uthunk_47,(void*)uthunk_48,(void*)uthunk_49,(void*)uthunk_50,
+    (void*)uthunk_51,(void*)uthunk_52,(void*)uthunk_53,(void*)uthunk_54,(void*)uthunk_55,(void*)uthunk_56,
+    (void*)uthunk_57,(void*)uthunk_58,(void*)uthunk_59,(void*)uthunk_60,(void*)uthunk_61,(void*)uthunk_62,
+    (void*)uthunk_63,
+};
+#define STEAMDISC_PATH FILES_DIR "steamdisc.txt"   // touch to arm ISteamUser vtable discovery
+
+// ============================================================================
+// STEAM TICKET RELAY (Quest side). files/relay.txt = "IP:PORT" of the PC minter
+// (steamrelay/relay.ps1). We fetch a REAL encrypted app ticket + the account's
+// SteamID64, hand the SteamID back at ISteamUser vt[2], and deliver the ticket
+// through RequestEncryptedAppTicket (vt[21]) -> EncryptedAppTicketResponse_t ->
+// GetEncryptedAppTicket (vt[22]). eosshim then sends it as EOS STEAM_APP_TICKET.
+// ============================================================================
+#define RELAY_PATH FILES_DIR "relay.txt"
+static bool     g_relay_mode = false;
+static uint8_t  g_ticket[2048];
+static uint32_t g_ticketlen = 0;
+static bool     g_ticket_ready = false;
+
+static int hexval(char c){ if(c>='0'&&c<='9')return c-'0'; if(c>='a'&&c<='f')return c-'a'+10; if(c>='A'&&c<='F')return c-'A'+10; return -1; }
+
+// Connect to the PC relay, read "STEAMID:<dec>\nTICKET:<hex>\n", fill g_steamid + g_ticket. Once.
+static bool relay_fetch(){
+    if (g_ticket_ready) return true;
+    FILE* rf = fopen(RELAY_PATH,"r"); if(!rf){ slog(false,"relay.txt missing"); return false; }
+    char line[64]={0}; if(!fgets(line,sizeof line,rf)){ fclose(rf); return false; } fclose(rf);
+    char* colon = strchr(line,':'); if(!colon){ slog(false,"relay.txt bad (need IP:PORT)"); return false; }
+    *colon=0; char* ip=line; int port=atoi(colon+1);
+    for(char* p=ip; *p; ++p) if(*p=='\n'||*p=='\r'||*p==' '){*p=0;break;}
+    int s=socket(AF_INET,SOCK_STREAM,0); if(s<0) return false;
+    struct timeval tv{5,0}; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof tv);
+    sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(port); a.sin_addr.s_addr=inet_addr(ip);
+    if(connect(s,(sockaddr*)&a,sizeof a)!=0){ slog(false,"relay connect %s:%d FAILED",ip,port); close(s); return false; }
+    // read the whole reply
+    static char buf[8192]; int off=0,n;
+    while(off<(int)sizeof(buf)-1 && (n=recv(s,buf+off,sizeof(buf)-1-off,0))>0) off+=n;
+    close(s); buf[off]=0;
+    slog(false,"relay reply %d bytes",off);
+    char* sid=strstr(buf,"STEAMID:"); char* tik=strstr(buf,"TICKET:");
+    if(!sid||!tik){ slog(false,"relay reply malformed"); return false; }
+    uint64_t id=strtoull(sid+8,nullptr,10); if(id) g_steamid=id;
+    char* hx=tik+7; uint32_t len=0;
+    for(; hx[0] && hx[1] && len<sizeof(g_ticket); hx+=2){
+        int hi=hexval(hx[0]); if(hi<0) break; int lo=hexval(hx[1]); if(lo<0) break;
+        g_ticket[len++]=(uint8_t)((hi<<4)|lo);
+    }
+    g_ticketlen=len; g_ticket_ready=(len>0);
+    slog(false,"relay OK: SteamID64=%llu ticket=%u bytes",(unsigned long long)g_steamid,len);
+    LOG("relay OK: SteamID64=%llu ticket=%u bytes",(unsigned long long)g_steamid,len);
+    return g_ticket_ready;
+}
+
+// ---- pending EncryptedAppTicket call-result delivery ----
+static uint64_t g_pending_call = 0;    // SteamAPICall_t we handed the game
+static uint64_t g_call_ctr     = 0x5000000000000001ULL;
+static void*    g_cr_cb        = nullptr;   // CCallbackBase* registered via RegisterCallResult
+static uint64_t g_cr_call      = 0;
+struct EncryptedAppTicketResponse_t { int32_t m_eResult; };   // k_iCallback = 154
+
+// ISteamUser vt[21]: RequestEncryptedAppTicket(void* pDataToInclude, int cb) -> SteamAPICall_t
+static uint64_t fake_RequestEncryptedAppTicket(void*, void*, int){
+    relay_fetch();
+    g_pending_call = g_call_ctr++;
+    slog(false,"RequestEncryptedAppTicket -> call=%llu (ticket_ready=%d)",(unsigned long long)g_pending_call,g_ticket_ready);
+    LOG("RequestEncryptedAppTicket -> call=%llu ready=%d",(unsigned long long)g_pending_call,g_ticket_ready);
+    return g_pending_call;
+}
+// ISteamUser vt[22]: GetEncryptedAppTicket(void* buf, int cbMax, uint32* pcbTicket) -> bool
+// Callers size-query first: GetEncryptedAppTicket(null/small, 0, &cb) -> we report the needed size
+// via *pcb (return false); the caller allocates cb and calls again with a real buffer -> we copy.
+static bool fake_GetEncryptedAppTicket(void*, uint8_t* buf, int cbMax, uint32_t* pcb){
+    if(!g_ticket_ready){ if(pcb)*pcb=0; slog(false,"GetEncryptedAppTicket: not ready"); return false; }
+    if(!buf || cbMax < (int)g_ticketlen){                 // size query / buffer too small -> report size
+        if(pcb)*pcb=g_ticketlen;
+        slog(false,"GetEncryptedAppTicket size-query: max=%d -> report need=%u",cbMax,g_ticketlen);
+        return false;
+    }
+    memcpy(buf,g_ticket,g_ticketlen); if(pcb)*pcb=g_ticketlen;
+    slog(false,"GetEncryptedAppTicket -> %u bytes served",g_ticketlen);
+    LOG("GetEncryptedAppTicket -> %u bytes served",g_ticketlen);
+    return true;
+}
+// fire the registered CCallResult: vtable[1] = Run(void* param, bool ioFailure, SteamAPICall_t)
+static void deliver_encapp_result(){
+    if(!g_pending_call || !g_cr_cb || g_cr_call!=g_pending_call) return;
+    EncryptedAppTicketResponse_t resp; resp.m_eResult = g_ticket_ready ? 1 : 2;  // 1=k_EResultOK
+    void** vt=*(void***)g_cr_cb; if(!vt) return;
+    typedef void(*RunCR)(void*,void*,bool,uint64_t);
+    slog(false,"delivering EncryptedAppTicketResponse_t eResult=%d call=%llu",resp.m_eResult,(unsigned long long)g_pending_call);
+    ((RunCR)vt[1])(g_cr_cb,&resp,false,g_pending_call);
+    g_pending_call=0; g_cr_cb=nullptr; g_cr_call=0;
+}
 static void* g_user_vtbl[256];
 static void* g_user_obj[2];
 static void* g_utils_vtbl[256];
@@ -167,17 +298,34 @@ static void fire_avatar_changed(){
 
 __attribute__((constructor)) static void on_load(){
     slog(true,"steamshim boot");
-    load_persona();
-    load_pfp();
+    load_persona();   // still read steamid.txt as a fallback for GetSteamID (name unused while spoof off)
+    // --- PERSONA/PFP SPOOF (disabled): the Steam-ticket relay now gives a REAL server-visible identity,
+    //     so we no longer fake the name/avatar. To restore the fake persona, uncomment load_pfp() +
+    //     the g_friends/g_utils lines below (and see the g_utils avatar lines further down). ---
+    // load_pfp();
     for(int i=0;i<256;i++){ g_friends_vtbl[i]=(void*)fake_stub; g_stub_vtbl[i]=(void*)fake_stub;
                             g_user_vtbl[i]=(void*)fake_stub; g_utils_vtbl[i]=(void*)fake_stub; }
-    g_friends_vtbl[0]=(void*)fake_GetPersonaName;                 // name
-    g_friends_vtbl[VT_MED_AVATAR]=(void*)fake_GetMediumFriendAvatar;
+    // g_friends_vtbl[0]=(void*)fake_GetPersonaName;                 // NAME SPOOF (disabled)
+    // g_friends_vtbl[VT_MED_AVATAR]=(void*)fake_GetMediumFriendAvatar;  // PFP SPOOF (disabled)
     g_user_vtbl[0]=(void*)fake_GetHSteamUser;
     g_user_vtbl[1]=(void*)fake_BLoggedOn;
     g_user_vtbl[2]=(void*)fake_GetSteamID;
-    g_utils_vtbl[VT_IMG_SIZE]=(void*)fake_GetImageSize;
-    g_utils_vtbl[VT_IMG_RGBA]=(void*)fake_GetImageRGBA;
+    // ISteamUser discovery: if steamdisc.txt present, instrument slots 3..63 to log the ticket call.
+    { FILE* df=fopen(STEAMDISC_PATH,"r");
+      if(df){ fclose(df);
+        for(int i=3;i<64;i++) g_user_vtbl[i]=g_uthunks[i];
+        LOG("ISteamUser vtable discovery ARMED (slots 3..63 instrumented)");
+        slog(false,"ISteamUser discovery armed"); } }
+    // RELAY MODE: if relay.txt present, install the real ticket handlers at vt[21]/vt[22]
+    // (override any discovery thunk) and pre-fetch the ticket so GetSteamID already returns the real id.
+    { FILE* rf=fopen(RELAY_PATH,"r");
+      if(rf){ fclose(rf); g_relay_mode=true;
+        g_user_vtbl[21]=(void*)fake_RequestEncryptedAppTicket;
+        g_user_vtbl[22]=(void*)fake_GetEncryptedAppTicket;
+        LOG("STEAM RELAY MODE armed (vt[21]=RequestEncAppTicket vt[22]=GetEncAppTicket)");
+        slog(false,"relay mode armed"); relay_fetch(); } }
+    // g_utils_vtbl[VT_IMG_SIZE]=(void*)fake_GetImageSize;   // PFP SPOOF (disabled)
+    // g_utils_vtbl[VT_IMG_RGBA]=(void*)fake_GetImageRGBA;   // PFP SPOOF (disabled)
     g_friends_obj[0]=(void*)g_friends_vtbl;
     g_stub_obj[0]=(void*)g_stub_vtbl;
     g_user_obj[0]=(void*)g_user_vtbl;
@@ -207,10 +355,23 @@ void SteamAPI_UnregisterCallback(void* pCallback){
     if(pCallback==g_cb_avatar)  g_cb_avatar=nullptr;
     if(pCallback==g_cb_persona) g_cb_persona=nullptr;
 }
+// The game registers a CCallResult for the RequestEncryptedAppTicket SteamAPICall_t here.
+// Capture it so RunCallbacks can fire EncryptedAppTicketResponse_t back on the matching handle.
+extern "C" __attribute__((visibility("default")))
+void SteamAPI_RegisterCallResult(void* pCallback, uint64_t hAPICall){
+    slog(false,"RegisterCallResult cb=%p call=%llu (pending=%llu)",pCallback,(unsigned long long)hAPICall,(unsigned long long)g_pending_call);
+    if(g_relay_mode && hAPICall==g_pending_call){ g_cr_cb=pCallback; g_cr_call=hAPICall;
+        LOG("captured CallResult for encapp ticket call=%llu",(unsigned long long)hAPICall); }
+}
+extern "C" __attribute__((visibility("default")))
+void SteamAPI_UnregisterCallResult(void* pCallback, uint64_t hAPICall){
+    if(pCallback==g_cr_cb) { g_cr_cb=nullptr; g_cr_call=0; }
+}
 // pumped by the game every frame: advance the GIF on its per-frame delay + poke the game to re-fetch.
 extern "C" __attribute__((visibility("default")))
 void SteamAPI_RunCallbacks(){
     static int nrun=0; if(nrun<3){ slog(false,"RunCallbacks pumping (nframes=%d avatar_cb=%p persona_cb=%p)", g_nframes, g_cb_avatar, g_cb_persona); nrun++; }
+    if(g_relay_mode) deliver_encapp_result();   // fire the encrypted-app-ticket call-result when pending
     if(g_nframes<=1 || !g_have_pfp) return;                 // static pfp: nothing to animate
     static uint64_t last=0; uint64_t t=now_ms();
     int d = (g_cur>=0 && g_cur<g_nframes && g_delays) ? g_delays[g_cur] : 100;

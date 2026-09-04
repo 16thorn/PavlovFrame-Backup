@@ -76,7 +76,6 @@ SRCS=(
   audioshim.cpp
   voice_opus.cpp
   mei/mei_settings.cpp
-  mei/mei_key.cpp
   mei/mei_menu.cpp
   mei/mei_input.cpp
   mei/mei_xr.cpp
@@ -90,7 +89,7 @@ SRCS=(
 # audioshim.cpp (the soundboard) is compiled INTO libpavchams.so — libOpenSLES.so is a public system
 # lib so it can't be replaced by APK name; pavchams GOT-hooks slCreateEngine from inside instead.
 echo "[1/5] compiling libpavchams.so (mod + soundboard + mei menu + imgui)"
-"$CLANG" $CXXFLAGS -shared -o libpavchams.so "${SRCS[@]}" third_party/libopus.a -llog -lvulkan -ldl -lm
+"$CLANG" $CXXFLAGS -shared -o libpavchams.so "${SRCS[@]}" third_party/libopus.a -llog -lvulkan -ldl -lm -laaudio
 
 # remove any stale standalone soundboard libs from the old name-swap approach so repack won't bundle them.
 rm -f libOpenSLES.so libOpenSLE2.so

@@ -69,6 +69,7 @@ void mei_save() {
     fprintf(f, "sb_loop %d\n",         s.sb_loop);
     fprintf(f, "sb_mix_mic %d\n",      s.sb_mix_mic);
     fprintf(f, "sb_monitor %d\n",      s.sb_monitor);
+    fprintf(f, "sb_transmit %d\n",     s.sb_transmit);
     fprintf(f, "sb_gain %.3f\n",       s.sb_gain);
     fprintf(f, "name_text %s\n",       s.name_text[0] ? s.name_text : "-");
     fprintf(f, "skin_name %s\n",       s.skin_name[0] ? s.skin_name : "-");
@@ -115,7 +116,7 @@ void mei_load() {
         GF("move_walk", move_walk) GF("move_crouch", move_crouch) GF("fly_speed", fly_speed)
         GI("godmode", godmode) GI("dev_tag", dev_tag) GI("force_vote", force_vote) GI("homing_knife", homing_knife)
         GI("name_enabled", name_enabled) GI("voice_enabled", voice_enabled) GI("voice_unmute", voice_unmute)
-        GI("sb_loop", sb_loop) GI("sb_mix_mic", sb_mix_mic) GI("sb_monitor", sb_monitor) GF("sb_gain", sb_gain)
+        GI("sb_loop", sb_loop) GI("sb_mix_mic", sb_mix_mic) GI("sb_monitor", sb_monitor) GI("sb_transmit", sb_transmit) GF("sb_gain", sb_gain)
         GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)
         GI("ui_accent", ui_accent) GI("ui_dark", ui_dark) GI("panel_custom", panel_custom)
         if (!strcmp(key, "panel_off") &&

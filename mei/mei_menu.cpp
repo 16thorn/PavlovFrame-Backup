@@ -4,7 +4,6 @@
 #include "mei_menu.h"
 #include "mei_settings.h"
 #include "mei_esp.h"
-#include "mei_key.h"
 #include <cstdio>
 #include <cstring>
 #include <cctype>
@@ -123,8 +122,11 @@ static const char* g_risk_name = nullptr; static bool* g_risk_ptr = nullptr; sta
 static bool ChkRisk(const char* l, bool* v, const char* riskName){
     ImGui::AlignTextToFramePadding(); ImGui::TextUnformatted(l);
     bool was = *v;
-    bool clicked = pill_draw(l, v, 1.f);
-    if(clicked && !was && *v){ g_risk_name=riskName; g_risk_ptr=v; g_risk_open=true; }  // enabling -> confirm
+    bool clicked = pill_draw(l, v, 1.f);       // pill_draw flips *v
+    if(clicked && !was && *v){                 // user just turned it ON -> keep OFF until they confirm
+        *v = false;
+        g_risk_name = riskName; g_risk_ptr = v; g_risk_open = true;
+    }
     return clicked;
 }
 static bool Sl(const char* l, float* v, float lo, float hi, const char* fmt){
@@ -466,6 +468,7 @@ static void tab_soundboard(){
     if (ImGui::Button("Rescan", ImVec2(120,44))) g_mei.sb_act_rescan = true;
     Chk("Loop", &g_mei.sb_loop);
     Chk("Monitor (hear it yourself)", &g_mei.sb_monitor);
+    ChkRisk("Broadcast to lobby", &g_mei.sb_transmit, "Broadcast to lobby");
     Sl("Gain", &g_mei.sb_gain, 0.5f, 8.0f, "%.1fx");
     ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "gain applies on next PLAY (bakes into the encode)");
     gb_end();
@@ -473,6 +476,12 @@ static void tab_soundboard(){
 static void tab_config(){
     gb_begin("GENERAL");
     Chk("Master enable",&g_mei.master_enabled);
+    gb_end();
+    gb_begin("SERVER  (RCON)");
+    ImGui::TextColored(v4(C_MUTE), "admin RPC — works on dedicated servers if you're admin");
+    if(ImGui::Button("Restart match", ImVec2(170,42))) g_mei.act_restart_match=true;
+    ImGui::SameLine();
+    if(ImGui::Button("Next map", ImVec2(150,42))) g_mei.act_next_map=true;
     gb_end();
     gb_begin("PANEL");
     Sl("Distance",&g_mei.panel_dist,0.35f,1.5f,"%.2f m");
@@ -610,12 +619,8 @@ static void account_page(){
     if(!g_persona_loaded){ g_persona_loaded=true;
         FILE* f=fopen(PERSONA_FILE,"r"); if(f){ if(fgets(g_persona_buf,sizeof g_persona_buf,f)){
             int L=(int)strlen(g_persona_buf); while(L>0&&(g_persona_buf[L-1]=='\n'||g_persona_buf[L-1]=='\r'))g_persona_buf[--L]=0; } fclose(f);} }
-    const char* tiers[]={"WEEKLY","MONTHLY","LIFETIME"}; int tr=mei_key_tier(); long dl=mei_key_days_left();
     gb_begin("ACCOUNT");
     ImGui::TextColored(v4(C_MUTE),"USER");  ImGui::SameLine(200); ImGui::TextColored(v4(C_TEXT), "%s", g_persona_buf[0]?g_persona_buf:"mei");
-    ImGui::TextColored(v4(C_MUTE),"TIER");  ImGui::SameLine(200); ImGui::TextColored(v4(ACC()), "%s", (tr>=0&&tr<3)?tiers[tr]:"NONE");
-    ImGui::TextColored(v4(C_MUTE),"DAYS");  ImGui::SameLine(200); if(dl>=99999) ImGui::TextColored(v4(C_TEXT),"lifetime"); else ImGui::TextColored(v4(C_TEXT),"%ld", dl<0?0:dl);
-    ImGui::TextColored(v4(C_MUTE),"HWID");  ImGui::SameLine(200); ImGui::TextColored(v4(C_TEXT), "%s", mei_key_hwid());
     ImGui::TextColored(v4(C_MUTE),"STATUS");ImGui::SameLine(200); ImGui::TextColored(v4(C_GREEN), "UNDETECTED");
     gb_end();
     gb_begin("USERNAME  (client)");
@@ -637,45 +642,6 @@ static void account_page(){
     if(ImGui::Button("Save persona", ImVec2(180,40))){
         FILE* f=fopen(PERSONA_FILE,"w"); if(f){ fputs(g_persona_buf,f); fclose(f); } }
     gb_end();
-    NEXTCOL();
-    gb_begin("KEY");
-    ImGui::TextColored(v4(ACC()), "%s", mei_key_str()[0]?mei_key_str():"(none)");
-    ImGui::Dummy(ImVec2(0,4));
-    ImGui::TextColored(v4(C_MUTE), "locked to this device (HWID). 1 key = 1 device.");
-    gb_end();
-}
-
-// ---- key activation page (shown when unlicensed; mods stay hard-locked) -------
-static char g_keyin[64]={0}; static bool g_keyerr=false;
-static void key_page(float W, ImVec2 wp, ImDrawList* dl){
-    dl->AddRectFilled(wp, ImVec2(wp.x+W, wp.y+56), C_HEAD, 14.f, ImDrawFlags_RoundCornersTop);
-    dl->AddCircleFilled(ImVec2(wp.x+30, wp.y+28), 13, ACC()); dl->AddText(ImVec2(wp.x+22, wp.y+20), C_KNOB, "M");
-    dl->AddText(ImVec2(wp.x+54, wp.y+19), C_TEXT, "2016 client");
-    float cw=560.f;
-    ImGui::SetCursorPos(ImVec2((W-cw)*0.5f, 96.f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28,24));
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, v4(C_CARD));
-    ImGui::BeginChild("keycard", ImVec2(cw,0), ImGuiChildFlags_AutoResizeY);
-    ImGui::TextColored(v4(ACC()), "ACTIVATE");
-    ImGui::TextColored(v4(C_MUTE), "enter your key to unlock. no key = mods stay locked.");
-    ImGui::Dummy(ImVec2(0,6));
-    ImGui::TextColored(v4(C_MUTE), "DEVICE HWID"); ImGui::SameLine();
-    ImGui::TextColored(v4(C_TEXT), "%s", mei_key_hwid());
-    ImGui::Dummy(ImVec2(0,6));
-    ImGui::PushItemWidth(-1.f);
-    if(ImGui::InputText("##keyin", g_keyin, sizeof g_keyin)) g_keyerr=false;
-    if(ImGui::IsItemActivated()) g_kb=true;
-    ImGui::PopItemWidth();
-    if(g_kb){ ImGui::Spacing(); keyboard(g_keyin, sizeof g_keyin); }
-    ImGui::Dummy(ImVec2(0,6));
-    if(ImGui::Button("ACTIVATE", ImVec2(220,48))){
-        bool ok=mei_key_activate(g_keyin); g_mei.licensed=mei_key_licensed(); g_keyerr=!ok; }
-    ImGui::SameLine();
-    if(g_keyerr) ImGui::TextColored(v4(ACC()), "  invalid key");
-    ImGui::Dummy(ImVec2(0,8));
-    ImGui::TextColored(v4(C_MUTE), "tiers:  Weekly (7d)   -   Monthly (30d)   -   Lifetime");
-    ImGui::EndChild();
-    ImGui::PopStyleColor(); ImGui::PopStyleVar();
 }
 
 // bottom-left user card (key-system data goes here once wired; placeholder for now)
@@ -716,16 +682,6 @@ void mei_menu_frame(int panel_w, int panel_h){
     ImGuiIO& io = ImGui::GetIO();
     ImDrawList* dl = ImGui::GetWindowDrawList(); ImVec2 wp = ImGui::GetWindowPos();
     const float HEAD=56.f, RAIL=186.f;
-
-    // ---- license gate: check once, hard-lock mods until a valid key is activated ----
-    static bool lic_checked=false;
-    if(!lic_checked){ lic_checked=true; mei_key_check(); g_mei.licensed=mei_key_licensed(); }
-    if(!g_mei.licensed){
-        g_mei.master_enabled=false;                 // belt: nothing arms without a key
-        key_page(W, wp, dl);
-        ImGui::End(); ImGui::PopStyleVar();
-        return;
-    }
 
     // ---- header ----
     dl->AddRectFilled(wp, ImVec2(wp.x+W, wp.y+HEAD), C_HEAD, 14.f, ImDrawFlags_RoundCornersTop);
@@ -852,7 +808,7 @@ void mei_menu_frame(int panel_w, int panel_h){
         ImGui::TextWrapped("%s is highly detectable — servers can flag or ban it. Enable anyway?",
                            g_risk_name?g_risk_name:"This feature");
         ImGui::Spacing(); ImGui::Spacing();
-        if(ImGui::Button("Enable anyway", ImVec2(170,42))) ImGui::CloseCurrentPopup();
+        if(ImGui::Button("Enable anyway", ImVec2(170,42))){ if(g_risk_ptr){ *g_risk_ptr=true; touched(); } ImGui::CloseCurrentPopup(); }
         ImGui::SameLine();
         if(ImGui::Button("Cancel", ImVec2(140,42))){ if(g_risk_ptr){ *g_risk_ptr=false; touched(); } ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
