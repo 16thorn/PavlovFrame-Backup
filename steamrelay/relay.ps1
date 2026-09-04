@@ -5,6 +5,8 @@
 $ErrorActionPreference = 'Stop'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $dir; [Environment]::CurrentDirectory = $dir
+# Steam reads steam_appid.txt from the CWD at init to know which app we are (Pavlov Shack = 3504270).
+Set-Content -Path (Join-Path $dir 'steam_appid.txt') -Value '3504270' -Encoding ascii -NoNewline
 
 Add-Type -TypeDefinition @"
 using System;
