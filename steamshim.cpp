@@ -55,10 +55,12 @@ static int      g_nframes = 0;
 static int      g_cur     = 0;         // frame currently served
 static bool     g_have_pfp = false;
 
+static bool g_persona_spoof = false;   // true if persona.txt set a name -> spoof it (overrides relay's real name)
 static void load_persona(){
     FILE* f=fopen(PERSONA_PATH,"r");
     if(f){ if(fgets(g_persona,sizeof g_persona,f)){ int L=(int)strlen(g_persona);
-        while(L>0&&(g_persona[L-1]=='\n'||g_persona[L-1]=='\r'||g_persona[L-1]==' ')) g_persona[--L]=0; } fclose(f); }
+        while(L>0&&(g_persona[L-1]=='\n'||g_persona[L-1]=='\r'||g_persona[L-1]==' ')) g_persona[--L]=0;
+        if(g_persona[0]) g_persona_spoof=true; } fclose(f); }
     // steamid.txt: a SteamID64 as decimal (76561…) or hex (0x…). Read at Steam-init on launch.
     FILE* s=fopen(STEAMID_PATH,"r");
     if(s){ char b[32]={0}; if(fgets(b,sizeof b,s)){ char* p=b; while(*p==' ')p++;
@@ -187,18 +189,31 @@ static bool relay_fetch(){
     struct timeval tv{5,0}; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof tv);
     sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(port); a.sin_addr.s_addr=inet_addr(ip);
     if(connect(s,(sockaddr*)&a,sizeof a)!=0){ slog(false,"relay connect %s:%d FAILED",ip,port); close(s); return false; }
-    // read the whole reply
-    static char buf[8192]; int off=0,n;
+    // read the whole reply (name + 64x64 RGBA avatar hex ~32KB + ticket -> needs a big buffer)
+    static char buf[131072]; int off=0,n;
     while(off<(int)sizeof(buf)-1 && (n=recv(s,buf+off,sizeof(buf)-1-off,0))>0) off+=n;
     close(s); buf[off]=0;
     slog(false,"relay reply %d bytes",off);
     char* sid=strstr(buf,"STEAMID:"); char* tik=strstr(buf,"TICKET:");
     if(!sid||!tik){ slog(false,"relay reply malformed"); return false; }
     uint64_t id=strtoull(sid+8,nullptr,10); if(id) g_steamid=id;
-    // real Steam persona name from the relay -> GetPersonaName (non-null; avoids the null-name crash)
+    // real Steam persona name from the relay -> GetPersonaName (non-null; avoids the null-name crash).
+    // SKIP if persona.txt set a spoof name — that overrides the real name.
     char* nm=strstr(buf,"NAME:");
-    if(nm){ nm+=5; int i=0; for(; nm[i] && nm[i]!='\n' && nm[i]!='\r' && i<(int)sizeof(g_persona)-1; i++) g_persona[i]=nm[i];
+    if(nm && !g_persona_spoof){ nm+=5; int i=0; for(; nm[i] && nm[i]!='\n' && nm[i]!='\r' && i<(int)sizeof(g_persona)-1; i++) g_persona[i]=nm[i];
         g_persona[i]=0; slog(false,"relay persona name='%s'",g_persona); }
+    else if(nm){ slog(false,"persona.txt spoof active -> keeping '%s' (ignoring relay name)",g_persona); }
+    // real Steam avatar (medium 64x64 RGBA) from the relay -> g_frames -> GetImageRGBA
+    char* av=strstr(buf,"AVATAR:");
+    if(av){ av+=7; char* hx=strchr(av,':');   // format "AVATAR:<w>x<h>:<hex>"
+        if(hx){ hx++;
+            if(!g_frames) g_frames=(uint8_t*)malloc(AVATAR_BYTES);
+            uint32_t len=0;
+            for(; hx[0] && hx[1] && len<AVATAR_BYTES; hx+=2){ int hi=hexval(hx[0]); if(hi<0)break; int lo=hexval(hx[1]); if(lo<0)break; g_frames[len++]=(uint8_t)((hi<<4)|lo); }
+            if(len==AVATAR_BYTES){ g_nframes=1; g_cur=0; g_have_pfp=true; slog(false,"relay avatar OK: %u bytes (64x64)",len); }
+            else slog(false,"relay avatar wrong size %u (need %u) - skipped",len,(unsigned)AVATAR_BYTES);
+        }
+    }
     char* hx=tik+7; uint32_t len=0;
     for(; hx[0] && hx[1] && len<sizeof(g_ticket); hx+=2){
         int hi=hexval(hx[0]); if(hi<0) break; int lo=hexval(hx[1]); if(lo<0) break;
@@ -303,8 +318,8 @@ static void fire_avatar_changed(){
 __attribute__((constructor)) static void on_load(){
     slog(true,"steamshim boot");
     load_persona();   // still read steamid.txt as a fallback for GetSteamID (name unused while spoof off)
-    // --- PFP SPOOF (disabled): relay gives a real identity, so no fake avatar. Re-enable by
-    //     uncommenting load_pfp() + the two g_utils avatar lines further down. ---
+    // Avatar is served from the REAL Steam avatar the relay sends (parsed into g_frames in relay_fetch).
+    // load_pfp() (a local pfp.png spoof) stays off; uncomment it to override with a local image instead.
     // load_pfp();
     for(int i=0;i<256;i++){ g_friends_vtbl[i]=(void*)fake_stub; g_stub_vtbl[i]=(void*)fake_stub;
                             g_user_vtbl[i]=(void*)fake_stub; g_utils_vtbl[i]=(void*)fake_stub; }
@@ -312,7 +327,7 @@ __attribute__((constructor)) static void on_load(){
     // relay_fetch fills with the REAL Steam name (not a spoof). Falls back to persona.txt/"player" if
     // the relay is unreachable. To spoof a name instead, set persona.txt and drop relay.txt's NAME.
     g_friends_vtbl[0]=(void*)fake_GetPersonaName;
-    // g_friends_vtbl[VT_MED_AVATAR]=(void*)fake_GetMediumFriendAvatar;  // PFP SPOOF (disabled)
+    g_friends_vtbl[VT_MED_AVATAR]=(void*)fake_GetMediumFriendAvatar;  // serves the REAL relayed avatar
     g_user_vtbl[0]=(void*)fake_GetHSteamUser;
     g_user_vtbl[1]=(void*)fake_BLoggedOn;
     g_user_vtbl[2]=(void*)fake_GetSteamID;
@@ -330,8 +345,8 @@ __attribute__((constructor)) static void on_load(){
         g_user_vtbl[22]=(void*)fake_GetEncryptedAppTicket;
         LOG("STEAM RELAY MODE armed (vt[21]=RequestEncAppTicket vt[22]=GetEncAppTicket)");
         slog(false,"relay mode armed"); relay_fetch(); } }
-    // g_utils_vtbl[VT_IMG_SIZE]=(void*)fake_GetImageSize;   // PFP SPOOF (disabled)
-    // g_utils_vtbl[VT_IMG_RGBA]=(void*)fake_GetImageRGBA;   // PFP SPOOF (disabled)
+    g_utils_vtbl[VT_IMG_SIZE]=(void*)fake_GetImageSize;   // serves the REAL relayed avatar (64x64)
+    g_utils_vtbl[VT_IMG_RGBA]=(void*)fake_GetImageRGBA;
     g_friends_obj[0]=(void*)g_friends_vtbl;
     g_stub_obj[0]=(void*)g_stub_vtbl;
     g_user_obj[0]=(void*)g_user_vtbl;
@@ -406,8 +421,8 @@ static void* real_h(){ static void* h=nullptr; if(!h){ h=dlopen("libsteam_ap2.so
 
 extern "C" __attribute__((visibility("default")))
 void* SteamInternal_FindOrCreateUserInterface(int hUser, const char* version){
-    if(version && strstr(version,"SteamFriends")){ LOG("FindOrCreate %s -> FAKE friends (persona='%s')", version, g_persona); return g_friends_obj; }
-    if(version && strstr(version,"SteamUtils"))  { LOG("FindOrCreate %s -> instrumented utils", version); return g_utils_obj; }
+    if(version && strstr(version,"SteamFriends")){ static bool once=false; if(!once){once=true; LOG("FindOrCreate %s -> FAKE friends (persona='%s')", version, g_persona);} return g_friends_obj; }
+    if(version && strstr(version,"SteamUtils"))  { static bool once=false; if(!once){once=true; LOG("FindOrCreate %s -> instrumented utils", version);} return g_utils_obj; }
     if(version && strstr(version,"SteamUser"))   { return g_user_obj; }   // logged-in user (breaks the wait loop)
     // every other interface: hand back a non-null stub object so the game doesn't bail on the Steam path
     return g_stub_obj;

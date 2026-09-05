@@ -30,7 +30,7 @@ Quest-3-runnable, EOS-authenticated Pavlov Shack **Steam Frame** build.
 - `UECommandLine.txt` : `-ini:` ProjectVersion override attempt (did NOT take; version is in OBB).
 - `repack.py` : rebuilds the APK (swaps libEOSSDK.so, adds libEOSDK.so, patched classes.dex,
   classes2.dex, patched manifest + UECommandLine).
-- `ratkey.jks` : signing keystore.  **storepass / keypass = `ratman4080`,  alias = `rat`**
+- `ratkey.jks` : signing keystore (generate your own with `keytool -genkey`; store/key pass + alias are yours, never commit them).
 - `Pavlov-EOS.apk` : the final signed, working Frame build.
 - `tools/` : dexlib2 + deps (for the dex patcher), baksmali/smali jars.
 - `browser-1.8.0.aar` : androidx.browser source for the customtabs classes.
@@ -71,15 +71,15 @@ aarch64-linux-android29-clang++ -std=c++17 -O2 -fPIC -fvisibility=hidden -shared
 # 2. repack + align + sign
 python repack.py
 zipalign -f 4 Pavlov-EOS-unsigned.apk Pavlov-EOS-aligned.apk
-apksigner sign --ks ratkey.jks --ks-pass pass:ratman4080 --key-pass pass:ratman4080 \
-  --ks-key-alias rat --out Pavlov-EOS.apk Pavlov-EOS-aligned.apk
+apksigner sign --ks ratkey.jks --ks-pass pass:YOURPASS --key-pass pass:YOURPASS \
+  --ks-key-alias YOURALIAS --out Pavlov-EOS.apk Pavlov-EOS-aligned.apk
 # 3. install (keeps OBB) + push OBBs if needed
 adb install -r Pavlov-EOS.apk
 ```
 
 ## Original untouched sources
-Frame APKs + keystore + xrshim: `C:\Users\lodge\Documents\pavlov-quest\`
-OBB backups (13.5GB): `C:\Program Files (x86)\Steam\steamapps\content\app_3504270\depot_3504271\obb\`
+Frame APKs + keystore + xrshim: keep your own local copy (bring your own dump).
+OBBs: pulled from your Steam Pavlov Shack install under `steamapps\content\app_3504270\...\obb\`.
 
 ## Next: Quest-3 build plan
 Take a genuine **Quest** Shack build (netcode matches live), re-sign with ratkey.jks, and bolt on
@@ -136,7 +136,7 @@ Used apktool to add `android:debuggable="true"` so `run-as` works:
 java -jar apktool.jar d -s -f -o apkdec2 Pavlov-EOS.apk     # -s keeps dex raw
 # edit apkdec2/AndroidManifest.xml: add android:debuggable="true" to <application>
 java -jar apktool.jar b apkdec2 -o Pavlov-dbg-unsigned.apk
-zipalign -f 4 ... ; apksigner sign --ks ratkey.jks ... (pass ratman4080, alias rat)
+zipalign -f 4 ... ; apksigner sign --ks ratkey.jks ... (your own pass + alias)
 ```
 Then read/write the real internal config (game must be force-stopped first):
 ```

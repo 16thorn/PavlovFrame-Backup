@@ -105,6 +105,33 @@ Common problems:
 
 ---
 
+## Changing your display name (persona.txt)
+
+`persona.txt` sets the name shown in-game. If it has a name, that name is used (a spoof); if it's
+empty or missing, your real Steam name (from the relay) is used instead.
+
+**Set a name (adb):**
+```sh
+adb shell "printf 'YourName' > /sdcard/Android/data/com.vankrupt.pavlov/files/persona.txt"
+adb shell am force-stop com.vankrupt.pavlov
+```
+Then relaunch Pavlov — you'll show as `YourName`.
+
+**Or on the headset:** with any file manager, edit
+`Android/data/com.vankrupt.pavlov/files/persona.txt` and type the name (one line, no quotes).
+
+**Use your real Steam name instead:** empty the file (or delete it), then restart:
+```sh
+adb shell "rm -f /sdcard/Android/data/com.vankrupt.pavlov/files/persona.txt"
+```
+
+Notes:
+- It's read **once at launch** — always restart the game after changing it.
+- This only changes the **displayed name**. The account you're authenticated as is still the relay's
+  Steam account (that's what gets you into lobbies) — the name is cosmetic.
+- Your avatar comes from the relay (your real Steam avatar) in this build; there's no local
+  `pfp.png` override enabled.
+
 ## How it works (short version)
 
 The game authenticates to official lobbies with a Steam **encrypted app ticket** (`RequestEncrypted

@@ -191,30 +191,33 @@ static void keyboard(char* buf,int cap){
     const char* rows[4]={"1234567890","QWERTYUIOP","ASDFGHJKL","ZXCVBNM"};
     const char* digsym ="!@#$%^&*()";     // shift on the number row -> standard US symbols
     const char* symrow ="@_-.!#$%&+";      // dedicated symbol row (literal, shift-independent)
+    // Size every key off the actual panel width so a 10-key row always fits (no right-side clipping).
+    const float sp = ImGui::GetStyle().ItemSpacing.x;
+    float u = (ImGui::GetContentRegionAvail().x - sp*9.f) / 10.f; if(u < 18.f) u = 18.f;   // 10-column grid
+    const float kh = 46.f;
     for(int r=0;r<4;r++){
-        if(r==2) ImGui::Indent(26.f); if(r==3) ImGui::Indent(52.f);
+        if(r==2) ImGui::Indent(u*0.5f); if(r==3) ImGui::Indent(u*1.0f);   // proportional QWERTY stagger
         for(int i=0; rows[r][i]; i++){
             char ch=rows[r][i];
             if(r==0 && g_shift) ch=digsym[i];              // 1->! 2->@ ... on shift
             else if(!g_shift && ch>='A'&&ch<='Z') ch+=32;  // letters lowercase unless shift
             char lab[8]; snprintf(lab,sizeof lab,"%c##k%d_%d",ch,r,i);   // unique id (avoid dup-char clash)
-            if(ImGui::Button(lab, ImVec2(52,46))) kb_append(buf,cap,ch);
-            ImGui::SameLine();
+            if(ImGui::Button(lab, ImVec2(u,kh))) kb_append(buf,cap,ch);
+            if(rows[r][i+1]) ImGui::SameLine();
         }
-        if(r==2) ImGui::Unindent(26.f); if(r==3) ImGui::Unindent(52.f);
-        ImGui::NewLine();
+        if(r==2) ImGui::Unindent(u*0.5f); if(r==3) ImGui::Unindent(u*1.0f);
     }
     for(int i=0; symrow[i]; i++){                          // symbols row (always available: @ _ - . etc)
         char lab[8]; snprintf(lab,sizeof lab,"%c##sym%d",symrow[i],i);
-        if(ImGui::Button(lab, ImVec2(52,46))) kb_append(buf,cap,symrow[i]);
-        ImGui::SameLine();
+        if(ImGui::Button(lab, ImVec2(u,kh))) kb_append(buf,cap,symrow[i]);
+        if(symrow[i+1]) ImGui::SameLine();
     }
-    ImGui::NewLine();
-    if(ImGui::Button(g_shift?"SHIFT":"shift",ImVec2(82,46))) g_shift=!g_shift; ImGui::SameLine();
-    if(ImGui::Button("space",ImVec2(220,46))) kb_append(buf,cap,' '); ImGui::SameLine();
-    if(ImGui::Button("back",ImVec2(82,46))){ int n=(int)strlen(buf); if(n>0){buf[n-1]=0;touched();} } ImGui::SameLine();
-    if(ImGui::Button("clear",ImVec2(82,46))){ buf[0]=0; touched(); } ImGui::SameLine();
-    if(ImGui::Button("done",ImVec2(82,46))){ g_kb=false; g_kb2=false; }
+    // bottom row as a 10-unit grid: shift(1.5) space(4) back(1.5) clear(1.5) done(1.5)
+    if(ImGui::Button(g_shift?"SHIFT":"shift",ImVec2(u*1.5f+sp*0.5f,kh))) g_shift=!g_shift; ImGui::SameLine();
+    if(ImGui::Button("space",ImVec2(u*4.f+sp*3.f,kh))) kb_append(buf,cap,' '); ImGui::SameLine();
+    if(ImGui::Button("back",ImVec2(u*1.5f+sp*0.5f,kh))){ int n=(int)strlen(buf); if(n>0){buf[n-1]=0;touched();} } ImGui::SameLine();
+    if(ImGui::Button("clear",ImVec2(u*1.5f+sp*0.5f,kh))){ buf[0]=0; touched(); } ImGui::SameLine();
+    if(ImGui::Button("done",ImVec2(u*1.5f,kh))){ g_kb=false; g_kb2=false; }
 }
 
 // ---- tabs --------------------------------------------------------------------
@@ -242,13 +245,18 @@ static void tab_visuals(){
     gb_begin("CHAMS");
     Chk("Enabled",&g_mei.chams_enabled);
     ImGui::BeginDisabled(!g_mei.chams_enabled);
-    const char* styles[] = { "Team colors","Single A","Single B","Flash","Target only","Custom color" };
-    Dropdown("Style", &g_mei.chams_style, styles, 6);
+    const char* styles[] = { "Team colors","Single A","Single B","Flash","Target only","Custom color","Rainbow" };
+    Dropdown("Style", &g_mei.chams_style, styles, 7);
     if (g_mei.chams_style == 5) {
         if (ImGui::ColorEdit3("Team 0", g_mei.chams_col,  ImGuiColorEditFlags_NoInputs)) touched();
         if (ImGui::ColorEdit3("Team 1", g_mei.chams_col2, ImGuiColorEditFlags_NoInputs)) touched();
         ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "recolor each team (see-through tint)");
     }
+    if (g_mei.chams_style == 6) {
+        Sl("Rainbow speed", &g_mei.rainbow_speed, 0.1f, 5.0f, "%.1fx");
+        ImGui::TextColored(v4(IM_COL32(0x7A,0x7A,0x88,0xFF)), "hue waves across the team");
+    }
+    Chk("Gun chams (your gun)", &g_mei.gun_chams);
     Chk("Highlight target",&g_mei.chams_highlight);
     Chk("Skip dead",&g_mei.chams_skip_dead);
     ImGui::EndDisabled();

@@ -2,8 +2,6 @@
 # NOTE: the finished modded APK IS shared with friends here (private repo). OBBs (~13GB)
 # are too big for GitHub and must be shared separately.
 *.apk
-!Pavlov-Frame-chams.apk
-!Backups/**/Pavlov-Frame-chams.apk
 *.apk.idsig
 *.obb
 *.pak
@@ -64,3 +62,9 @@ steam_appid.txt
 steam_ticket.txt
 dlls.txt
 pfp_test.*
+
+# steam relay local artifacts (personal / binary)
+steamrelay/avatar_fetched.png
+steamrelay/relay.log
+steamrelay/steam_api64.dll
+steamrelay/steam_appid.txt

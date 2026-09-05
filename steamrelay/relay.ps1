@@ -8,7 +8,7 @@ Set-Location $dir; [Environment]::CurrentDirectory = $dir
 # Steam reads steam_appid.txt from the CWD at init to know which app we are (Pavlov Shack = 3504270).
 Set-Content -Path (Join-Path $dir 'steam_appid.txt') -Value '3504270' -Encoding ascii -NoNewline
 
-Add-Type -TypeDefinition @"
+Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -20,6 +20,9 @@ public static class S {
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_SteamUtils_v010();
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_SteamFriends_v017();
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_ISteamFriends_GetPersonaName(IntPtr s);
+    [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern int   SteamAPI_ISteamFriends_GetMediumFriendAvatar(IntPtr s, ulong id);
+    [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern bool  SteamAPI_ISteamUtils_GetImageSize(IntPtr s, int h, out uint w, out uint ht);
+    [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern bool  SteamAPI_ISteamUtils_GetImageRGBA(IntPtr s, int h, byte[] dest, int destSize);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern ulong SteamAPI_ISteamUser_GetSteamID(IntPtr s);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern bool  SteamAPI_ISteamUser_BLoggedOn(IntPtr s);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern ulong SteamAPI_ISteamUser_RequestEncryptedAppTicket(IntPtr s, IntPtr d, int cb);
@@ -28,7 +31,32 @@ public static class S {
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern bool  SteamAPI_ISteamUtils_GetAPICallResult(IntPtr s, ulong c, byte[] cb, int n, int exp, out bool f);
 
     static IntPtr U, Ut, Fr; static ulong Id; static string Name = "";
+    static string AvHex = ""; static uint AvW = 0, AvH = 0;
     static string cacheHex = ""; static DateTime cacheAt = DateTime.MinValue;
+
+    static void FetchAvatar() {
+        if (Fr == IntPtr.Zero) return;
+        int h = 0;
+        for (int tries = 0; tries < 60; tries++) {          // avatar may need a moment to load
+            h = SteamAPI_ISteamFriends_GetMediumFriendAvatar(Fr, Id);
+            if (h > 0) break;
+            SteamAPI_RunCallbacks(); System.Threading.Thread.Sleep(50);
+        }
+        if (h <= 0) return;
+        uint w, ht; if (!SteamAPI_ISteamUtils_GetImageSize(Ut, h, out w, out ht) || w == 0) return;
+        byte[] buf = new byte[w * ht * 4];
+        if (!SteamAPI_ISteamUtils_GetImageRGBA(Ut, h, buf, buf.Length)) return;
+        StringBuilder sb = new StringBuilder(buf.Length * 2);
+        for (int i = 0; i < buf.Length; i++) sb.Append(buf[i].ToString("x2"));
+        AvHex = sb.ToString(); AvW = w; AvH = ht;
+        try {   // dump what we fetched to avatar_fetched.png so it can be eyeballed (RGBA -> BGRA)
+            var bmp = new System.Drawing.Bitmap((int)w, (int)ht, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            for (int y = 0; y < ht; y++) for (int x = 0; x < w; x++) { int i = (y*(int)w + x)*4;
+                bmp.SetPixel(x, y, System.Drawing.Color.FromArgb(buf[i+3], buf[i], buf[i+1], buf[i+2])); }
+            bmp.Save(System.IO.Path.Combine(Environment.CurrentDirectory, "avatar_fetched.png"),
+                     System.Drawing.Imaging.ImageFormat.Png);
+        } catch {}
+    }
 
     public static string Init() {
         SetDllDirectory(Environment.CurrentDirectory);
@@ -40,7 +68,8 @@ public static class S {
         Id = SteamAPI_ISteamUser_GetSteamID(U);
         if (Fr != IntPtr.Zero) { IntPtr np = SteamAPI_ISteamFriends_GetPersonaName(Fr);
             if (np != IntPtr.Zero) Name = Marshal.PtrToStringAnsi(np) ?? ""; }
-        return "OK SteamID64=" + Id + " name='" + Name + "'";
+        FetchAvatar();
+        return "OK SteamID64=" + Id + " name='" + Name + "' avatar=" + (AvHex.Length>0 ? (AvW+"x"+AvH) : "none");
     }
     static string MintFresh() {
         ulong call = SteamAPI_ISteamUser_RequestEncryptedAppTicket(U, IntPtr.Zero, 0);
@@ -65,7 +94,8 @@ public static class S {
         string hex;
         if ((DateTime.UtcNow - cacheAt).TotalSeconds < 90 && cacheHex.Length > 0) hex = cacheHex;
         else { hex = MintFresh(); if (hex == null) return "ERROR: mint failed\n"; cacheHex = hex; cacheAt = DateTime.UtcNow; }
-        return "STEAMID:" + Id + "\nNAME:" + Name + "\nTICKET:" + hex + "\n";
+        string av = AvHex.Length > 0 ? ("\nAVATAR:" + AvW + "x" + AvH + ":" + AvHex) : "";
+        return "STEAMID:" + Id + "\nNAME:" + Name + av + "\nTICKET:" + hex + "\n";
     }
 }
 "@

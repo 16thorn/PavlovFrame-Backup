@@ -2314,6 +2314,58 @@ static void scan_bots() {
     g_fguard = 0;
 }
 // GAME THREAD: cheap — re-validate each cached pawn FRESH (guards stale/reused pointers) + apply.
+// HSV->RGB (h in [0,1)) for the rainbow cham style.
+static void hsv2rgb(float h, float s, float v, float* out) {
+    h -= (float)(int)h; if (h < 0) h += 1.f;
+    float i = h * 6.f; int ii = (int)i; float f = i - ii;
+    float p = v*(1-s), q = v*(1-s*f), t = v*(1-s*(1-f));
+    switch (ii % 6) {
+        case 0: out[0]=v; out[1]=t; out[2]=p; break;   case 1: out[0]=q; out[1]=v; out[2]=p; break;
+        case 2: out[0]=p; out[1]=v; out[2]=t; break;   case 3: out[0]=p; out[1]=q; out[2]=v; break;
+        case 4: out[0]=t; out[1]=p; out[2]=v; break;   default:out[0]=v; out[1]=p; out[2]=q; break;
+    }
+}
+static void rainbow_color(float* out, float phase) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    float sec = ts.tv_sec + ts.tv_nsec/1e9f;
+    float sp = g_mei.rainbow_speed <= 0 ? 1.f : g_mei.rainbow_speed;
+    hsv2rgb(sec * sp / 3.f + phase, 1.f, 1.f, out);
+}
+// resolve a held gun's mesh (BP-created, no reflected ptr) by Outer == gun. Cached per gun. Skeletal only.
+static void* g_gunMesh = nullptr; static void* g_gunMeshOwner = nullptr;
+static void* find_gun_mesh(void* gun) {
+    if (!gun) return nullptr;
+    if (g_gunMesh && g_gunMeshOwner == gun && addr_readable((uintptr_t)g_gunMesh) && in_lib(*(uintptr_t*)g_gunMesh))
+        return g_gunMesh;
+    g_gunMesh = nullptr; g_gunMeshOwner = nullptr;
+    void* cSkel = find_class("SkeletalMeshComponent");
+    int32_t n = objects_num();
+    for (int32_t i = 0; i < n; i++) {
+        void* o = object_at(i);
+        if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o)) continue;
+        if (*(void**)((uint8_t*)o + UOBJ_OUTER_OFF) != gun) continue;
+        if (cSkel && is_a(o, cSkel)) { g_gunMesh = o; g_gunMeshOwner = gun; return o; }
+    }
+    return nullptr;
+}
+// cham one gun mesh in the active style (solid / custom RGB / rainbow). Guarded by the caller.
+static void cham_one_gun_mesh(void* gm, float phase) {
+    if (!gm || !addr_readable((uintptr_t)gm) || !in_lib(*(uintptr_t*)gm) || !is_material(g_xray1)) return;
+    void* gmat = g_xray1;
+    if ((g_mei.chams_style == 5 || g_mei.chams_style == 6) && fn_CreateMID && fn_SetVecParam) {
+        void* mid = mid_for(gm);
+        if (!mid) { struct { int32_t idx; int32_t _p; void* src; int32_t nId, nNum; void* ret; }
+                cp{ 0, 0, g_xray1, 0, 0, nullptr };
+            g_ProcessEvent(gm, fn_CreateMID, &cp); mid = cp.ret; if (mid) mid_store(gm, mid); }
+        if (mid && addr_readable((uintptr_t)mid) && in_lib(*(uintptr_t*)mid)) {
+            if (g_colorNameId < 0) g_colorNameId = fname_find("Color");
+            float rb[3]; const float* col;
+            if (g_mei.chams_style == 6) { rainbow_color(rb, phase); col = rb; } else col = g_mei.chams_col;
+            struct { int32_t nId, nNum; float r, g, b, a; } sp{ g_colorNameId, 0, col[0], col[1], col[2], 1.f };
+            g_ProcessEvent(mid, fn_SetVecParam, &sp); gmat = mid; }
+    }
+    if (is_material(gmat)) { cham_snapshot(gm); for (int s = 0; s < 4; s++) call_setmaterial(gm, s, gmat); }
+}
 static void chams_pass() {
     if (!g_ready) return;
     g_cfg = cfg_value();
@@ -2466,11 +2518,12 @@ static void chams_pass() {
                       long ms = ts.tv_sec*1000 + ts.tv_nsec/1000000; mat = ((ms/220)&1) ? g_xray1 : g_xray0; } break;
             case 4: if (o != g_aim_target) continue; mat = (team==0)?g_xray0:g_xray1; break;  // Target-only
             case 5: mat = g_xray1; break;   // Custom color (tinted below via a dynamic instance)
+            case 6: mat = g_xray1; break;   // Rainbow (time-cycled color via a dynamic instance)
             default: mat = (team == 0) ? g_xray1 : g_xray0; break;               // Team colors (swapped)
         }
-        // CUSTOM COLOR: make (once) a dynamic instance of the xray material for this mesh and set its
-        // "Color" param to the user's RGB. The MID is reused per mesh; SetMaterial below applies it.
-        if (g_mei.chams_style == 5 && fn_CreateMID && fn_SetVecParam && is_material(g_xray1)) {
+        // CUSTOM/RAINBOW: dynamic material instance per mesh, set its "Color". Style 5 = user RGB;
+        // style 6 = time-cycled rainbow with a per-enemy hue offset so the team waves.
+        if ((g_mei.chams_style == 5 || g_mei.chams_style == 6) && fn_CreateMID && fn_SetVecParam && is_material(g_xray1)) {
             g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
                 void* mid = mid_for(avatar);
                 if (!mid) { struct { int32_t idx; int32_t _p; void* src; int32_t nId, nNum; void* ret; }
@@ -2478,7 +2531,9 @@ static void chams_pass() {
                     g_ProcessEvent(avatar, fn_CreateMID, &cp); mid = cp.ret; if (mid) mid_store(avatar, mid); }
                 if (mid && addr_readable((uintptr_t)mid) && in_lib(*(uintptr_t*)mid)) {
                     if (g_colorNameId < 0) g_colorNameId = fname_find("Color");
-                    const float* col = (team == 0) ? g_mei.chams_col : g_mei.chams_col2;   // per-team custom color
+                    float rb[3]; const float* col;
+                    if (g_mei.chams_style == 6) { rainbow_color(rb, i * 0.07f); col = rb; }
+                    else col = (team == 0) ? g_mei.chams_col : g_mei.chams_col2;
                     struct { int32_t nId, nNum; float r, g, b, a; }
                         sp{ g_colorNameId, 0, col[0], col[1], col[2], 1.f };
                     g_ProcessEvent(mid, fn_SetVecParam, &sp); mat = mid; }
@@ -2495,6 +2550,14 @@ static void chams_pass() {
                    call_setmaterial(avatar, 0, mat); }    // single call; overlay is a no-op on mobile
         }
         g_fguard = 0;
+    }
+    // GUN CHAMS: cham your OWN held gun's mesh (bounded + cached — safe). Follows the active style.
+    if (g_mei.gun_chams && me) {
+        g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) {
+            void* gun = resolve_gun(me);
+            void* gm  = gun ? find_gun_mesh(gun) : nullptr;
+            if (gm) cham_one_gun_mesh(gm, 0.f);
+        } g_fguard = 0;
     }
 }
 

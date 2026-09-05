@@ -136,9 +136,9 @@ printf '6yawn' | adb shell 'cat > /sdcard/Android/data/com.vankrupt.pavlov/files
 
 ## Install on Quest 3
 
-The ready-to-run build is **`Backups/2026-08-29/Pavlov-Frame-chams.apk`** (same file as
-`Pavlov-Frame-chams.apk` in the repo root). Grab it from the backup folder — pull it out with any
-APK extractor / file manager, or just `adb install` it directly.
+Build the APK yourself with [`build.sh`](build.sh) (see [Build](#build)), or grab a prebuilt one if it
+was **shared separately** — signed APKs are not committed to the repo (they embed build-time identity
+and are gitignored, same as the OBBs). Then `adb install -r <the-apk>`.
 
 This is the Pavlov **Steam Frame** build (`com.vankrupt.pavlov`), which is an Android/arm64 VR build
 originally targeting the Steam Frame headset. It runs on **Quest 3** because the APK carries an
@@ -148,7 +148,7 @@ correctly on Quest. No native Meta/Oculus libs are involved (which is also why i
 device-attestation — see `docs/EOS-PORT.md`).
 
 ```sh
-adb install -r Pavlov-Frame-chams.apk
+adb install -r Pavlov-Frame-chams.apk   # your built/received APK
 # then push the game content (OBBs) — REQUIRED, ~13 GB, shared separately (too big for GitHub):
 adb push main.<ver>.com.vankrupt.pavlov.obb \
   /sdcard/Android/obb/com.vankrupt.pavlov/

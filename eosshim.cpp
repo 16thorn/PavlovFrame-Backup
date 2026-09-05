@@ -135,7 +135,7 @@ int32_t EOS_Initialize(const void* Options) {
 // EOS_Connect_AddNotifyLoginStatusChanged callback and the game adopts the identity.
 static EOS_HConnect g_connect = nullptr;
 static bool g_autologin_started = false;
-static const char* g_username = "cum";   // injected display name (login + lobby attrs)
+static const char* g_username = "player";   // fallback injected display name (login + lobby attrs) when none is set
 
 typedef EOS_HConnect (*PFN_GetConnect)(void*);
 
