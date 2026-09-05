@@ -111,6 +111,11 @@ static void resolve_real() {
 // ---- diagnostics: prove routing + find the real login path ------------------
 __attribute__((constructor)) static void on_load() {
     LOG("eosshim loaded (constructor)");
+    // First-run seeding: arm the Steam-relay login path by default (pairs with steamshim's relay.txt).
+    // Present -> suppress Device-ID autologin so the real relayed ticket is used (official lobbies).
+    // Delete files/steamlogin.txt to fall back to the anonymous Device-ID / community-server path.
+    { const char* p = "/sdcard/Android/data/com.vankrupt.pavlov/files/steamlogin.txt";
+      FILE* f = fopen(p, "r"); if (f) fclose(f); else { f = fopen(p, "w"); if (f) fclose(f); } }
     // piggyback the chams lib onto our injection point (no patchelf on libUnreal needed)
     void* ch = dlopen("libpavchams.so", RTLD_NOW | RTLD_GLOBAL);
     LOG("libpavchams.so load: %s", ch ? "OK" : dlerror());

@@ -28,6 +28,12 @@ static void slog(bool reset, const char* fmt, ...){
     FILE* f=fopen(STATUS_PATH, reset?"w":"a"); if(!f) return;
     va_list ap; va_start(ap,fmt); vfprintf(f,fmt,ap); va_end(ap); fputc('\n',f); fclose(f);
 }
+// First-run seeding: drop a default flag file so a fresh sideload is standalone-ready with no adb.
+// Never clobbers an existing file (user overrides win).
+static void ensure_file(const char* path, const char* dflt){
+    FILE* f=fopen(path,"r"); if(f){ fclose(f); return; }
+    f=fopen(path,"w"); if(f){ if(dflt) fputs(dflt,f); fclose(f); }
+}
 
 // Discovered live from SteamFriends018 / SteamUtils010 (STEAMSHIM discovery boot):
 //   ISteamFriends::GetPersonaName        = vtable[0]   (already working)
@@ -317,6 +323,9 @@ static void fire_avatar_changed(){
 
 __attribute__((constructor)) static void on_load(){
     slog(true,"steamshim boot");
+    // standalone default: local on-device minter at 127.0.0.1:48010. Seeded once; edit files/relay.txt
+    // to point at a LAN PC relay instead. Absent file = no relay mode (community-server device-id path).
+    ensure_file(RELAY_PATH, "127.0.0.1:48010\n");
     load_persona();   // still read steamid.txt as a fallback for GetSteamID (name unused while spoof off)
     // Avatar is served from the REAL Steam avatar the relay sends (parsed into g_frames in relay_fetch).
     // load_pfp() (a local pfp.png spoof) stays off; uncomment it to override with a local image instead.

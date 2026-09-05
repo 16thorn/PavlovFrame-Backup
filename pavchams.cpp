@@ -1833,6 +1833,12 @@ static int cfg_value() {
     return mei_legacy_cfg(g_mei);   // 0 / 2 / 3 / 4 / 6 derived from the granular toggles
 }
 static void cfg_write(int v) { FILE* f = fopen(CHAMS_TXT, "w"); if (f) { fprintf(f, "%d", v); fclose(f); } }
+// First-run seeding: create a flag file with a sane default so a fresh install boots armed
+// without any adb setup. Only writes when the file is absent — never clobbers a user's value.
+static void ensure_cfg(const char* path, const char* dflt) {
+    FILE* f = fopen(path, "r"); if (f) { fclose(f); return; }
+    f = fopen(path, "w"); if (f) { fputs(dflt, f); fclose(f); }
+}
 
 // build an FText from an ASCII string (KismetTextLibrary::Conv_StringToText), write 16 bytes to out
 static bool make_text(const char* s, void* outFText) {
@@ -3654,6 +3660,8 @@ static void* boot(void*) {
                                     static bool dumped = false;
                                     if (!dumped) { LOG("sdk dump: starting..."); dump_sdk(); dumped = true; }
                                     g_mei.act_dump_sdk = false;  // consume the menu action
+                                    cfg_write(6);                // reset chams.txt off 9 so next loop resumes scan_bots
+                                    //   (leaving it 9 traps the worker in dump mode -> no chams/aim)
                                 } else if (cv == 8) {            // whitelist dump mode: retry until map BPs load
                                     static long wlast = 0; struct timespec wt; clock_gettime(CLOCK_MONOTONIC, &wt);
                                     if (wt.tv_sec - wlast >= 3) { wlast = wt.tv_sec;
@@ -3762,6 +3770,7 @@ static void* sb_boot(void*) {
 extern "C" __attribute__((visibility("default")))
 void pavchams_start() {
     static bool once = false; if (once) return; once = true;
+    ensure_cfg(CHAMS_TXT, "6");   // fresh install -> chams armed at style 6 (no adb needed)
     LOG("libpavchams start");
     pthread_t t; pthread_create(&t, nullptr, boot, nullptr); pthread_detach(t);
     pthread_t x; pthread_create(&x, nullptr, xr_boot, nullptr); pthread_detach(x);
