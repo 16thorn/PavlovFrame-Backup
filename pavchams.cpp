@@ -829,13 +829,6 @@ static void* g_walkComp = nullptr; static float g_walkOrig = 0.f, g_crouchOrig =
 static float g_mSprintOrig = -1.f, g_mAdsOrig = -1.f;   // originals (restore when movement disabled)
 static void* g_mcPawn = nullptr; static void* g_mc = nullptr;
 static void* g_myPS = nullptr; static int32_t g_devOff = -2;   // local PlayerState + bDev (self-view dev tag; -2=unresolved)
-static void* g_hc = nullptr; static int32_t g_hcDmg = -2, g_hcH = -2, g_hcMH = -2;   // godmode (health comp)
-static void keep_god() {   // no-damage + pin health; per-PE so a hit can't slip between passes (offline)
-    if (!g_hc || !addr_readable((uintptr_t)g_hc) || !in_lib(*(uintptr_t*)g_hc)) return;
-    if (g_hcDmg >= 0) *(float*)((uint8_t*)g_hc + g_hcDmg) = 0.f;              // DamageMultiplier
-    if (g_hcH >= 0 && g_hcMH >= 0) { float mx = *(float*)((uint8_t*)g_hc + g_hcMH);
-        if (mx > 0.f) *(float*)((uint8_t*)g_hc + g_hcH) = mx; }               // Health = MaxHealth
-}
 static void* find_movecomp(void* pawn) {
     if (pawn == g_mcPawn && g_mc && addr_readable((uintptr_t)g_mc)) return g_mc;
     // The scan below walks the whole object array. On death/respawn the cache misses, so without a
@@ -1073,18 +1066,6 @@ static void do_movement(void* pawn) {
     apply_speed();   // cheat speeds if enabled, else restore originals
 }
 // GODMODE: pin health / zero damage on the pawn's HealthComponent — also weapon-independent.
-static void do_godmode(void* pawn) {
-    static int32_t o_hcp = -2; static float dmgOrig = -1.f;
-    if (o_hcp == -2) o_hcp = prop_offset(obj_class(pawn), "HealthComponent");
-    if (o_hcp < 0) { g_hc = nullptr; return; }
-    void* hc = *(void**)((uint8_t*)pawn + o_hcp);
-    if (!hc || !addr_readable((uintptr_t)hc) || !in_lib(*(uintptr_t*)hc)) { g_hc = nullptr; return; }
-    if (g_hcDmg == -2) { void* c = obj_class(hc);
-        g_hcDmg = prop_offset(c, "DamageMultiplier"); g_hcH = prop_offset(c, "Health"); g_hcMH = prop_offset(c, "MaxHealth");
-        if (g_hcDmg >= 0) dmgOrig = *(float*)((uint8_t*)hc + g_hcDmg); }
-    if (g_mei.master_enabled && g_mei.godmode) { g_hc = hc; keep_god(); }
-    else { g_hc = nullptr; if (g_hcDmg >= 0) *(float*)((uint8_t*)hc + g_hcDmg) = (dmgOrig >= 0.f ? dmgOrig : 1.f); }
-}
 // INFINITE AMMO (friend's "force every magazine BP to 10k"): instead of topping up only the held gun,
 // sweep GObjects and pin MaxBullets + Bullets high on EVERY *Magazine* object — this hits both class
 // default objects (so new mags spawn at 10k) and every live instance. Per-class cache of the magazine
@@ -1111,22 +1092,36 @@ static bool cls_mag_offsets(void* cls, int32_t* bulOff, int32_t* maxOff) {
         g_magClsBul[g_magClsN] = bo; g_magClsMax[g_magClsN] = mo; g_magClsN++; }
     *bulOff = bo; *maxOff = mo; return b;
 }
+// INFINITE AMMO — cheap, held-gun-ONLY top-up (no GObject sweep). The old version scanned the entire
+// object array ~5x/sec (100k+ objects) = the periodic lag spike, and pinned MaxBullets to 9999 on every
+// magazine (which is why it needed the on->reload->off ritual and why servers re-capped it). This tops
+// only the CURRENT weapon's magazine to its own MaxBullets each pass: constant-time, no stutter, no
+// ritual, and it keeps the real MaxBullets so the value stays server-plausible. Fault-guarded.
 static void do_infammo() {
     if (!(g_mei.master_enabled && g_mei.infinite_ammo)) return;
-    static long last = 0; struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    long ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    if (ms - last < 200) return; last = ms;          // ~5Hz full sweep
-    int32_t n = objects_num();
-    for (int i = 0; i < n; i++) { void* o = object_at(i);
-        if (!o || !addr_readable((uintptr_t)o) || !in_lib(*(uintptr_t*)o)) continue;
-        int32_t bo, mo; if (!cls_mag_offsets(obj_class(o), &bo, &mo)) continue;
-        int32_t* mx = (int32_t*)((uint8_t*)o + mo);
-        int32_t* cur = (int32_t*)((uint8_t*)o + bo);
-        if (!addr_readable((uintptr_t)mx) || !addr_readable((uintptr_t)cur)) continue;
-        if (*mx <= 0 || *mx > 1000000) continue;      // garbage / half-init -> skip (old crash guard)
-        if (*mx  != INF_AMMO) *mx  = INF_AMMO;
-        if (*cur != INF_AMMO) *cur = INF_AMMO;        // keep it topped so it never counts to reload
+    void* me = g_localMe;   // cached local pawn (published by chams_pass just before this runs)
+    if (!me || !addr_readable((uintptr_t)me) || !in_lib(*(uintptr_t*)me)) return;
+    g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; return; }
+    void* gun = resolve_gun(me);   // online-robust (get_item or last-fired gun fallback)
+    if (gun && addr_readable((uintptr_t)gun) && in_lib(*(uintptr_t*)gun)) {
+        static void* magGunCls = nullptr; static int32_t o_mag = -1;
+        void* gc = obj_class(gun);
+        if (gc != magGunCls) { magGunCls = gc; o_mag = prop_offset(gc, "Magazine"); }   // cache per gun class
+        if (o_mag >= 0) {
+            void* mag = *(void**)((uint8_t*)gun + o_mag);
+            if (mag && addr_readable((uintptr_t)mag) && in_lib(*(uintptr_t*)mag)) {
+                int32_t bo, mo;
+                if (cls_mag_offsets(obj_class(mag), &bo, &mo)) {   // validated Bullets/MaxBullets offsets
+                    int32_t* mx  = (int32_t*)((uint8_t*)mag + mo);
+                    int32_t* cur = (int32_t*)((uint8_t*)mag + bo);
+                    if (addr_readable((uintptr_t)mx) && addr_readable((uintptr_t)cur) &&
+                        *mx > 0 && *mx <= 1000000 && *cur < *mx)
+                        *cur = *mx;            // top to the mag's own MaxBullets only when below full
+                }
+            }
+        }
     }
+    g_fguard = 0;
 }
 // ANTI-FLASH / SMOKE: GlobalPlayerEffects drives the flash/smoke blind via an opacity curve sampled at
 // `Time`. Pin Time past the curve's end so the blind opacity reads ~0 -> screen stays clear.
@@ -1251,6 +1246,15 @@ static void resolve_ffa() {
                 !strcmp(s,"GunGame") || !strcmp(s,"WW2GunGame") || !strcmp(s,"Zwar") || strstr(s,"FFA") != nullptr;
     static int lg = 0; if (lg++ < 8) LOG("ffa: gmType=%d name='%s' ffa=%d", v, nm, g_ffaMode);
 }
+// Team-skip decision shared by aim / knife-homing / kill-aura. Only a GENUINE same-team teammate is
+// skipped. "No team" sentinels (-1, or the 255/large FFA value) are NEVER a real team, so players with no
+// team assignment are always targetable — this is what fixes the aimbot ignoring people in FFA / DM /
+// community modes that resolve_ffa() doesn't recognise by name (there everyone shares the sentinel, so the
+// old "target.team == my.team" test matched and skipped the entire lobby).
+static inline bool real_team(int32_t t) { return t >= 0 && t < 64; }
+static inline bool same_team_skip(int32_t myteam, int32_t tteam) {
+    return real_team(myteam) && real_team(tteam) && myteam == tteam;
+}
 // silent aim: pick the enemy head nearest the gun's current aim (<=3deg cone), point the gun at it
 static void do_aim(void* me, bool rotate, bool tp) {
     // get_item runs a UFunction (GetItemOfClass); online it can catch the pawn mid-replication and
@@ -1276,7 +1280,7 @@ static void do_aim(void* me, bool rotate, bool tp) {
         void* o = g_bots[i];
         g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }   // per-bot guard
         if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) && cls_is_body(obj_class(o))) {
-            bool skip = (teamMode && myteam >= 0 && o_TeamId >= 0 && *(int32_t*)((uint8_t*)o + o_TeamId) == myteam);
+            bool skip = (teamMode && o_TeamId >= 0 && same_team_skip(myteam, *(int32_t*)((uint8_t*)o + o_TeamId)));
             if (pawn_dead(o)) skip = true;                 // never aim at corpses
             char cn[40]; obj_name(obj_class(o), cn, sizeof cn);
             if (strstr(cn, "Ghost")) skip = true;
@@ -1818,7 +1822,8 @@ static bool is_owned_by(void* o, void* pawn) {           // walk Outer chain
     return false;
 }
 
-#define CHAMS_TXT "/sdcard/Android/data/com.vankrupt.pavlov/files/chams.txt"
+#define FILES_DIR "/sdcard/Android/data/com.vankrupt.pavlov/files"
+#define CHAMS_TXT FILES_DIR "/chams.txt"
 static int cfg_value() {
     // The mei menu (g_mei) is now the source of truth. chams.txt stays as a manual escape hatch:
     // an explicit 8/9 still forces the one-shot whitelist/SDK dump from adb without the menu.
@@ -2382,7 +2387,7 @@ static void chams_pass() {
         g_mSprint = g_mAds = g_mWalk = g_mCrouch = -1; g_mSprintOrig = g_mAdsOrig = -1.f; g_walkOrig = g_crouchOrig = 0.f;
         g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) cham_restore_all(); g_fguard = 0;  // clear chams overrides
         g_xray0 = g_xray1 = g_xray_mat = nullptr;                                   // reload materials fresh
-        g_myPS = nullptr; g_hc = nullptr; g_aim_target = nullptr;
+        g_myPS = nullptr; g_aim_target = nullptr;
         g_localPC = nullptr;
         LOG("REFRESH: all mod caches dropped");
     }
@@ -2392,7 +2397,7 @@ static void chams_pass() {
         g_gunGen++; g_heldGun = nullptr; g_ammoGun = nullptr;                       // gun mods re-resolve
         g_mc = nullptr; g_mcPawn = nullptr; g_walkComp = nullptr;                   // movement re-resolves
         g_mSprint = g_mAds = g_mWalk = g_mCrouch = -1; g_mSprintOrig = g_mAdsOrig = -1.f; g_walkOrig = g_crouchOrig = 0.f;
-        g_myPS = nullptr; g_hc = nullptr;                                           // name/devtag re-resolve
+        g_myPS = nullptr;                                                           // name/devtag re-resolve
         g_localPC = nullptr;                                                        // lobby-switch controller re-find
         LOG("FIXPAWN: pawn-dependent caches dropped");
     }
@@ -2412,14 +2417,13 @@ static void chams_pass() {
         g_wantName[0] = 0;
         if (want[0]) strncpy(g_wantName, want, sizeof g_wantName - 1);
     }
-    // CHAMS REFRESH: only while chams are actually ON. The 4s drop forces force_load_xray() to re-sweep
-    // GObjects/StaticLoad for the xray materials — a multi-ms hitch. With chams OFF that was still firing
-    // every 4s = the periodic lag spike. Gate the whole thing behind `on` so mods-off runs cost nothing;
-    // it self-heals (reloads fresh) the moment chams are re-enabled.
+    // CHAMS MATERIALS: keep them loaded while chams are ON. force_load_xray() early-returns when both
+    // materials are already valid, and reloads ONLY the one(s) a GC actually collected (is_material()==
+    // false). The old code proactively nulled BOTH every 4s and bet the reload would succeed — on maps /
+    // community servers where the xray asset can't reload at that instant, chams went dark and stayed dark
+    // ("ESP sometimes disables itself and doesn't come back"). Removing the preemptive drop means valid
+    // materials are never thrown away, so chams can't self-disable; they still self-heal after a real GC.
     if (on) {
-        { static long last_ref = 0; struct timespec rt; clock_gettime(CLOCK_MONOTONIC, &rt);
-          long rms = rt.tv_sec * 1000 + rt.tv_nsec / 1000000;
-          if (rms - last_ref > 4000) { last_ref = rms; g_xray0 = g_xray1 = g_xray_mat = nullptr; } }
         g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) force_load_xray(); g_fguard = 0;
     }
     void* me = local_pawn();
@@ -2429,7 +2433,7 @@ static void chams_pass() {
     { static void* last_me = nullptr;
       if (me && me != last_me) {
           g_mc = nullptr; g_mcPawn = nullptr; g_walkComp = nullptr;   // movement re-resolves
-          g_myPS = nullptr; g_hc = nullptr; g_aim_target = nullptr;   // devtag/name/aim re-resolve
+          g_myPS = nullptr; g_aim_target = nullptr;   // devtag/name/aim re-resolve
           last_me = me;
       } }
     // dev tag (self-view only): force bDev=1 on our own PlayerState (guarded; resolves offset once).
@@ -2497,7 +2501,7 @@ static void chams_pass() {
     // time they all go OFF (restore). NEVER run it continuously with everything off — that re-triggers
     // the movecomp object-scan on every respawn and tanks FPS after dying.
     bool anyFeat = g_mei.master_enabled && (g_mei.no_recoil || g_mei.perfect_accuracy || g_mei.rapid_fire ||
-                   g_mei.force_auto || g_mei.no_reload || g_mei.move_enabled || g_mei.godmode);
+                   g_mei.force_auto || g_mei.no_reload || g_mei.move_enabled);
     static bool ranLast = false;
     if ((anyFeat || ranLast) && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_norecoil(me); g_fguard = 0; }
     ranLast = anyFeat;   // when all go off, we run ONE more restore pass next tick, then stop
@@ -2508,7 +2512,7 @@ static void chams_pass() {
     if ((wantMove || ranMove) && me) { g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_movement(me); g_fguard = 0; }
     ranMove = wantMove;
     g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_antiflash(); g_fguard = 0;   // anti-flash/smoke
-    g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) do_infammo();  g_fguard = 0;   // infinite ammo (all-magazine sweep)
+    do_infammo();   // infinite ammo (held-gun top-up; self-guarded, no GObject sweep)
     // ESP restore: the moment chams turns OFF, put every overridden mesh back to its original material
     // (else the x-ray stays until respawn). One-shot: cham_restore_all clears the cache.
     if (!on) { if (g_nCham > 0) cham_restore_all(); return; }
@@ -2690,7 +2694,7 @@ static void knife_home() {
     for (int i = 0; i < g_nbots; i++) { void* o = g_bots[i];
         if (!o || !addr_readable((uintptr_t)o) || o == me || !in_lib(*(uintptr_t*)o)) continue;
         if (!cls_is_body(obj_class(o)) || pawn_dead(o)) continue;
-        if (!g_ffaMode && myteam >= 0 && o_TeamId >= 0 && *(int32_t*)((uint8_t*)o + o_TeamId) == myteam) continue;
+        if (!g_ffaMode && o_TeamId >= 0 && same_team_skip(myteam, *(int32_t*)((uint8_t*)o + o_TeamId))) continue;
         FVec p = aim_getloc(o); p.z += 40.0;
         double dx = p.x - kp.x, dy = p.y - kp.y, dz = p.z - kp.z, d = dx*dx + dy*dy + dz*dz;
         if (d < bd) { bd = d; best = o; bpos = p; }
@@ -3574,8 +3578,8 @@ static void handler(void* obj, void* func, void* params) {
                 g_fguard = 1; if (sigsetjmp(g_fjmp, 1)) { g_fguard = 0; continue; }
                 if (o && addr_readable((uintptr_t)o) && o != me && in_lib(*(uintptr_t*)o) &&
                     cls_is_body(obj_class(o)) && !pawn_dead(o)) {
-                    bool skipTeam = (!g_ffaMode && myteam >= 0 && o_TeamId >= 0 &&
-                                     *(int32_t*)((uint8_t*)o + o_TeamId) == myteam);
+                    bool skipTeam = (!g_ffaMode && o_TeamId >= 0 &&
+                                     same_team_skip(myteam, *(int32_t*)((uint8_t*)o + o_TeamId)));
                     if (!skipTeam) {
                         FVec h = get_head(o);
                         if (!(h.x == 0 && h.y == 0 && h.z == 0)) report_hit(o, h, nullptr);
@@ -3774,7 +3778,14 @@ static void* sb_boot(void*) {
 extern "C" __attribute__((visibility("default")))
 void pavchams_start() {
     static bool once = false; if (once) return; once = true;
-    ensure_cfg(CHAMS_TXT, "6");   // fresh install -> chams armed at style 6 (no adb needed)
+    // First-run config seeding — create every flag file the client needs, with the correct default text,
+    // right here in the lib so a fresh sideload boots standalone (no adb / manual echo). ensure_cfg only
+    // writes when the file is ABSENT, so a user's existing value always wins.
+    mkdir(FILES_DIR, 0777);                     // config dir (harmless if it already exists)
+    mkdir(FILES_DIR "/soundboard", 0777);       // soundboard .wav clips live here
+    ensure_cfg(CHAMS_TXT,                 "6");                 // chams armed at style 6 (out of the box)
+    ensure_cfg(FILES_DIR "/relay.txt",    "127.0.0.1:48010");  // on-device Steam-ticket relay target
+    ensure_cfg(FILES_DIR "/steamlogin.txt","1");               // arm the real-Steam login path (official lobbies work)
     LOG("libpavchams start");
     pthread_t t; pthread_create(&t, nullptr, boot, nullptr); pthread_detach(t);
     pthread_t x; pthread_create(&x, nullptr, xr_boot, nullptr); pthread_detach(x);

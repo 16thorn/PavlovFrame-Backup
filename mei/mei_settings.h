@@ -92,7 +92,6 @@ struct MeiSettings {
                                       // doesn't make flying uncontrollable). fly MaxFlySpeed = 800 * this.
 
     // ---- Player ----
-    bool  godmode          = false;   // offline only (server-auth)
     bool  dev_tag          = false;   // self-view dev tag
     bool  force_vote       = false;   // force bCanVote on our PlayerState (vote button even where disabled)
     bool  homing_knife     = false;
@@ -100,7 +99,7 @@ struct MeiSettings {
     char  name_text[MEI_NAME_MAX] = {0};   // client-side PlayerNamePrivate (short!)
 
     // ---- Voice (Quest fix) ----
-    bool  voice_enabled    = false;   // force-enable the Android voice pipeline (mic capture + net voice)
+    bool  voice_enabled    = true;    // force-enable the Android voice pipeline (mic capture + net voice) — ON by default so the mic works out of the box
     bool  voice_unmute     = true;    // also clear bMicMuted / SetMicMuted(false)
     char  skin_name[MEI_NAME_MAX] = {0};   // player skin FName for SetPlayerSkin
 
@@ -110,7 +109,7 @@ struct MeiSettings {
     bool  sb_loop          = false;   // loop the active clip
     bool  sb_mix_mic       = false;   // 1 = layer clip over real mic; 0 = replace mic with clip
     bool  sb_monitor       = true;    // play the clip out your own headset (local AAudio monitor — safe)
-    bool  sb_transmit      = false;   // ALSO broadcast to the lobby via ServerOnVoice (can crash some modes)
+    bool  sb_transmit      = true;    // ALSO broadcast to the lobby via ServerOnVoice — ON by default so the soundboard actually transmits
     float sb_gain          = 3.0f;    // clip gain (linear) — loud enough to carry over other voices
     int   sb_sel           = -1;      // selected clip index into sb_names
     // read-only mirror (pavchams writes; menu reads)
@@ -174,7 +173,7 @@ void mei_save();
 static inline int mei_legacy_cfg(const MeiSettings& s) {
     if (!s.master_enabled) return 0;
     if (s.aim_enabled && s.aim_mode == AIM_CONTINUOUS) return 6;
-    if (s.move_enabled || s.godmode || s.rapid_fire || s.force_auto) return 4;
+    if (s.move_enabled || s.rapid_fire || s.force_auto) return 4;
     if (s.aim_enabled && s.aim_mode == AIM_ONFIRE) return 3;
     return 2;
 }

@@ -59,7 +59,6 @@ void mei_save() {
     fprintf(f, "move_walk %.3f\n",     s.move_walk);
     fprintf(f, "move_crouch %.3f\n",   s.move_crouch);
     fprintf(f, "fly_speed %.3f\n",     s.fly_speed);
-    fprintf(f, "godmode %d\n",         s.godmode);
     fprintf(f, "dev_tag %d\n",         s.dev_tag);
     fprintf(f, "force_vote %d\n",      s.force_vote);
     fprintf(f, "homing_knife %d\n",    s.homing_knife);
@@ -114,7 +113,7 @@ void mei_load() {
         GI("move_enabled", move_enabled) GI("noclip", noclip) GI("anti_flash", anti_flash)
         GF("move_sprint", move_sprint) GF("move_ads", move_ads)
         GF("move_walk", move_walk) GF("move_crouch", move_crouch) GF("fly_speed", fly_speed)
-        GI("godmode", godmode) GI("dev_tag", dev_tag) GI("force_vote", force_vote) GI("homing_knife", homing_knife)
+        GI("dev_tag", dev_tag) GI("force_vote", force_vote) GI("homing_knife", homing_knife)
         GI("name_enabled", name_enabled) GI("voice_enabled", voice_enabled) GI("voice_unmute", voice_unmute)
         GI("sb_loop", sb_loop) GI("sb_mix_mic", sb_mix_mic) GI("sb_monitor", sb_monitor) GI("sb_transmit", sb_transmit) GF("sb_gain", sb_gain)
         GF("panel_dist", panel_dist) GF("panel_scale", panel_scale)

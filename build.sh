@@ -113,8 +113,12 @@ rm -f Pavlov-EOS-aligned.apk Pavlov-EOS-signed.apk
   --key-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS" \
   --out Pavlov-EOS-signed.apk Pavlov-EOS-aligned.apk
 
-echo "[4/5] installing"
-adb install -r Pavlov-EOS-signed.apk
+if [ -z "${SKIP_INSTALL:-}" ]; then
+  echo "[4/5] installing"
+  adb install -r Pavlov-EOS-signed.apk
+else
+  echo "[4/5] skipping install (SKIP_INSTALL set) — signed APK is Pavlov-EOS-signed.apk"
+fi
 
 echo "[5/5] done."
 echo "In-headset: point a controller UP (~55 deg) for ~0.6 s to open 'mei mei [private]'."

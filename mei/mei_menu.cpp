@@ -349,7 +349,6 @@ static void tab_movement(){
 }
 static void tab_player(){
     gb_begin("PLAYER");
-    Chk("Godmode",&g_mei.godmode);
     Chk("Dev tag",&g_mei.dev_tag);
     Chk("Vote unlock",&g_mei.force_vote);
     Chk("Anti flash",&g_mei.anti_flash);
