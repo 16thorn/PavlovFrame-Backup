@@ -691,6 +691,7 @@ static void* c_Gun = nullptr;       // Gun_Base_C
 static void* c_VRGun = nullptr;     // VRGun
 static void* c_VRMagazine = nullptr;   // VRMagazine (ancestry match for infinite-ammo sweep)
 static void* fn_AddMoveInput = nullptr; // APawn::AddMovementInput (smooth noclip vertical)
+float mei_xr_lift();   // right-stick Y (deadzoned, -1..1) from mei_xr — drives noclip/fly vertical
 // silent-aim reflection
 static void* fn_GetLoc = nullptr, *fn_GetRot = nullptr, *fn_SetRot = nullptr, *fn_SetLoc = nullptr;
 static void* fn_SockLoc = nullptr, *fn_LookAt = nullptr, *cdo_KML = nullptr;
@@ -1038,10 +1039,16 @@ static void do_movement(void* pawn) {
           if (o_cheat >= 0) *(uint8_t*)((uint8_t*)mc + o_cheat) = 1;              // bCheatFlying → smooth
           if (o_grav >= 0)  *(float*)((uint8_t*)mc + o_grav) = 0.f;               // kill gravity pull
           if (o_fly >= 0)   *(float*)((uint8_t*)mc + o_fly) = 800.f * g_mei.fly_speed;  // decoupled from walk mult
-          // vertical is handled by Pavlov's OWN flying locomotion (fly where you aim/move) — do NOT inject
-          // our own AddMovementInput/SetActorLocation here: do_movement runs per-ProcessEvent (dozens of
-          // times/frame), so any per-call movement input accumulates and jitters. The mode writes above
-          // are idempotent (same value) so they're safe to repeat; movement stays the native path.
+          // RIGHT-STICK vertical: mei_xr captures the right-stick Y as mei_xr_lift() (-1..1, deadzoned). Drive
+          // the movecomp's Velocity.Z from it so up/down is explicit right-stick control on top of the native
+          // left-stick horizontal flight. This is an idempotent per-PE SET of the Z component only — NOT
+          // AddMovementInput, which would accumulate across the dozens of PE calls per frame and jitter. X/Y
+          // stay native (left stick moves you around the plane). Velocity is a UE5 double FVector (Z @ +16).
+          static int32_t o_vel = -2; if (o_vel == -2) o_vel = prop_offset(mcc, "Velocity");
+          if (o_vel >= 0) {
+              float lift = mei_xr_lift();                                            // -1 (down) .. +1 (up)
+              *(double*)((uint8_t*)mc + o_vel + 16) = (double)lift * 800.0 * (double)g_mei.fly_speed;
+          }
       } }
     if (g_mSprint == -1) { void* mcc = obj_class(mc);
         g_mSprint = prop_offset(mcc, "SprintSpeedMultiplier");
