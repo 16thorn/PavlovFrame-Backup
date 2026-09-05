@@ -16,9 +16,22 @@ public static class S {
     [DllImport("kernel32", CharSet=CharSet.Unicode)] public static extern bool SetDllDirectory(string p);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern int   SteamAPI_InitFlat(byte[] e);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern void  SteamAPI_RunCallbacks();
-    [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_SteamUser_v023();
-    [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_SteamUtils_v010();
-    [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_SteamFriends_v017();
+    // Interface accessors are VERSION-SUFFIXED and the suffix bumps with every Steamworks SDK
+    // (SteamUtils_v010 -> v011, SteamFriends_v017 -> v018, ...). Binding them by a fixed name breaks the
+    // moment you drop in a newer steam_api64.dll. Resolve them DYNAMICALLY (GetProcAddress over a version
+    // range, newest-first) so ANY dll — this one or a future one — just works. The un-versioned
+    // ISteamUser_*/ISteamUtils_*/ISteamFriends_* method names below are stable, so they stay DllImports.
+    [DllImport("kernel32", CharSet=CharSet.Ansi)] public static extern IntPtr LoadLibraryA(string name);
+    [DllImport("kernel32", CharSet=CharSet.Ansi)] public static extern IntPtr GetProcAddress(IntPtr h, string proc);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr AccessorFn();
+    static IntPtr ResolveIface(IntPtr dll, string prefix, int hi, int lo) {
+        for (int v = hi; v >= lo; v--) {
+            IntPtr p = GetProcAddress(dll, prefix + "_v" + v.ToString("D3"));
+            if (p != IntPtr.Zero)
+                return ((AccessorFn)Marshal.GetDelegateForFunctionPointer(p, typeof(AccessorFn)))();
+        }
+        return IntPtr.Zero;
+    }
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern IntPtr SteamAPI_ISteamFriends_GetPersonaName(IntPtr s);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern int   SteamAPI_ISteamFriends_GetMediumFriendAvatar(IntPtr s, ulong id);
     [DllImport("steam_api64.dll", CallingConvention=CallingConvention.Cdecl)] public static extern bool  SteamAPI_ISteamUtils_GetImageSize(IntPtr s, int h, out uint w, out uint ht);
@@ -62,8 +75,11 @@ public static class S {
         SetDllDirectory(Environment.CurrentDirectory);
         byte[] e = new byte[1024]; int ir = SteamAPI_InitFlat(e);
         if (ir != 0) return "ERROR: InitFlat=" + ir + " '" + Encoding.ASCII.GetString(e).TrimEnd('\0') + "'";
-        U = SteamAPI_SteamUser_v023(); Ut = SteamAPI_SteamUtils_v010(); Fr = SteamAPI_SteamFriends_v017();
-        if (U == IntPtr.Zero || Ut == IntPtr.Zero) return "ERROR: null user/utils";
+        IntPtr dll = LoadLibraryA("steam_api64.dll");   // already mapped by InitFlat; handle for GetProcAddress
+        U  = ResolveIface(dll, "SteamAPI_SteamUser",    30, 20);   // v023 today; probe newest->oldest
+        Ut = ResolveIface(dll, "SteamAPI_SteamUtils",   20,  8);   // v010/v011/...
+        Fr = ResolveIface(dll, "SteamAPI_SteamFriends", 25, 15);   // v017/v018/... (optional; avatar+name only)
+        if (U == IntPtr.Zero || Ut == IntPtr.Zero) return "ERROR: null user/utils (accessor versions not found in dll)";
         if (!SteamAPI_ISteamUser_BLoggedOn(U)) return "ERROR: not logged on";
         Id = SteamAPI_ISteamUser_GetSteamID(U);
         if (Fr != IntPtr.Zero) { IntPtr np = SteamAPI_ISteamFriends_GetPersonaName(Fr);
