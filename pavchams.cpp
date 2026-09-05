@@ -2412,12 +2412,16 @@ static void chams_pass() {
         g_wantName[0] = 0;
         if (want[0]) strncpy(g_wantName, want, sizeof g_wantName - 1);
     }
-    // CHAMS REFRESH: every few seconds drop the cached xray materials so a GC that collected them
-    // (heavy death/respawn/map change) is recovered — force_load_xray reloads them fresh next line.
-    { static long last_ref = 0; struct timespec rt; clock_gettime(CLOCK_MONOTONIC, &rt);
-      long rms = rt.tv_sec * 1000 + rt.tv_nsec / 1000000;
-      if (rms - last_ref > 4000) { last_ref = rms; g_xray0 = g_xray1 = g_xray_mat = nullptr; } }
-    g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) force_load_xray(); g_fguard = 0;
+    // CHAMS REFRESH: only while chams are actually ON. The 4s drop forces force_load_xray() to re-sweep
+    // GObjects/StaticLoad for the xray materials — a multi-ms hitch. With chams OFF that was still firing
+    // every 4s = the periodic lag spike. Gate the whole thing behind `on` so mods-off runs cost nothing;
+    // it self-heals (reloads fresh) the moment chams are re-enabled.
+    if (on) {
+        { static long last_ref = 0; struct timespec rt; clock_gettime(CLOCK_MONOTONIC, &rt);
+          long rms = rt.tv_sec * 1000 + rt.tv_nsec / 1000000;
+          if (rms - last_ref > 4000) { last_ref = rms; g_xray0 = g_xray1 = g_xray_mat = nullptr; } }
+        g_fguard = 1; if (!sigsetjmp(g_fjmp, 1)) force_load_xray(); g_fguard = 0;
+    }
     void* me = local_pawn();
     g_localMe = me;   // publish for the 90Hz continuous-aim path (so it never calls find_world itself)
     // POST-DEATH RECOVERY: when the pawn changes (respawn/map), every per-pawn cache is stale. Drop them

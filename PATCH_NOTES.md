@@ -1,5 +1,17 @@
 # Pavlov Frame — Release Notes
 
+## Lag-spike fixes (2026-09-05)
+
+### Fixed
+- **Periodic freeze every few seconds (mods off).** Two causes:
+  - `force_load_xray()` re-swept GObjects every 4s even with chams disabled —
+    now gated behind chams actually being on (self-heals when re-enabled).
+  - The Steam ticket relay was fetched **synchronously** on the game thread;
+    with the relay down, the game's every-few-seconds `RequestEncryptedAppTicket`
+    poll did a 5s blocking connect = the freeze. The fetch now runs on a
+    background thread with a 30s backoff and a 2s connect timeout, so a dead
+    relay never stalls the game.
+
 ## Standalone build (2026-09-05)
 
 **Zero-setup sideload.** The build now seeds its own config on first launch — no

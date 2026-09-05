@@ -15,6 +15,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <pthread.h>
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO,"STEAMSHIM",__VA_ARGS__)
@@ -192,7 +193,7 @@ static bool relay_fetch(){
     *colon=0; char* ip=line; int port=atoi(colon+1);
     for(char* p=ip; *p; ++p) if(*p=='\n'||*p=='\r'||*p==' '){*p=0;break;}
     int s=socket(AF_INET,SOCK_STREAM,0); if(s<0) return false;
-    struct timeval tv{5,0}; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof tv);
+    struct timeval tv{2,0}; setsockopt(s,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); setsockopt(s,SOL_SOCKET,SO_SNDTIMEO,&tv,sizeof tv);
     sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(port); a.sin_addr.s_addr=inet_addr(ip);
     if(connect(s,(sockaddr*)&a,sizeof a)!=0){ slog(false,"relay connect %s:%d FAILED",ip,port); close(s); return false; }
     // read the whole reply (name + 64x64 RGBA avatar hex ~32KB + ticket -> needs a big buffer)
@@ -231,6 +232,23 @@ static bool relay_fetch(){
     return g_ticket_ready;
 }
 
+// NON-BLOCKING relay: relay_fetch() does a blocking connect (up to 2s). The game polls
+// RequestEncryptedAppTicket every few seconds, so calling it inline froze the game thread on every
+// poll while the relay was down (the "lag spike every few seconds"). Run it on a detached thread with
+// a 30s backoff so a dead relay never blocks the game and never re-spawns a thread each poll.
+static volatile bool g_relay_inflight = false;
+static uint64_t      g_relay_last_ms  = 0;
+static uint64_t relay_now_ms(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+t.tv_nsec/1000000; }
+static void* relay_thread(void*){ relay_fetch(); g_relay_inflight=false; return nullptr; }
+static void relay_fetch_async(){
+    if (g_ticket_ready || g_relay_inflight) return;
+    uint64_t now = relay_now_ms();
+    if (g_relay_last_ms && now - g_relay_last_ms < 30000) return;   // backoff: don't hammer a dead relay
+    g_relay_last_ms = now; g_relay_inflight = true;
+    pthread_t th; if (pthread_create(&th,nullptr,relay_thread,nullptr)==0) pthread_detach(th);
+    else g_relay_inflight = false;
+}
+
 // ---- pending EncryptedAppTicket call-result delivery ----
 static uint64_t g_pending_call = 0;    // SteamAPICall_t we handed the game
 static uint64_t g_call_ctr     = 0x5000000000000001ULL;
@@ -240,7 +258,7 @@ struct EncryptedAppTicketResponse_t { int32_t m_eResult; };   // k_iCallback = 1
 
 // ISteamUser vt[21]: RequestEncryptedAppTicket(void* pDataToInclude, int cb) -> SteamAPICall_t
 static uint64_t fake_RequestEncryptedAppTicket(void*, void*, int){
-    relay_fetch();
+    relay_fetch_async();   // non-blocking; never stalls the game thread (dead-relay freeze fix)
     g_pending_call = g_call_ctr++;
     slog(false,"RequestEncryptedAppTicket -> call=%llu (ticket_ready=%d)",(unsigned long long)g_pending_call,g_ticket_ready);
     LOG("RequestEncryptedAppTicket -> call=%llu ready=%d",(unsigned long long)g_pending_call,g_ticket_ready);
@@ -353,7 +371,7 @@ __attribute__((constructor)) static void on_load(){
         g_user_vtbl[21]=(void*)fake_RequestEncryptedAppTicket;
         g_user_vtbl[22]=(void*)fake_GetEncryptedAppTicket;
         LOG("STEAM RELAY MODE armed (vt[21]=RequestEncAppTicket vt[22]=GetEncAppTicket)");
-        slog(false,"relay mode armed"); relay_fetch(); } }
+        slog(false,"relay mode armed"); relay_fetch_async(); } }
     g_utils_vtbl[VT_IMG_SIZE]=(void*)fake_GetImageSize;   // serves the REAL relayed avatar (64x64)
     g_utils_vtbl[VT_IMG_RGBA]=(void*)fake_GetImageRGBA;
     g_friends_obj[0]=(void*)g_friends_vtbl;
